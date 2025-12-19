@@ -1,0 +1,6 @@
+.cursor/
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
