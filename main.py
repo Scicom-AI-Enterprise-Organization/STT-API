@@ -42,6 +42,9 @@ replaces = [
 ]
 pattern = r"<\|\-?\d+\.?\d*\|>"
 pattern_pair = r"<\|(\d+\.\d+)\|>(.*?)<\|(\d+\.\d+)\|>"
+pattern_pair_with_speaker = (
+    r"(?:<\|speaker:(\d+)\|>)?<\|(\d+\.\d+)\|>(.*?)<\|(\d+\.\d+)\|>"
+)
 
 # Initialize VAD model
 logger.info("Loading silero VAD model...")
@@ -193,32 +196,101 @@ async def transcribe_chunk(
                     # Handle diarization if enabled
                     if diarization is not None and len(texts) > 0:
                         matches = re.findall(pattern_pair, texts)
+                        logger.info(
+                            f"Diarization enabled: found {len(matches)} segments to process"
+                        )
                         if len(matches):
-                            match = matches[0]
-                            if len(match[1]) > 2:
-                                # Convert absolute timestamps back to relative for audio extraction
+                            # Process all segments, not just the first one
+                            text_parts_with_speakers = []
+                            for idx, match in enumerate(matches):
                                 start_abs = float(match[0])
                                 end_abs = float(match[-1])
-                                start_rel = int(
-                                    (start_abs - last_timestamp) * sample_rate
-                                )
-                                end_rel = int((end_abs - last_timestamp) * sample_rate)
-                                # Convert float32 to int16 for diarization
-                                sample_wav_float = wav_data[start_rel:end_rel]
-                                if len(sample_wav_float) > 0:
-                                    max_val = np.max(np.abs(sample_wav_float))
-                                    if max_val > 0:
-                                        sample_wav_float = sample_wav_float / max_val
-                                    sample_wav = np.int16(sample_wav_float * 32768)
-                                    v = speaker_v([sample_wav])[0]
-                                    speaker = malaya_speech.diarization.streaming(
-                                        v, diarization
+                                segment_text = match[1]
+
+                                # Only diarize if segment has meaningful text
+                                if len(segment_text.strip()) > 2:
+                                    # Convert absolute timestamps back to relative for audio extraction
+                                    start_rel = int(
+                                        (start_abs - last_timestamp) * sample_rate
                                     )
-                                    speaker = f"{speaker}|>"
-                                    splitted = texts.split("<|")
-                                    texts = "<|".join(
-                                        splitted[:1] + [speaker] + splitted[1:]
+                                    end_rel = int(
+                                        (end_abs - last_timestamp) * sample_rate
                                     )
+                                    # Ensure indices are valid
+                                    start_rel = max(0, min(start_rel, len(wav_data)))
+                                    end_rel = max(0, min(end_rel, len(wav_data)))
+
+                                    if end_rel > start_rel:
+                                        # Convert float32 to int16 for diarization
+                                        sample_wav_float = wav_data[start_rel:end_rel]
+                                        if len(sample_wav_float) > 0:
+                                            max_val = np.max(np.abs(sample_wav_float))
+                                            if max_val > 0:
+                                                sample_wav_float = (
+                                                    sample_wav_float / max_val
+                                                )
+                                            sample_wav = np.int16(
+                                                sample_wav_float * 32768
+                                            )
+                                            v = speaker_v([sample_wav])[0]
+                                            speaker_id = (
+                                                malaya_speech.diarization.streaming(
+                                                    v, diarization
+                                                )
+                                            )
+                                            # Extract numeric speaker ID (handles both "0" and "speaker 0" formats)
+                                            if isinstance(speaker_id, str):
+                                                # Extract number from strings like "speaker 0" or "0"
+                                                import re as re_module
+
+                                                num_match = re_module.search(
+                                                    r"\d+", str(speaker_id)
+                                                )
+                                                speaker_id_num = (
+                                                    num_match.group(0)
+                                                    if num_match
+                                                    else "0"
+                                                )
+                                            else:
+                                                speaker_id_num = str(speaker_id)
+
+                                            logger.debug(
+                                                f"Segment {idx}: speaker_id={speaker_id} -> {speaker_id_num}, text='{segment_text[:50]}...'"
+                                            )
+                                            # Embed speaker label before segment: <|speaker:N|><|start|>text<|end|>
+                                            text_parts_with_speakers.append(
+                                                f"<|speaker:{speaker_id_num}|><|{start_abs}|>{segment_text}<|{end_abs}|>"
+                                            )
+                                        else:
+                                            logger.warning(
+                                                f"Segment {idx}: No audio data for diarization"
+                                            )
+                                            # No audio data, keep original format without speaker
+                                            text_parts_with_speakers.append(
+                                                f"<|{start_abs}|>{segment_text}<|{end_abs}|>"
+                                            )
+                                    else:
+                                        logger.warning(
+                                            f"Segment {idx}: Invalid audio slice (start_rel={start_rel}, end_rel={end_rel})"
+                                        )
+                                        # Invalid audio slice, keep original format without speaker
+                                        text_parts_with_speakers.append(
+                                            f"<|{start_abs}|>{segment_text}<|{end_abs}|>"
+                                        )
+                                else:
+                                    logger.debug(
+                                        f"Segment {idx}: Text too short (len={len(segment_text.strip())}), skipping diarization"
+                                    )
+                                    # Segment too short, keep original format without speaker
+                                    text_parts_with_speakers.append(
+                                        f"<|{start_abs}|>{segment_text}<|{end_abs}|>"
+                                    )
+
+                            # Rebuild texts with speaker labels
+                            texts = "".join(text_parts_with_speakers)
+                            logger.debug(
+                                f"Rebuilt text with speaker labels: {texts[:200]}..."
+                            )
                 else:
                     error_text = await r.text()
                     try:
@@ -257,6 +329,9 @@ async def audio_transcriptions(
     minimum_trigger_vad_ms: int = Form(MINIMUM_TRIGGER_VAD_MS),
     reject_segment_vad_ratio: float = Form(REJECT_SEGMENT_VAD_RATIO),
 ):
+    logger.info(
+        f"Received request: enable_diarization={enable_diarization} (type: {type(enable_diarization)})"
+    )
     """
     Long audio transcription API with VAD chunking.
 
@@ -336,9 +411,14 @@ async def audio_transcriptions(
     # Initialize diarization if enabled
     diarization = None
     if enable_diarization:
+        logger.info(
+            f"Diarization enabled with similarity={speaker_similarity}, max_speakers={speaker_max_n}"
+        )
         diarization = StreamingKMeansMaxCluster(
             threshold=speaker_similarity, max_clusters=speaker_max_n
         )
+    else:
+        logger.info("Diarization disabled")
 
     # Phase 1: Chunk entire audio first - collect all chunks with their timestamps
     # This allows us to know all chunk boundaries before sending to API
@@ -471,24 +551,68 @@ async def audio_transcriptions(
 
     # Combine all transcriptions
     combined_text = "".join(all_transcriptions)
+    logger.debug(f"Combined text sample: {combined_text[:300]}...")
 
-    # Parse timestamp pairs to extract segments
-    matches = re.findall(pattern_pair, combined_text)
+    # Check if speaker labels are present in combined text
+    speaker_label_count = len(re.findall(r"<\|speaker:\d+\|>", combined_text))
+    logger.info(f"Found {speaker_label_count} speaker labels in combined text")
+
+    # Parse timestamp pairs to extract segments (with optional speaker info)
+    # Try pattern with speaker first, fallback to pattern without speaker for backward compatibility
+    matches = re.findall(pattern_pair_with_speaker, combined_text)
+    logger.info(f"Found {len(matches)} segments with speaker pattern")
     segments = []
     all_texts = []
 
-    for no, (start, text, end) in enumerate(matches):
+    for no, match in enumerate(matches):
+        # pattern_pair_with_speaker groups: (speaker_id, start, text, end)
+        speaker_id_str = match[0] if match[0] else None
+        start = match[1]
+        text = match[2]
+        end = match[3]
+
         start_timestamp = float(start)
         end_timestamp = float(end)
-        segments.append(
-            {
-                "id": no,
-                "start": start_timestamp,
-                "end": end_timestamp,
-                "text": text.strip(),
-            }
-        )
+
+        segment_dict = {
+            "id": no,
+            "start": start_timestamp,
+            "end": end_timestamp,
+            "text": text.strip(),
+        }
+
+        # Add speaker field only if diarization was enabled and speaker_id is present
+        if speaker_id_str is not None and speaker_id_str != "":
+            try:
+                segment_dict["speaker"] = int(speaker_id_str)
+                logger.debug(f"Segment {no}: Added speaker={segment_dict['speaker']}")
+            except (ValueError, TypeError) as e:
+                logger.warning(
+                    f"Segment {no}: Failed to parse speaker_id '{speaker_id_str}': {e}"
+                )
+        else:
+            logger.debug(f"Segment {no}: No speaker_id (value: {speaker_id_str})")
+
+        segments.append(segment_dict)
         all_texts.append(text.strip())
+
+    # Fallback: if no matches with speaker pattern, try without speaker (backward compatibility)
+    if not segments:
+        logger.info("No segments found with speaker pattern, trying fallback pattern")
+        matches = re.findall(pattern_pair, combined_text)
+        logger.info(f"Fallback pattern found {len(matches)} segments")
+        for no, (start, text, end) in enumerate(matches):
+            start_timestamp = float(start)
+            end_timestamp = float(end)
+            segments.append(
+                {
+                    "id": no,
+                    "start": start_timestamp,
+                    "end": end_timestamp,
+                    "text": text.strip(),
+                }
+            )
+            all_texts.append(text.strip())
 
     # If no timestamp pairs found, use the raw text (might not have timestamps)
     if not segments:
