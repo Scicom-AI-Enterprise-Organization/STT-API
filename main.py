@@ -4,7 +4,7 @@ import json
 import logging
 import io
 import tempfile
-from typing import Optional
+from typing import Optional, List, Tuple
 import numpy as np
 import torch
 import aiohttp
@@ -41,10 +41,8 @@ replaces = [
     "<|transcribeprecise|>",
 ]
 pattern = r"<\|\-?\d+\.?\d*\|>"
-pattern_pair = r"<\|(\d+\.\d+)\|>(.*?)<\|(\d+\.\d+)\|>"
-pattern_pair_with_speaker = (
-    r"(?:<\|speaker:(\d+)\|>)?<\|(\d+\.\d+)\|>(.*?)<\|(\d+\.\d+)\|>"
-)
+# Unified pattern that handles both with and without speaker labels
+pattern_unified = r"(?:<\|speaker:(\d+)\|>)?<\|(\d+\.\d+)\|>(.*?)<\|(\d+\.\d+)\|>"
 
 # Initialize VAD model
 logger.info("Loading silero VAD model...")
@@ -75,8 +73,7 @@ async def transcribe_chunk(
     language: str,
     timestamp_granularities: str,
     last_timestamp: float,
-    diarization: Optional[StreamingKMeansMaxCluster] = None,
-) -> tuple[str, Optional[str]]:
+) -> Tuple[str, Optional[str]]:
     """
     Transcribe a single audio chunk using upstream STT API.
 
@@ -85,14 +82,10 @@ async def transcribe_chunk(
         language: Language hint for transcription
         timestamp_granularities: 'segment' or 'word'
         last_timestamp: Timestamp offset to add to chunk timestamps
-        diarization: Optional diarization clusterer
 
     Returns:
         Tuple of (transcribed text with adjusted timestamps, detected language)
     """
-    if diarization is not None:
-        load_speaker_v()
-
     url = urllib.parse.urljoin(STT_API_URL, "/v1/audio/transcriptions")
 
     # Normalize audio to prevent clipping
@@ -116,23 +109,19 @@ async def transcribe_chunk(
     if language and language != "null":
         form_data.add_field("language", language)
 
-    # OpenAI uses timestamp_granularities as an array
     if timestamp_granularities:
         form_data.add_field("timestamp_granularities[]", timestamp_granularities)
 
-    # Request verbose_json format to get timestamps in response
     form_data.add_field("response_format", "verbose_json")
-
-    # Request non-streaming response for synchronous processing
     form_data.add_field("stream", "false")
 
     texts = ""
     detected_language = None
+
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(url, data=form_data) as r:
                 if r.status == 200:
-                    # Handle non-streaming JSON response only
                     response_data = await r.json()
                     logger.debug(
                         f"Upstream API response keys: {list(response_data.keys())}"
@@ -142,20 +131,16 @@ async def transcribe_chunk(
                     if "language" in response_data:
                         detected_language = response_data["language"]
 
-                    # Extract text and timestamps from response
                     # Handle both segments format and text with embedded timestamps
                     if "segments" in response_data:
-                        # verbose_json format with segments - reconstruct text with timestamp markers
                         segments = response_data.get("segments", [])
                         if segments:
-                            # Build text with timestamp markers: <|start|>text<|end|>
                             text_parts = []
                             for seg in segments:
                                 start_ts = seg.get("start", 0.0)
                                 end_ts = seg.get("end", 0.0)
                                 text = seg.get("text", "").strip()
                                 if text:
-                                    # Add timestamp offset to relative timestamps
                                     adjusted_start = round(start_ts + last_timestamp, 2)
                                     adjusted_end = round(end_ts + last_timestamp, 2)
                                     text_parts.append(
@@ -166,7 +151,6 @@ async def transcribe_chunk(
                             logger.warning("Upstream API returned empty segments")
                             texts = ""
                     elif "text" in response_data:
-                        # Text format - may have embedded timestamps
                         texts = response_data["text"]
 
                         # Remove special tokens first
@@ -187,108 +171,10 @@ async def transcribe_chunk(
                         )
                         texts = ""
 
-                    # Log if no timestamps found
-                    if texts and not re.search(pattern_pair, texts):
+                    if texts and not re.search(pattern_unified, texts):
                         logger.warning(
                             f"No timestamp pairs found in transcription text. Text length: {len(texts)}"
                         )
-
-                    # Handle diarization if enabled
-                    if diarization is not None and len(texts) > 0:
-                        matches = re.findall(pattern_pair, texts)
-                        logger.info(
-                            f"Diarization enabled: found {len(matches)} segments to process"
-                        )
-                        if len(matches):
-                            # Process all segments, not just the first one
-                            text_parts_with_speakers = []
-                            for idx, match in enumerate(matches):
-                                start_abs = float(match[0])
-                                end_abs = float(match[-1])
-                                segment_text = match[1]
-
-                                # Only diarize if segment has meaningful text
-                                if len(segment_text.strip()) > 2:
-                                    # Convert absolute timestamps back to relative for audio extraction
-                                    start_rel = int(
-                                        (start_abs - last_timestamp) * sample_rate
-                                    )
-                                    end_rel = int(
-                                        (end_abs - last_timestamp) * sample_rate
-                                    )
-                                    # Ensure indices are valid
-                                    start_rel = max(0, min(start_rel, len(wav_data)))
-                                    end_rel = max(0, min(end_rel, len(wav_data)))
-
-                                    if end_rel > start_rel:
-                                        # Convert float32 to int16 for diarization
-                                        sample_wav_float = wav_data[start_rel:end_rel]
-                                        if len(sample_wav_float) > 0:
-                                            max_val = np.max(np.abs(sample_wav_float))
-                                            if max_val > 0:
-                                                sample_wav_float = (
-                                                    sample_wav_float / max_val
-                                                )
-                                            sample_wav = np.int16(
-                                                sample_wav_float * 32768
-                                            )
-                                            v = speaker_v([sample_wav])[0]
-                                            speaker_id = (
-                                                malaya_speech.diarization.streaming(
-                                                    v, diarization
-                                                )
-                                            )
-                                            # Extract numeric speaker ID (handles both "0" and "speaker 0" formats)
-                                            if isinstance(speaker_id, str):
-                                                # Extract number from strings like "speaker 0" or "0"
-                                                num_match = re.search(
-                                                    r"\d+", str(speaker_id)
-                                                )
-                                                speaker_id_num = (
-                                                    num_match.group(0)
-                                                    if num_match
-                                                    else "0"
-                                                )
-                                            else:
-                                                speaker_id_num = str(speaker_id)
-
-                                            logger.debug(
-                                                f"Segment {idx}: speaker_id={speaker_id} -> {speaker_id_num}, text='{segment_text[:50]}...'"
-                                            )
-                                            # Embed speaker label before segment: <|speaker:N|><|start|>text<|end|>
-                                            text_parts_with_speakers.append(
-                                                f"<|speaker:{speaker_id_num}|><|{start_abs}|>{segment_text}<|{end_abs}|>"
-                                            )
-                                        else:
-                                            logger.warning(
-                                                f"Segment {idx}: No audio data for diarization"
-                                            )
-                                            # No audio data, keep original format without speaker
-                                            text_parts_with_speakers.append(
-                                                f"<|{start_abs}|>{segment_text}<|{end_abs}|>"
-                                            )
-                                    else:
-                                        logger.warning(
-                                            f"Segment {idx}: Invalid audio slice (start_rel={start_rel}, end_rel={end_rel})"
-                                        )
-                                        # Invalid audio slice, keep original format without speaker
-                                        text_parts_with_speakers.append(
-                                            f"<|{start_abs}|>{segment_text}<|{end_abs}|>"
-                                        )
-                                else:
-                                    logger.debug(
-                                        f"Segment {idx}: Text too short (len={len(segment_text.strip())}), skipping diarization"
-                                    )
-                                    # Segment too short, keep original format without speaker
-                                    text_parts_with_speakers.append(
-                                        f"<|{start_abs}|>{segment_text}<|{end_abs}|>"
-                                    )
-
-                            # Rebuild texts with speaker labels
-                            texts = "".join(text_parts_with_speakers)
-                            logger.debug(
-                                f"Rebuilt text with speaker labels: {texts[:200]}..."
-                            )
                 else:
                     error_text = await r.text()
                     try:
@@ -310,6 +196,166 @@ async def transcribe_chunk(
     return texts, detected_language
 
 
+def apply_diarization(
+    combined_text: str, full_audio: np.ndarray, diarization: StreamingKMeansMaxCluster
+) -> str:
+    """
+    Apply speaker diarization to transcribed text with timestamps.
+
+    This processes ALL segments from the combined transcription and adds speaker
+    labels by analyzing the corresponding audio from the full recording.
+
+    Args:
+        combined_text: Transcription with timestamp markers
+        full_audio: Complete audio array (float32, normalized)
+        diarization: Streaming K-Means clusterer for speaker identification
+
+    Returns:
+        Text with speaker labels added: <|speaker:N|><|start|>text<|end|>
+    """
+    load_speaker_v()
+
+    # Extract all segments with timestamps
+    matches = re.findall(pattern_unified, combined_text)
+
+    if not matches:
+        logger.warning("No segments found for diarization")
+        return combined_text
+
+    logger.info(f"Applying diarization to {len(matches)} segments")
+
+    text_parts_with_speakers = []
+
+    for idx, match in enumerate(matches):
+        # Pattern: (?:<\|speaker:(\d+)\|>)?<\|(\d+\.\d+)\|>(.*?)<\|(\d+\.\d+)\|>
+        # Groups: (speaker_id_or_empty, start, text, end)
+        # match[0] is existing speaker (ignored - we re-diarize all segments)
+        start_time = float(match[1])
+        segment_text = match[2]
+        end_time = float(match[3])
+
+        # Skip segments that are too short for meaningful diarization
+        if len(segment_text.strip()) <= 2:
+            logger.debug(f"Segment {idx}: Too short, skipping diarization")
+            text_parts_with_speakers.append(
+                f"<|{start_time}|>{segment_text}<|{end_time}|>"
+            )
+            continue
+
+        # Convert timestamps to sample indices
+        start_sample = int(start_time * sample_rate)
+        end_sample = int(end_time * sample_rate)
+
+        # Validate indices are within bounds
+        start_sample = max(0, min(start_sample, len(full_audio)))
+        end_sample = max(0, min(end_sample, len(full_audio)))
+
+        if end_sample <= start_sample:
+            logger.warning(
+                f"Segment {idx}: Invalid time range ({start_time}s-{end_time}s)"
+            )
+            text_parts_with_speakers.append(
+                f"<|{start_time}|>{segment_text}<|{end_time}|>"
+            )
+            continue
+
+        # Extract audio segment
+        audio_segment = full_audio[start_sample:end_sample]
+
+        if len(audio_segment) == 0:
+            logger.warning(f"Segment {idx}: No audio data")
+            text_parts_with_speakers.append(
+                f"<|{start_time}|>{segment_text}<|{end_time}|>"
+            )
+            continue
+
+        try:
+            # Normalize segment (full_audio should already be normalized, but ensure consistency)
+            max_val = np.max(np.abs(audio_segment))
+            if max_val > 0:
+                audio_segment = audio_segment / max_val
+
+            # Convert to int16 for speaker vector model
+            audio_int16 = np.int16(audio_segment * 32767)
+
+            # Extract speaker embedding
+            embedding = speaker_v([audio_int16])[0]
+
+            # Cluster to get speaker ID (streaming clustering maintains state)
+            speaker_id = malaya_speech.diarization.streaming(embedding, diarization)
+
+            # Extract numeric ID (handle "speaker N" or just "N" format)
+            if isinstance(speaker_id, str):
+                num_match = re.search(r"\d+", str(speaker_id))
+                speaker_id_num = num_match.group(0) if num_match else "0"
+            else:
+                speaker_id_num = str(speaker_id)
+
+            logger.debug(
+                f"Segment {idx}: speaker={speaker_id_num}, "
+                f"time={start_time:.2f}-{end_time:.2f}s, "
+                f"text='{segment_text[:50]}...'"
+            )
+
+            # Add speaker label
+            text_parts_with_speakers.append(
+                f"<|speaker:{speaker_id_num}|><|{start_time}|>{segment_text}<|{end_time}|>"
+            )
+
+        except Exception as e:
+            logger.error(f"Segment {idx}: Diarization failed: {e}")
+            # Fallback: keep segment without speaker label
+            text_parts_with_speakers.append(
+                f"<|{start_time}|>{segment_text}<|{end_time}|>"
+            )
+
+    result = "".join(text_parts_with_speakers)
+    speaker_count = len(re.findall(r"<\|speaker:\d+\|>", result))
+    logger.info(f"Diarization complete: {speaker_count} speaker labels added")
+
+    return result
+
+
+def parse_segments(text: str) -> List[dict]:
+    """
+    Parse text with timestamp markers into structured segments.
+
+    Args:
+        text: Text with markers like <|speaker:N|><|start|>text<|end|>
+
+    Returns:
+        List of segment dictionaries with id, start, end, text, and optionally speaker
+    """
+    matches = re.findall(pattern_unified, text)
+    segments = []
+
+    for idx, match in enumerate(matches):
+        speaker_id_str = match[0]  # Empty string if no speaker
+        start_time = float(match[1])
+        segment_text = match[2].strip()
+        end_time = float(match[3])
+
+        segment_dict = {
+            "id": idx,
+            "start": start_time,
+            "end": end_time,
+            "text": segment_text,
+        }
+
+        # Add speaker field only if present
+        if speaker_id_str:
+            try:
+                segment_dict["speaker"] = int(speaker_id_str)
+            except (ValueError, TypeError) as e:
+                logger.warning(
+                    f"Segment {idx}: Invalid speaker_id '{speaker_id_str}': {e}"
+                )
+
+        segments.append(segment_dict)
+
+    return segments
+
+
 @app.get("/")
 async def read_root():
     return {"message": "STT API", "version": "1.0"}
@@ -327,43 +373,33 @@ async def audio_transcriptions(
     minimum_trigger_vad_ms: int = Form(MINIMUM_TRIGGER_VAD_MS),
     reject_segment_vad_ratio: float = Form(REJECT_SEGMENT_VAD_RATIO),
 ):
-    logger.info(
-        f"Received request: enable_diarization={enable_diarization} (type: {type(enable_diarization)})"
-    )
     """
-    Long audio transcription API with VAD chunking.
-
-    Accepts audio file uploads, chunks them using VAD (silero-vad) with 25-second max chunks,
-    maintains timestamps across chunks, and optionally supports speaker diarization.
+    Long audio transcription API with VAD chunking and optional speaker diarization.
 
     Parameters:
     - file: Audio file (multipart/form-data)
     - language: Language hint (e.g., 'en', 'ms', 'zh', 'ta') or None for auto-detect
-    - response_format: Response format - 'text', 'json', or 'verbose_json' (default: 'json')
-    - enable_diarization: Enable speaker diarization
-    - speaker_similarity: Diarization threshold (0.0-1.0)
+    - response_format: 'text', 'json', or 'verbose_json' (default: 'json')
+    - enable_diarization: Enable speaker diarization (maintains speaker identity across full audio)
+    - speaker_similarity: Diarization threshold (0.0-1.0, lower = more speakers)
     - speaker_max_n: Maximum number of speakers (1-100)
     - minimum_silent_ms: Minimum silence duration for VAD trigger (ms)
     - minimum_trigger_vad_ms: Minimum audio length to trigger VAD (ms)
     - reject_segment_vad_ratio: Reject segments with this ratio of silence (0.0-1.0)
-
-    Returns:
-    - 'text': Plain text string
-    - 'json': JSON with 'text' field containing full transcription
-    - 'verbose_json': JSON with 'text', 'segments' (with timestamps), 'language', 'duration'
     """
+    logger.info(f"Request: diarization={enable_diarization}, language={language}")
+
+    # Validate parameters
     if language is None:
         language = "null"
     else:
         language = language.lower().strip()
 
-    # Validate language
     if language not in {"none", "null", "en", "ms", "zh", "ta"}:
         raise HTTPException(
             status_code=400, detail="language only supports: none, null, en, ms, zh, ta"
         )
 
-    # Validate response_format
     response_format = response_format.lower().strip()
     if response_format not in {"text", "json", "verbose_json"}:
         raise HTTPException(
@@ -371,7 +407,6 @@ async def audio_transcriptions(
             detail="response_format only supports: text, json, verbose_json",
         )
 
-    # Validate diarization parameters
     if enable_diarization:
         if not (0.0 < speaker_similarity < 1.0):
             raise HTTPException(
@@ -382,22 +417,16 @@ async def audio_transcriptions(
                 status_code=400, detail="speaker_max_n must be between 1 and 100"
             )
 
-    # Load audio file using librosa (supports various formats)
-    # Save bytes to temporary file for librosa to read
-    frames_per_chunk = frame_size  # silero frame size
-
+    # Load audio file
     try:
-        # Create a temporary file to store the audio bytes
         with tempfile.NamedTemporaryFile(delete=False, suffix=".tmp") as tmp_file:
             tmp_file.write(file)
             tmp_path = tmp_file.name
 
-        # Load audio with librosa (automatically resamples to target sample_rate)
         logger.info("Loading audio file...")
-        audio_data, original_sr = librosa.load(tmp_path, sr=sample_rate, mono=True)
+        audio_data, _ = librosa.load(tmp_path, sr=sample_rate, mono=True)
         logger.info(f"Audio loaded: {len(audio_data)} samples at {sample_rate}Hz")
 
-        # Clean up temporary file
         os.unlink(tmp_path)
 
     except Exception as e:
@@ -406,30 +435,31 @@ async def audio_transcriptions(
             status_code=400, detail=f"Error loading audio file: {str(e)}"
         )
 
-    # Initialize diarization if enabled
+    # Keep a copy of full audio for diarization (if enabled)
+    full_audio = audio_data.copy() if enable_diarization else None
+
+    # Initialize diarization clusterer (maintains state across all chunks)
     diarization = None
     if enable_diarization:
         logger.info(
-            f"Diarization enabled with similarity={speaker_similarity}, max_speakers={speaker_max_n}"
+            f"Initializing diarization: similarity={speaker_similarity}, "
+            f"max_speakers={speaker_max_n}"
         )
         diarization = StreamingKMeansMaxCluster(
             threshold=speaker_similarity, max_clusters=speaker_max_n
         )
-    else:
-        logger.info("Diarization disabled")
 
-    # Phase 1: Chunk entire audio first - collect all chunks with their timestamps
-    # This allows us to know all chunk boundaries before sending to API
-    chunks = []  # List of (wav_data, start_timestamp, end_timestamp, negative_ratio)
+    # PHASE 1: Chunk audio using VAD
+    chunks = []  # (wav_data, start_timestamp, end_timestamp, silence_ratio)
     wav_data = np.array([], dtype=np.float32)
     last_timestamp = 0.0
     total_silent = 0
     total_silent_frames = 0
     total_frames = 0
+    frames_per_chunk = frame_size
 
     try:
-        logger.info("Phase 1: Chunking audio with VAD...")
-        # Process audio in chunks of frame_size
+        logger.info("Phase 1: VAD chunking...")
         num_frames = len(audio_data) // frames_per_chunk
 
         for i in range(num_frames):
@@ -437,7 +467,6 @@ async def audio_transcriptions(
             end_idx = start_idx + frames_per_chunk
             frame = audio_data[start_idx:end_idx]
 
-            # Ensure frame is exactly frames_per_chunk (pad if necessary)
             if len(frame) < frames_per_chunk:
                 frame = np.pad(
                     frame, (0, frames_per_chunk - len(frame)), mode="constant"
@@ -445,10 +474,8 @@ async def audio_transcriptions(
 
             total_frames += 1
 
-            # Convert to PyTorch tensor for VAD
+            # Run VAD
             frame_pt = torch.from_numpy(frame).unsqueeze(0)
-
-            # Run silero VAD
             vad_score = silero(frame_pt, sr=sample_rate).numpy()[0][0]
             vad = vad_score > 0.5
 
@@ -463,7 +490,7 @@ async def audio_transcriptions(
             audio_len = len(wav_data) / sample_rate
             audio_len_ms = audio_len * 1000
             silent_len = (total_silent / sample_rate) * 1000
-            negative_ratio = (
+            silence_ratio = (
                 total_silent_frames / total_frames if total_frames > 0 else 0
             )
 
@@ -474,154 +501,89 @@ async def audio_transcriptions(
             )
 
             if vad_trigger or audio_len >= maxlen:
-                # Store chunk with its metadata
-                start_timestamp = last_timestamp
-                end_timestamp = last_timestamp + audio_len
-                chunks.append(
-                    (wav_data.copy(), start_timestamp, end_timestamp, negative_ratio)
-                )
+                start_ts = last_timestamp
+                end_ts = last_timestamp + audio_len
+                chunks.append((wav_data.copy(), start_ts, end_ts, silence_ratio))
 
-                # Update timestamp and reset accumulators
-                last_timestamp = end_timestamp
+                last_timestamp = end_ts
                 total_silent = 0
                 total_silent_frames = 0
                 total_frames = 0
                 wav_data = np.array([], dtype=np.float32)
 
-        # Process remaining audio samples that don't make a complete frame
+        # Handle remaining samples
         remaining_samples = len(audio_data) % frames_per_chunk
         if remaining_samples > 0:
             remaining_frame = audio_data[-remaining_samples:]
-            # Don't pad - just add the remaining samples to wav_data
             wav_data = np.concatenate([wav_data, remaining_frame])
 
-        # Process remaining accumulated audio if any
+        # Process remaining accumulated audio
         if len(wav_data) > 0:
             audio_len = len(wav_data) / sample_rate
-            negative_ratio = (
+            silence_ratio = (
                 total_silent_frames / total_frames if total_frames > 0 else 0
             )
-            start_timestamp = last_timestamp
-            end_timestamp = last_timestamp + audio_len
-            chunks.append(
-                (wav_data.copy(), start_timestamp, end_timestamp, negative_ratio)
-            )
+            start_ts = last_timestamp
+            end_ts = last_timestamp + audio_len
+            chunks.append((wav_data.copy(), start_ts, end_ts, silence_ratio))
 
-        logger.info(f"Phase 1 complete: Found {len(chunks)} chunks")
+        logger.info(f"Phase 1 complete: {len(chunks)} chunks created")
 
-        # Phase 2: Send all chunks to upstream API
-        logger.info("Phase 2: Sending chunks to upstream API...")
+        # PHASE 2: Transcribe all chunks
+        logger.info("Phase 2: Transcribing chunks...")
         all_transcriptions = []
         detected_language = None
 
-        for chunk_idx, (
-            wav_data,
-            start_timestamp,
-            end_timestamp,
-            negative_ratio,
-        ) in enumerate(chunks):
-            # Only transcribe if not mostly silent
-            if negative_ratio <= reject_segment_vad_ratio:
+        for chunk_idx, (wav_chunk, start_ts, end_ts, silence_ratio) in enumerate(
+            chunks
+        ):
+            # Skip chunks that are mostly silent
+            if silence_ratio <= reject_segment_vad_ratio:
                 logger.info(
-                    f"Transcribing chunk {chunk_idx + 1}/{len(chunks)} (start: {start_timestamp:.2f}s, end: {end_timestamp:.2f}s)"
+                    f"Chunk {chunk_idx + 1}/{len(chunks)}: "
+                    f"{start_ts:.2f}s-{end_ts:.2f}s "
+                    f"(silence: {silence_ratio:.1%})"
                 )
-                transcription, chunk_language = await transcribe_chunk(
-                    wav_data=wav_data,
+                transcription, chunk_lang = await transcribe_chunk(
+                    wav_data=wav_chunk,
                     language=language,
                     timestamp_granularities="segment",
-                    last_timestamp=start_timestamp,  # Use chunk's start timestamp as offset
-                    diarization=diarization,
+                    last_timestamp=start_ts,
                 )
                 all_transcriptions.append(transcription)
+
                 # Capture language from first chunk
-                if detected_language is None and chunk_language is not None:
-                    detected_language = chunk_language
+                if detected_language is None and chunk_lang is not None:
+                    detected_language = chunk_lang
             else:
                 logger.info(
-                    f"Skipping chunk {chunk_idx + 1}/{len(chunks)} (too silent: {negative_ratio:.2%})"
+                    f"Chunk {chunk_idx + 1}/{len(chunks)}: Skipped (too silent: {silence_ratio:.1%})"
                 )
 
-        logger.info(f"Phase 2 complete: Transcribed {len(all_transcriptions)} chunks")
+        logger.info(f"Phase 2 complete: {len(all_transcriptions)} chunks transcribed")
+
+        # Combine transcriptions
+        combined_text = "".join(all_transcriptions)
+
+        # PHASE 3: Apply diarization if enabled
+        if enable_diarization and full_audio is not None:
+            logger.info("Phase 3: Applying diarization to full transcription...")
+            combined_text = apply_diarization(combined_text, full_audio, diarization)
+            logger.info("Phase 3 complete")
 
     except Exception as e:
         logger.error(f"Error processing audio: {e}")
         raise HTTPException(status_code=500, detail=f"Error processing audio: {str(e)}")
 
-    # Combine all transcriptions
-    combined_text = "".join(all_transcriptions)
-    logger.debug(f"Combined text sample: {combined_text[:300]}...")
+    # Parse segments from combined text
+    segments = parse_segments(combined_text)
 
-    # Check if speaker labels are present in combined text
-    speaker_label_count = len(re.findall(r"<\|speaker:\d+\|>", combined_text))
-    logger.info(f"Found {speaker_label_count} speaker labels in combined text")
+    # Extract plain text from segments (join with spaces)
+    final_text = " ".join(seg["text"] for seg in segments) if segments else ""
 
-    # Parse timestamp pairs to extract segments (with optional speaker info)
-    # Try pattern with speaker first, fallback to pattern without speaker for backward compatibility
-    matches = re.findall(pattern_pair_with_speaker, combined_text)
-    logger.info(f"Found {len(matches)} segments with speaker pattern")
-    segments = []
-    all_texts = []
-
-    for no, match in enumerate(matches):
-        # pattern_pair_with_speaker groups: (speaker_id, start, text, end)
-        speaker_id_str = match[0] if match[0] else None
-        start = match[1]
-        text = match[2]
-        end = match[3]
-
-        start_timestamp = float(start)
-        end_timestamp = float(end)
-
-        segment_dict = {
-            "id": no,
-            "start": start_timestamp,
-            "end": end_timestamp,
-            "text": text.strip(),
-        }
-
-        # Add speaker field only if diarization was enabled and speaker_id is present
-        if speaker_id_str is not None and speaker_id_str != "":
-            try:
-                segment_dict["speaker"] = int(speaker_id_str)
-                logger.debug(f"Segment {no}: Added speaker={segment_dict['speaker']}")
-            except (ValueError, TypeError) as e:
-                logger.warning(
-                    f"Segment {no}: Failed to parse speaker_id '{speaker_id_str}': {e}"
-                )
-        else:
-            logger.debug(f"Segment {no}: No speaker_id (value: {speaker_id_str})")
-
-        segments.append(segment_dict)
-        all_texts.append(text.strip())
-
-    # Fallback: if no matches with speaker pattern, try without speaker (backward compatibility)
-    if not segments:
-        logger.info("No segments found with speaker pattern, trying fallback pattern")
-        matches = re.findall(pattern_pair, combined_text)
-        logger.info(f"Fallback pattern found {len(matches)} segments")
-        for no, (start, text, end) in enumerate(matches):
-            start_timestamp = float(start)
-            end_timestamp = float(end)
-            segments.append(
-                {
-                    "id": no,
-                    "start": start_timestamp,
-                    "end": end_timestamp,
-                    "text": text.strip(),
-                }
-            )
-            all_texts.append(text.strip())
-
-    # If no timestamp pairs found, use the raw text (might not have timestamps)
-    if not segments:
-        # Remove timestamp markers but keep text
-        cleaned_text = re.sub(pattern, "", combined_text)
-        cleaned_text = cleaned_text.strip()
-        if cleaned_text:
-            all_texts = [cleaned_text]
-
-    # Join without spaces to match reference behavior
-    final_text = "".join(all_texts) if all_texts else combined_text.strip()
+    # If no segments parsed, fallback to cleaning combined text
+    if not final_text:
+        final_text = re.sub(pattern, "", combined_text).strip()
 
     # Return based on response_format
     if response_format == "verbose_json":
@@ -630,9 +592,9 @@ async def audio_transcriptions(
             "language": detected_language or "unknown",
             "duration": duration,
             "text": final_text,
-            "segments": segments if segments else [],
+            "segments": segments,
         }
     elif response_format == "json":
         return {"text": final_text}
-    else:  # response_format == 'text'
+    else:  # 'text'
         return final_text
