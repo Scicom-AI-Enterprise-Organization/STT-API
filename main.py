@@ -241,9 +241,7 @@ async def transcribe_chunk(
                                             # Extract numeric speaker ID (handles both "0" and "speaker 0" formats)
                                             if isinstance(speaker_id, str):
                                                 # Extract number from strings like "speaker 0" or "0"
-                                                import re as re_module
-
-                                                num_match = re_module.search(
+                                                num_match = re.search(
                                                     r"\d+", str(speaker_id)
                                                 )
                                                 speaker_id_num = (

@@ -70,3 +70,35 @@ Key form fields:
 - **`language`**: one of `none`, `null`, `en`, `ms`, `zh`, `ta` (optional).
 - **`response_format`**: `text`, `json`, or `verbose_json` (optional, defaults to `json`).
 - **`enable_diarization`**: `true`/`false` to turn speaker diarization on or off (optional).
+- **`speaker_similarity`**: threshold for clustering speakers (0.0-1.0, optional, defaults to 0.5).
+- **`speaker_max_n`**: max number of speakers (1-100, optional, defaults to 5).
+
+### Example with diarization
+
+```bash
+curl -X POST "http://localhost:8000/audio/transcriptions" \
+  -F "file=@test_audio/sample.wav" \
+  -F "language=ms" \
+  -F "response_format=verbose_json" \
+  -F "enable_diarization=true"
+```
+
+Response includes speaker IDs in segments:
+
+```json
+{
+  "language": "ms",
+  "duration": 12.26,
+  "text": "Pas rela dituduh demikian...",
+  "segments": [
+    {
+      "id": 0,
+      "start": 0.0,
+      "end": 3.68,
+      "text": "Pas rela dituduh demikian daripada menjadi pelacur politik.",
+      "speaker": 0
+    }
+    // ... more segments
+  ]
+}
+```
