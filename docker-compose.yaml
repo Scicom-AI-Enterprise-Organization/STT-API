@@ -1,0 +1,33 @@
+services:
+  stt-api:
+    env_file:
+      - .env
+    build:
+      context: .
+      dockerfile: Dockerfile
+    # GPU configuration - uncomment when NVIDIA drivers are properly configured in WSL2
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           device_ids: ["0"]
+    #           capabilities: [gpu]
+    container_name: stt-api
+    ports:
+      - "9090:9090"
+    volumes:
+      - "~/.cache/huggingface:/root/.cache/huggingface"
+      - "./app:/app/app"
+      - /app/.venv
+    environment:
+      - PYTHONUNBUFFERED=1
+    restart: unless-stopped
+    working_dir: /app
+    command: uv run uvicorn app.main:app --host 0.0.0.0 --port 9090 --workers 1 --reload --reload-dir ./app
+    networks:
+      - stt-network
+
+networks:
+  stt-network:
+    driver: bridge
