@@ -5,6 +5,7 @@ RUN apt update && \
     git \
     ffmpeg \
     build-essential \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
 RUN pip install --no-cache-dir uv
@@ -13,7 +14,6 @@ WORKDIR /app
 
 COPY pyproject.toml uv.lock* ./
 
-# PyTorch CPU will be installed automatically via uv
 RUN uv sync --frozen -v || uv sync -v
 
 COPY . .

@@ -42,11 +42,21 @@ The main FastAPI app is in `app/main.py` and exposes:
 
 ---
 
+## Prerequisites
+
+- Docker and Docker Compose
+- External Docker network `stt-network` (created automatically or manually)
+
 ## How to run
 
 ### Using Docker Compose (Recommended)
 
-1. **Create a `.env` file** (optional) with environment variables:
+1. **Create the external network** (if it doesn't exist):
+   ```bash
+   docker network create stt-network
+   ```
+
+2. **Create a `.env` file** (optional) with environment variables:
    ```bash
    STT_API_URL=https://stt-engine-rtx.aies.scicom.dev
    SAMPLE_RATE=16000
@@ -56,24 +66,24 @@ The main FastAPI app is in `app/main.py` and exposes:
    REJECT_SEGMENT_VAD_RATIO=0.9
    ```
 
-2. **Build and start the service**:
+3. **Build and start the service**:
    ```bash
    docker-compose up --build
    ```
 
    The API will be available at `http://localhost:9090`.
 
-3. **Run in detached mode**:
+4. **Run in detached mode**:
    ```bash
    docker-compose up -d
    ```
 
-4. **View logs**:
+5. **View logs**:
    ```bash
    docker-compose logs -f stt-api
    ```
 
-5. **Stop the service**:
+6. **Stop the service**:
    ```bash
    docker-compose down
    ```
@@ -96,7 +106,33 @@ uv sync
 
 ## Testing
 
-### Run tests in Docker
+### Run integration tests in Docker
+
+Integration tests run in a separate container that accesses the API using the container name.
+
+1. **Create the external network** (if it doesn't exist):
+   ```bash
+   docker network create stt-network
+   ```
+
+2. **Start the API service**:
+   ```bash
+   docker-compose up -d
+   ```
+
+3. **Run integration tests**:
+   ```bash
+   docker compose -f test.yaml up --build
+   ```
+
+   The test container will:
+   - Wait for the API to be ready
+   - Run integration tests that call the API at `http://stt-api:9090` (configurable via `LOCAL_STT_API` environment variable)
+   - Exit after tests complete
+
+### Run unit tests in Docker
+
+For unit tests that don't require the API to be running:
 
 1. **Make sure the container is running**:
    ```bash
@@ -108,9 +144,9 @@ uv sync
    docker-compose exec stt-api uv sync --extra dev
    ```
 
-3. **Run tests**:
+3. **Run unit tests**:
    ```bash
-   docker-compose exec stt-api uv run pytest tests/ -v
+   docker-compose exec stt-api uv run pytest tests/test_main.py -v
    ```
 
 ### Test the API with curl
@@ -139,7 +175,7 @@ curl -X POST "http://localhost:9090/audio/transcriptions" \
   -F "response_format=json"
 ```
 
-Key form fields:
+**Request parameters:**
 
 - **`file`**: audio file to transcribe (required).
 - **`language`**: one of `none`, `null`, `en`, `ms`, `zh`, `ta` (optional).

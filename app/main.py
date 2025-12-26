@@ -29,7 +29,7 @@ REJECT_SEGMENT_VAD_RATIO = float(os.environ.get("REJECT_SEGMENT_VAD_RATIO", "0.9
 buffer_size = 4096
 sample_rate = SAMPLE_RATE
 maxlen = MAX_CHUNK_LENGTH
-frame_size = 512  # silero frame size
+frame_size = 512
 replaces = [
     "<|startoftranscript|>",
     "<|endoftext|>",
@@ -106,7 +106,10 @@ async def transcribe_chunk(
                     )
 
                     if "language" in response_data:
-                        detected_language = response_data["language"]
+                        lang_value = response_data["language"]
+                        # Handle case where upstream API returns None for language
+                        if lang_value is not None:
+                            detected_language = lang_value
 
                     # Handle both segments format and text with embedded timestamps
                     if "segments" in response_data:
@@ -155,7 +158,11 @@ async def transcribe_chunk(
                 else:
                     error_text = await r.text()
                     try:
-                        error_detail = json.loads(error_text).get("detail", error_text)
+                        error_json = json.loads(error_text)
+                        error_detail = error_json.get(
+                            "detail",
+                            error_json.get("error", {}).get("message", error_text),
+                        )
                     except json.JSONDecodeError:
                         error_detail = error_text
                     raise HTTPException(
@@ -410,5 +417,5 @@ async def audio_transcriptions(
         }
     elif response_format == "json":
         return {"text": final_text}
-    else:  # 'text'
+    else:
         return final_text

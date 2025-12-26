@@ -1,0 +1,43 @@
+services:
+  stt-api-test:
+    env_file:
+      - .env
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: stt-api-test
+    volumes:
+      - "./app:/app/app"
+      - "./tests:/app/tests"
+      - "./test_audio:/app/test_audio"
+    environment:
+      - PYTHONUNBUFFERED=1
+      - LOCAL_STT_API=http://stt-api:9090
+    working_dir: /app
+    command: >
+      sh -c "
+      uv sync --extra dev &&
+      echo 'Waiting for API to be ready...' &&
+      i=1 &&
+      while [ $$i -le 30 ]; do
+        if curl -f http://stt-api:9090/ > /dev/null 2>&1; then
+          echo 'API is ready!'
+          break
+        fi
+        echo \"Waiting for API... ($$i/30)\" &&
+        sleep 2 &&
+        i=$$((i+1))
+      done &&
+      if [ $$i -gt 30 ]; then
+        echo 'ERROR: API did not become ready after 60 seconds'
+        exit 1
+      fi &&
+      echo 'Running integration tests...' &&
+      uv run pytest tests/test_integration.py -v
+      "
+    networks:
+      - stt-network
+
+networks:
+  stt-network:
+    external: true

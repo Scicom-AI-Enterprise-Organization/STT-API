@@ -30,4 +30,4 @@ services:
 
 networks:
   stt-network:
-    driver: bridge
+    external: true
