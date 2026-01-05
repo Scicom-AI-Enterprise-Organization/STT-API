@@ -5,7 +5,8 @@ import logging
 import io
 import tempfile
 import asyncio
-from typing import Optional, List, Tuple
+from typing import List, Optional, Tuple
+from concurrent.futures import ProcessPoolExecutor
 import numpy as np
 import torch
 import aiohttp
@@ -14,7 +15,6 @@ import urllib.parse
 from fastapi import FastAPI, File, Form, HTTPException
 import librosa
 import soundfile as sf
-from silero_vad import load_silero_vad
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -26,7 +26,19 @@ MINIMUM_SILENT_MS = int(os.environ.get("MINIMUM_SILENT_MS", "200"))
 MINIMUM_TRIGGER_VAD_MS = int(os.environ.get("MINIMUM_TRIGGER_VAD_MS", "1500"))
 REJECT_SEGMENT_VAD_RATIO = float(os.environ.get("REJECT_SEGMENT_VAD_RATIO", "0.9"))
 
-buffer_size = 4096
+MAX_CONCURRENT_UPSTREAM = int(os.environ.get("MAX_CONCURRENT_UPSTREAM", "100"))
+upstream_semaphore = asyncio.Semaphore(MAX_CONCURRENT_UPSTREAM)
+logger.info(f"Upstream semaphore initialized with limit: {MAX_CONCURRENT_UPSTREAM}")
+
+MAX_CONCURRENT_REQUESTS = int(os.environ.get("MAX_CONCURRENT_REQUESTS", "20"))
+request_semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
+logger.info(f"Request semaphore initialized with limit: {MAX_CONCURRENT_REQUESTS}")
+
+CHUNK_BATCH_SIZE = int(os.environ.get("CHUNK_BATCH_SIZE", "8"))
+
+VAD_WORKERS = int(os.environ.get("VAD_WORKERS", "8"))
+_vad_executor = None
+
 sample_rate = SAMPLE_RATE
 maxlen = MAX_CHUNK_LENGTH
 frame_size = 512
@@ -37,12 +49,126 @@ replaces = [
     "<|transcribeprecise|>",
 ]
 pattern = r"<\|\-?\d+\.?\d*\|>"
-# Handles both with and without speaker labels
 pattern_unified = r"(?:<\|speaker:(\d+)\|>)?<\|(\d+\.\d+)\|>(.*?)<\|(\d+\.\d+)\|>"
 
-logger.info("Loading silero VAD model...")
-silero = load_silero_vad(onnx=True)
-logger.info("Silero VAD model loaded")
+_worker_silero = None
+
+
+def init_vad_worker():
+    """Initialize VAD model in worker process."""
+    global _worker_silero
+    from silero_vad import load_silero_vad
+
+    _worker_silero = load_silero_vad(onnx=True)
+    logger.info(f"Worker {os.getpid()} initialized with Silero VAD")
+
+
+def get_vad_executor():
+    """Get or create the VAD ProcessPoolExecutor."""
+    global _vad_executor
+    if _vad_executor is None:
+        _vad_executor = ProcessPoolExecutor(
+            max_workers=VAD_WORKERS, initializer=init_vad_worker
+        )
+        logger.info(f"VAD executor initialized with {VAD_WORKERS} workers")
+    return _vad_executor
+
+
+def process_audio_segment(args: Tuple) -> List[Tuple]:
+    """
+    Process a segment of audio in a worker process.
+
+    Args:
+        args: Tuple of (audio_segment, start_offset, sample_rate, frame_size,
+                       maxlen, minimum_silent_ms, minimum_trigger_vad_ms)
+
+    Returns:
+        List of (wav_data, start_ts, end_ts, silence_ratio) tuples
+    """
+    (
+        audio_segment,
+        start_offset,
+        worker_sample_rate,
+        worker_frame_size,
+        worker_maxlen,
+        worker_minimum_silent_ms,
+        worker_minimum_trigger_vad_ms,
+    ) = args
+
+    global _worker_silero
+    if _worker_silero is None:
+        from silero_vad import load_silero_vad
+
+        _worker_silero = load_silero_vad(onnx=True)
+
+    _worker_silero.reset_states()
+
+    chunks = []
+    wav_data = np.array([], dtype=np.float32)
+    last_timestamp = start_offset
+    total_silent = 0
+    total_silent_frames = 0
+    total_frames = 0
+
+    num_frames = len(audio_segment) // worker_frame_size
+
+    for i in range(num_frames):
+        start_idx = i * worker_frame_size
+        end_idx = start_idx + worker_frame_size
+        frame = audio_segment[start_idx:end_idx]
+
+        if len(frame) < worker_frame_size:
+            frame = np.pad(frame, (0, worker_frame_size - len(frame)), mode="constant")
+
+        total_frames += 1
+
+        frame_pt = torch.from_numpy(frame).unsqueeze(0)
+        vad_score = _worker_silero(frame_pt, sr=worker_sample_rate).numpy()[0][0]
+        vad = vad_score > 0.5
+
+        if vad:
+            total_silent = 0
+        else:
+            total_silent += len(frame)
+            total_silent_frames += 1
+
+        wav_data = np.concatenate([wav_data, frame])
+        audio_len = len(wav_data) / worker_sample_rate
+        audio_len_ms = audio_len * 1000
+        silent_len = (total_silent / worker_sample_rate) * 1000
+        silence_ratio = total_silent_frames / total_frames if total_frames > 0 else 0
+
+        vad_trigger = (
+            audio_len_ms >= worker_minimum_trigger_vad_ms
+            and silent_len >= worker_minimum_silent_ms
+        )
+
+        if vad_trigger or audio_len >= worker_maxlen:
+            start_ts = last_timestamp
+            end_ts = last_timestamp + audio_len
+            chunks.append((wav_data.copy(), start_ts, end_ts, silence_ratio))
+
+            last_timestamp = end_ts
+            total_silent = 0
+            total_silent_frames = 0
+            total_frames = 0
+            wav_data = np.array([], dtype=np.float32)
+
+    # Handle remaining samples
+    remaining_samples = len(audio_segment) % worker_frame_size
+    if remaining_samples > 0:
+        remaining_frame = audio_segment[-remaining_samples:]
+        wav_data = np.concatenate([wav_data, remaining_frame])
+
+    if len(wav_data) > 0:
+        audio_len = len(wav_data) / worker_sample_rate
+        silence_ratio = total_silent_frames / total_frames if total_frames > 0 else 0
+        start_ts = last_timestamp
+        end_ts = last_timestamp + audio_len
+        chunks.append((wav_data.copy(), start_ts, end_ts, silence_ratio))
+
+    return chunks
+
 
 app = FastAPI(title="STT API", description="Long audio transcription API with VAD")
 
@@ -67,7 +193,8 @@ async def transcribe_chunk(
     """
     url = urllib.parse.urljoin(STT_API_URL, "/v1/audio/transcriptions")
 
-    # Normalize to prevent clipping
+    timeout = aiohttp.ClientTimeout(total=600, connect=120, sock_read=300)
+
     if len(wav_data) > 0:
         max_val = np.max(np.abs(wav_data))
         if max_val > 0:
@@ -78,7 +205,6 @@ async def transcribe_chunk(
     wav_buffer.seek(0)
     wav_bytes = wav_buffer.read()
 
-    # OpenAI-compatible multipart form data
     form_data = FormData()
     form_data.add_field(
         "file", wav_bytes, filename="audio.wav", content_type="audio/wav"
@@ -97,78 +223,77 @@ async def transcribe_chunk(
     detected_language = None
 
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(url, data=form_data) as r:
-                if r.status == 200:
-                    response_data = await r.json()
-                    logger.debug(
-                        f"Upstream API response keys: {list(response_data.keys())}"
-                    )
+        async with upstream_semaphore:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(url, data=form_data) as r:
+                    if r.status == 200:
+                        response_data = await r.json()
+                        logger.debug(
+                            f"Upstream API response keys: {list(response_data.keys())}"
+                        )
 
-                    if "language" in response_data:
-                        lang_value = response_data["language"]
-                        # Handle case where upstream API returns None for language
-                        if lang_value is not None:
-                            detected_language = lang_value
+                        if "language" in response_data:
+                            lang_value = response_data["language"]
+                            if lang_value is not None:
+                                detected_language = lang_value
 
-                    # Handle both segments format and text with embedded timestamps
-                    if "segments" in response_data:
-                        segments = response_data.get("segments", [])
-                        if segments:
-                            text_parts = []
-                            for seg in segments:
-                                start_ts = seg.get("start", 0.0)
-                                end_ts = seg.get("end", 0.0)
-                                text = seg.get("text", "").strip()
-                                if text:
-                                    adjusted_start = round(start_ts + last_timestamp, 2)
-                                    adjusted_end = round(end_ts + last_timestamp, 2)
-                                    text_parts.append(
-                                        f"<|{adjusted_start}|>{text}<|{adjusted_end}|>"
-                                    )
-                            texts = "".join(text_parts)
+                        if "segments" in response_data:
+                            segments = response_data.get("segments", [])
+                            if segments:
+                                text_parts = []
+                                for seg in segments:
+                                    start_ts = seg.get("start", 0.0)
+                                    end_ts = seg.get("end", 0.0)
+                                    text = seg.get("text", "").strip()
+                                    if text:
+                                        adjusted_start = round(
+                                            start_ts + last_timestamp, 2
+                                        )
+                                        adjusted_end = round(end_ts + last_timestamp, 2)
+                                        text_parts.append(
+                                            f"<|{adjusted_start}|>{text}<|{adjusted_end}|>"
+                                        )
+                                texts = "".join(text_parts)
+                            else:
+                                logger.warning("Upstream API returned empty segments")
+                                texts = ""
+                        elif "text" in response_data:
+                            texts = response_data["text"]
+
+                            for replace_token in replaces:
+                                texts = texts.replace(replace_token, "")
+
+                            matches = re.findall(pattern, texts)
+                            for match in matches:
+                                timestamp = float(match.split("|")[1])
+                                timestamp += last_timestamp
+                                timestamp = round(timestamp, 2)
+                                timestamp_str = f"<|{timestamp}|>"
+                                texts = texts.replace(match, timestamp_str)
                         else:
-                            logger.warning("Upstream API returned empty segments")
+                            logger.warning(
+                                f"Unexpected response format from upstream API: {list(response_data.keys())}"
+                            )
                             texts = ""
-                    elif "text" in response_data:
-                        texts = response_data["text"]
 
-                        # Remove special tokens before timestamp adjustment
-                        for replace_token in replaces:
-                            texts = texts.replace(replace_token, "")
-
-                        # Adjust timestamps by adding last_timestamp offset
-                        matches = re.findall(pattern, texts)
-                        for match in matches:
-                            timestamp = float(match.split("|")[1])
-                            timestamp += last_timestamp
-                            timestamp = round(timestamp, 2)
-                            timestamp_str = f"<|{timestamp}|>"
-                            texts = texts.replace(match, timestamp_str)
+                        if texts and not re.search(pattern_unified, texts):
+                            logger.warning(
+                                f"No timestamp pairs found in transcription text. Text length: {len(texts)}"
+                            )
                     else:
-                        logger.warning(
-                            f"Unexpected response format from upstream API: {list(response_data.keys())}"
+                        error_text = await r.text()
+                        try:
+                            error_json = json.loads(error_text)
+                            error_detail = error_json.get(
+                                "detail",
+                                error_json.get("error", {}).get("message", error_text),
+                            )
+                        except json.JSONDecodeError:
+                            error_detail = error_text
+                        raise HTTPException(
+                            status_code=r.status,
+                            detail=f"Upstream STT API error: {error_detail}",
                         )
-                        texts = ""
-
-                    if texts and not re.search(pattern_unified, texts):
-                        logger.warning(
-                            f"No timestamp pairs found in transcription text. Text length: {len(texts)}"
-                        )
-                else:
-                    error_text = await r.text()
-                    try:
-                        error_json = json.loads(error_text)
-                        error_detail = error_json.get(
-                            "detail",
-                            error_json.get("error", {}).get("message", error_text),
-                        )
-                    except json.JSONDecodeError:
-                        error_detail = error_text
-                    raise HTTPException(
-                        status_code=r.status,
-                        detail=f"Upstream STT API error: {error_detail}",
-                    )
     except HTTPException:
         raise
     except Exception as e:
@@ -219,6 +344,69 @@ def parse_segments(text: str) -> List[dict]:
     return segments
 
 
+def vad_parallel(
+    audio_data: np.ndarray,
+    sample_rate: int,
+    frame_size: int,
+    maxlen: float,
+    minimum_silent_ms: int,
+    minimum_trigger_vad_ms: int,
+) -> List[Tuple]:
+    """
+    Process audio with VAD using multiple processes.
+
+    Splits audio into VAD_WORKERS segments, processes each in parallel, then combines results.
+
+    Note: This approach has a limitation - VAD state is not shared between segments,
+    which may cause slightly different chunking at segment boundaries (typically 3-5 extra chunks).
+
+    Args:
+        audio_data: Audio data as numpy array
+        sample_rate: Sample rate of audio
+        frame_size: Frame size for VAD processing
+        maxlen: Maximum chunk length in seconds
+        minimum_silent_ms: Minimum silence duration for VAD trigger (ms)
+        minimum_trigger_vad_ms: Minimum audio length to trigger VAD (ms)
+
+    Returns:
+        List of (wav_data, start_ts, end_ts, silence_ratio) tuples
+    """
+    audio_duration = len(audio_data) / sample_rate
+    segment_duration = audio_duration / VAD_WORKERS
+    segment_samples = int(segment_duration * sample_rate)
+
+    # Split audio into segments for each worker
+    segments = []
+    for i in range(VAD_WORKERS):
+        start_sample = i * segment_samples
+        end_sample = (
+            start_sample + segment_samples if i < VAD_WORKERS - 1 else len(audio_data)
+        )
+        start_offset = start_sample / sample_rate
+        segments.append(
+            (
+                audio_data[start_sample:end_sample],
+                start_offset,
+                sample_rate,
+                frame_size,
+                maxlen,
+                minimum_silent_ms,
+                minimum_trigger_vad_ms,
+            )
+        )
+
+    # Process segments in parallel
+    executor = get_vad_executor()
+    results = list(executor.map(process_audio_segment, segments))
+
+    # Combine results
+    all_chunks = []
+    for segment_chunks in results:
+        all_chunks.extend(segment_chunks)
+
+    return all_chunks
+
+
 @app.get("/")
 async def read_root():
     return {"message": "STT API", "version": "1.0"}
@@ -244,6 +432,26 @@ async def audio_transcriptions(
     - minimum_trigger_vad_ms: Minimum audio length to trigger VAD (ms)
     - reject_segment_vad_ratio: Reject segments with this ratio of silence (0.0-1.0)
     """
+    async with request_semaphore:
+        return await _process_transcription(
+            file=file,
+            language=language,
+            response_format=response_format,
+            minimum_silent_ms=minimum_silent_ms,
+            minimum_trigger_vad_ms=minimum_trigger_vad_ms,
+            reject_segment_vad_ratio=reject_segment_vad_ratio,
+        )
+
+
+async def _process_transcription(
+    file: bytes,
+    language: str,
+    response_format: str,
+    minimum_silent_ms: int,
+    minimum_trigger_vad_ms: int,
+    reject_segment_vad_ratio: float,
+):
+    """Internal transcription processing (wrapped by request semaphore)."""
     logger.info(f"Request: language={language}")
 
     if language is None:
@@ -280,86 +488,25 @@ async def audio_transcriptions(
             status_code=400, detail=f"Error loading audio file: {str(e)}"
         )
 
-    # Phase 1: VAD chunking
-    chunks = []  # (wav_data, start_timestamp, end_timestamp, silence_ratio)
-    wav_data = np.array([], dtype=np.float32)
-    last_timestamp = 0.0
-    total_silent = 0
-    total_silent_frames = 0
-    total_frames = 0
-    frames_per_chunk = frame_size
+    chunks = []
 
     try:
-        logger.info("Phase 1: VAD chunking...")
-        num_frames = len(audio_data) // frames_per_chunk
-
-        for i in range(num_frames):
-            start_idx = i * frames_per_chunk
-            end_idx = start_idx + frames_per_chunk
-            frame = audio_data[start_idx:end_idx]
-
-            if len(frame) < frames_per_chunk:
-                frame = np.pad(
-                    frame, (0, frames_per_chunk - len(frame)), mode="constant"
-                )
-
-            total_frames += 1
-
-            frame_pt = torch.from_numpy(frame).unsqueeze(0)
-            vad_score = silero(frame_pt, sr=sample_rate).numpy()[0][0]
-            vad = vad_score > 0.5
-
-            if vad:
-                total_silent = 0
-            else:
-                total_silent += len(frame)
-                total_silent_frames += 1
-
-            wav_data = np.concatenate([wav_data, frame])
-            audio_len = len(wav_data) / sample_rate
-            audio_len_ms = audio_len * 1000
-            silent_len = (total_silent / sample_rate) * 1000
-            silence_ratio = (
-                total_silent_frames / total_frames if total_frames > 0 else 0
-            )
-
-            vad_trigger = (
-                audio_len_ms >= minimum_trigger_vad_ms
-                and silent_len >= minimum_silent_ms
-            )
-
-            if vad_trigger or audio_len >= maxlen:
-                start_ts = last_timestamp
-                end_ts = last_timestamp + audio_len
-                chunks.append((wav_data.copy(), start_ts, end_ts, silence_ratio))
-
-                last_timestamp = end_ts
-                total_silent = 0
-                total_silent_frames = 0
-                total_frames = 0
-                wav_data = np.array([], dtype=np.float32)
-
-        remaining_samples = len(audio_data) % frames_per_chunk
-        if remaining_samples > 0:
-            remaining_frame = audio_data[-remaining_samples:]
-            wav_data = np.concatenate([wav_data, remaining_frame])
-
-        if len(wav_data) > 0:
-            audio_len = len(wav_data) / sample_rate
-            silence_ratio = (
-                total_silent_frames / total_frames if total_frames > 0 else 0
-            )
-            start_ts = last_timestamp
-            end_ts = last_timestamp + audio_len
-            chunks.append((wav_data.copy(), start_ts, end_ts, silence_ratio))
-
+        logger.info(f"Phase 1: VAD chunking (parallel, {VAD_WORKERS} workers)...")
+        chunks = vad_parallel(
+            audio_data=audio_data,
+            sample_rate=sample_rate,
+            frame_size=frame_size,
+            maxlen=maxlen,
+            minimum_silent_ms=minimum_silent_ms,
+            minimum_trigger_vad_ms=minimum_trigger_vad_ms,
+        )
         logger.info(f"Phase 1 complete: {len(chunks)} chunks created")
 
-        # Phase 2: Concurrent transcription
+        audio_data = None
+
         logger.info("Phase 2: Transcribing chunks concurrently...")
 
-        transcription_tasks = []
-
+        chunks_to_transcribe = []
         for chunk_idx, (wav_chunk, start_ts, end_ts, silence_ratio) in enumerate(
             chunks
         ):
@@ -369,28 +516,50 @@ async def audio_transcriptions(
                     f"{start_ts:.2f}s-{end_ts:.2f}s "
                     f"(silence: {silence_ratio:.1%})"
                 )
-                transcription_tasks.append(
-                    transcribe_chunk(
-                        wav_data=wav_chunk,
-                        language=language,
-                        timestamp_granularities="segment",
-                        last_timestamp=start_ts,
-                    )
-                )
+                chunks_to_transcribe.append((wav_chunk, start_ts))
             else:
                 logger.info(
                     f"Chunk {chunk_idx + 1}/{len(chunks)}: Skipped (too silent: {silence_ratio:.1%})"
                 )
 
-        results = await asyncio.gather(*transcription_tasks)
+        chunks = None
 
         all_transcriptions = []
         detected_language = None
+        total_chunks = len(chunks_to_transcribe)
 
-        for transcription, chunk_lang in results:
-            all_transcriptions.append(transcription)
-            if detected_language is None and chunk_lang is not None:
-                detected_language = chunk_lang
+        for batch_start in range(0, total_chunks, CHUNK_BATCH_SIZE):
+            batch_end = min(batch_start + CHUNK_BATCH_SIZE, total_chunks)
+            batch = chunks_to_transcribe[batch_start:batch_end]
+
+            logger.info(
+                f"Processing batch {batch_start // CHUNK_BATCH_SIZE + 1}/"
+                f"{(total_chunks + CHUNK_BATCH_SIZE - 1) // CHUNK_BATCH_SIZE} "
+                f"(chunks {batch_start + 1}-{batch_end})"
+            )
+
+            batch_tasks = [
+                transcribe_chunk(
+                    wav_data=wav_chunk,
+                    language=language,
+                    timestamp_granularities="segment",
+                    last_timestamp=start_ts,
+                )
+                for wav_chunk, start_ts in batch
+            ]
+
+            batch_results = await asyncio.gather(*batch_tasks)
+
+            for transcription, chunk_lang in batch_results:
+                all_transcriptions.append(transcription)
+                if detected_language is None and chunk_lang is not None:
+                    detected_language = chunk_lang
+
+            batch = None
+            batch_tasks = None
+            batch_results = None
+
+        chunks_to_transcribe = None
 
         logger.info(f"Phase 2 complete: {len(all_transcriptions)} chunks transcribed")
 
