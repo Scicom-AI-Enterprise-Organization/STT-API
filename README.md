@@ -6,6 +6,7 @@ Long-form speech-to-text API that:
 - **Keeps global timestamps** across all chunks
 - **Transcribes chunks concurrently** for improved performance
 - **Proxies to an upstream STT engine** via an OpenAI-compatible `/v1/audio/transcriptions` endpoint
+- **Speaker diarization** with online (TitaNet + StreamingKMeans) or offline (pyannote) modes
 
 ---
 
@@ -186,6 +187,9 @@ curl -X POST "http://localhost:9090/audio/transcriptions" \
 | `minimum_silent_ms` | int | 200 | Minimum silence duration for VAD trigger (ms) |
 | `minimum_trigger_vad_ms` | int | 1500 | Minimum audio length to trigger VAD (ms) |
 | `reject_segment_vad_ratio` | float | 0.9 | Reject segments with this ratio of silence (0.0-1.0) |
+| `diarization` | string | none | Diarization mode: `none`, `online`, or `offline` |
+| `speaker_similarity` | float | 0.75 | Online mode: speaker clustering threshold (0.0-1.0) |
+| `speaker_max_n` | int | 10 | Online mode: maximum number of speakers |
 
 ### Response Formats
 
@@ -219,7 +223,70 @@ curl -X POST "http://localhost:9090/audio/transcriptions" \
 }
 ```
 
+**`verbose_json` with diarization**:
+```json
+{
+  "language": "en",
+  "duration": 144.94,
+  "text": "Hello there. Hi, how are you?",
+  "segments": [
+    {
+      "id": 0,
+      "start": 0.0,
+      "end": 3.68,
+      "text": "Hello there.",
+      "speaker": 0
+    },
+    {
+      "id": 1,
+      "start": 3.68,
+      "end": 7.42,
+      "text": "Hi, how are you?",
+      "speaker": 1
+    }
+  ]
+}
+```
+
 **`text`**: Plain text string
+
+---
+
+## Speaker Diarization
+
+The API supports optional speaker diarization to identify who is speaking in each segment.
+
+### Diarization Modes
+
+| Mode | Description | Speed | Accuracy |
+|------|-------------|-------|----------|
+| `none` | No speaker labels (default) | Fastest | N/A |
+| `online` | TitaNet + StreamingKMeans | Fast | Good |
+| `offline` | External OSD service (pyannote) | Slow | Best |
+
+### Online Diarization
+
+Uses TitaNet Large for speaker embeddings with batched GPU inference, combined with StreamingKMeansMaxCluster for incremental speaker assignment.
+
+**Parameters:**
+- `speaker_similarity`: Cosine similarity threshold (0.0-1.0). Higher = stricter matching, fewer speakers. Default: 0.75
+- `speaker_max_n`: Maximum speakers to detect. Default: 10
+
+### Offline Diarization
+
+Calls an external OSD (Offline Speaker Diarization) service running pyannote/speaker-diarization-3.1. More accurate but requires the OSD service to be running and takes longer.
+
+### Example with Diarization
+
+```bash
+curl -X POST "http://localhost:9090/audio/transcriptions" \
+  -F "file=@meeting.mp3" \
+  -F "language=en" \
+  -F "response_format=verbose_json" \
+  -F "diarization=online" \
+  -F "speaker_similarity=0.7" \
+  -F "speaker_max_n=5"
+```
 
 ---
 
@@ -442,6 +509,14 @@ VAD RTF (lower is better):
 | `OMP_NUM_THREADS` | 2 | OpenMP threads per process |
 | `OPENBLAS_NUM_THREADS` | 2 | OpenBLAS threads per process |
 | `MKL_NUM_THREADS` | 2 | Intel MKL threads per process |
+
+### Diarization Configuration
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `OSD_API_URL` | http://osd:8000 | Offline diarization service URL |
+| `ENABLE_ONLINE_DIARIZATION` | true | Load TitaNet model at startup |
+| `SPEAKER_EMBEDDING_BATCH_SIZE` | 16 | Batch size for speaker embedding GPU inference |
 
 ---
 

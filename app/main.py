@@ -15,6 +15,7 @@ import urllib.parse
 from fastapi import FastAPI, File, Form, HTTPException
 import librosa
 import soundfile as sf
+from app.diarization import load_speaker_model, online_diarize
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -25,6 +26,10 @@ MAX_CHUNK_LENGTH = float(os.environ.get("MAX_CHUNK_LENGTH", "25"))
 MINIMUM_SILENT_MS = int(os.environ.get("MINIMUM_SILENT_MS", "200"))
 MINIMUM_TRIGGER_VAD_MS = int(os.environ.get("MINIMUM_TRIGGER_VAD_MS", "1500"))
 REJECT_SEGMENT_VAD_RATIO = float(os.environ.get("REJECT_SEGMENT_VAD_RATIO", "0.9"))
+ENABLE_ONLINE_DIARIZATION = (
+    os.environ.get("ENABLE_ONLINE_DIARIZATION", "true").lower() == "true"
+)
+OSD_API_URL = os.environ.get("OSD_API_URL", "http://osd:8000")
 
 MAX_CONCURRENT_UPSTREAM = int(os.environ.get("MAX_CONCURRENT_UPSTREAM", "100"))
 upstream_semaphore = asyncio.Semaphore(MAX_CONCURRENT_UPSTREAM)
@@ -72,6 +77,24 @@ def get_vad_executor():
         )
         logger.info(f"VAD executor initialized with {VAD_WORKERS} workers")
     return _vad_executor
+
+
+def initialize_models():
+    """
+    Initialize all models at startup.
+    """
+    get_vad_executor()
+
+    if ENABLE_ONLINE_DIARIZATION:
+        try:
+            load_speaker_model()
+        except Exception as e:
+            logger.warning(
+                f"Failed to load speaker model: {e}. Online diarization disabled."
+            )
+
+
+initialize_models()
 
 
 def process_audio_segment(args: Tuple) -> List[Tuple]:
@@ -344,6 +367,143 @@ def parse_segments(text: str) -> List[dict]:
     return segments
 
 
+async def offline_diarize(
+    audio_bytes: bytes, filename: str = "audio.wav"
+) -> List[dict]:
+    """
+    Call external OSD service for precise speaker diarization.
+
+    The OSD service use pyannote/speaker-diarization-3.1 which is more accurate but slower than online diarization.
+
+    Args:
+        audio_bytes: Raw audio file bytes
+        filename: Original filename for format detection
+
+        Returns:
+        List of diarization segments: [{"start": float, "end": float, "speaker": str}, ...]
+
+    Reference: osd/app/main.py - /diarize endpoint
+    """
+    url = urllib.parse.urljoin(OSD_API_URL, "/diarize")
+
+    timeout = aiohttp.ClientTimeout(total=600, connect=120, sock_read=300)
+
+    form_data = FormData()
+    form_data.add_field(
+        "file", audio_bytes, filename=filename, content_type="application/octet-stream"
+    )
+
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(url, data=form_data) as r:
+                if r.status == 200:
+                    # OSD returns: [{"segment": ..., "label": ..., "speaker": "SPEAKER_00", "start": 0.0, "end": 1.5}, ...]
+                    result = await r.json()
+                    logger.info(f"OSD returned {len(result)} diarization segments")
+                    return result
+                else:
+                    error_text = await r.text()
+                    logger.error(f"OSD API error {r.status}: {error_text}")
+                    raise HTTPException(
+                        status_code=r.status,
+                        detail=f"OSD diarization service error: {error_text}",
+                    )
+    except aiohttp.ClientError as e:
+        logger.error(f"Failed to connect to OSD service at {OSD_API_URL}: {e}")
+        raise HTTPException(
+            status_code=503, detail=f"OSD diarization service unavailable: {str(e)}"
+        )
+
+
+def find_speaker_for_timestamp(
+    start: float, end: float, diarization_segments: List[dict]
+) -> Optional[int]:
+    """
+    Find the speaker for a given timestamp range using overlap.
+
+    Args:
+        start: Segment start time
+        end: Segment end time
+        diarization_segments: List of {"start": float, "end": float, "speaker": str}
+
+    Returns:
+        Speaker ID (int) or None if no overlap found
+    """
+    best_overlap = 0
+    best_speaker = None
+
+    for dia_seg in diarization_segments:
+        dia_start = dia_seg.get("start", 0)
+        dia_end = dia_seg.get("end", 0)
+        speaker = dia_seg.get("speaker", "SPEAKER_00")
+
+        # Calculate overlap
+        overlap_start = max(start, dia_start)
+        overlap_end = min(end, dia_end)
+        overlap = max(0, overlap_end - overlap_start)
+
+        if overlap > best_overlap:
+            best_overlap = overlap
+            # Convert "SPEAKER_00" -> 0, "SPEAKER_01" -> 1, etc.
+            try:
+                best_speaker = int(speaker.replace("SPEAKER_", ""))
+            except (ValueError, AttributeError):
+                best_speaker = 0
+
+    return best_speaker
+
+
+def merge_speakers_with_segments(
+    segments: List[dict],
+    speaker_data: dict,
+    mode: str,
+    chunks_to_transcribe: List[tuple] = None,
+) -> List[dict]:
+    """
+    Add speaker field to each transcription segment.
+
+    Args:
+        segments: Transcription segments [{"id": 0, "start": 0.0, "end": 3.5, "text": "..."}, ...]
+        speaker_data: Either:
+            - online mode: {chunk_idx: speaker_id} from online_diarize()
+            - offline mode: [{"start": float, "end": float, "speaker": str}, ...] from OSD
+        mode: "online" or "offline"
+        chunks_to_transcribe: For online mode, list of (wav_data, start_ts) to map segments to chunks
+
+    Returns:
+        Segments with added "speaker" field
+    """
+    if mode == "online" and chunks_to_transcribe:
+        # build a mapping of timestamp ranges to chunk indices
+        chunk_ranges = []
+        for idx, (_, start_ts) in enumerate(chunks_to_transcribe):
+            chunk_ranges.append((start_ts, idx))
+        chunk_ranges.sort(key=lambda x: x[0])
+
+        for seg in segments:
+            seg_start = seg.get("start", 0)
+
+            # find which chunk this segment belongs to
+            chunk_idx = 0
+            for i, (chunk_start, idx) in enumerate(chunk_ranges):
+                if seg_start >= chunk_start:
+                    chunk_idx = idx
+                else:
+                    break
+
+            seg["speaker"] = speaker_data.get(chunk_idx, 0)
+
+    elif mode == "offline":
+        # speaker_data is list of OSD segments
+        for seg in segments:
+            speaker = find_speaker_for_timestamp(
+                seg.get("start", 0), seg.get("end", 0), speaker_data
+            )
+            seg["speaker"] = speaker if speaker is not None else 0
+
+    return segments
+
+
 def vad_parallel(
     audio_data: np.ndarray,
     sample_rate: int,
@@ -420,6 +580,9 @@ async def audio_transcriptions(
     minimum_silent_ms: int = Form(MINIMUM_SILENT_MS),
     minimum_trigger_vad_ms: int = Form(MINIMUM_TRIGGER_VAD_MS),
     reject_segment_vad_ratio: float = Form(REJECT_SEGMENT_VAD_RATIO),
+    diarization: str = Form("none"),  # none | online | offline
+    speaker_similarity: float = Form(0.75),  # for online, clustering threshold
+    speaker_max_n: int = Form(10),  # for online, max speakers
 ):
     """
     Long audio transcription API with VAD chunking.
@@ -440,6 +603,9 @@ async def audio_transcriptions(
             minimum_silent_ms=minimum_silent_ms,
             minimum_trigger_vad_ms=minimum_trigger_vad_ms,
             reject_segment_vad_ratio=reject_segment_vad_ratio,
+            diarization=diarization,
+            speaker_similarity=speaker_similarity,
+            speaker_max_n=speaker_max_n,
         )
 
 
@@ -450,6 +616,9 @@ async def _process_transcription(
     minimum_silent_ms: int,
     minimum_trigger_vad_ms: int,
     reject_segment_vad_ratio: float,
+    diarization: str = "none",
+    speaker_similarity: float = 0.75,
+    speaker_max_n: int = 10,
 ):
     """Internal transcription processing (wrapped by request semaphore)."""
     logger.info(f"Request: language={language}")
@@ -470,6 +639,22 @@ async def _process_transcription(
             status_code=400,
             detail="response_format only supports: text, json, verbose_json",
         )
+
+    diarization = diarization.lower().strip()
+    if diarization not in {"none", "online", "offline"}:
+        raise HTTPException(
+            status_code=400, detail="diarization only supports: none, online, offline"
+        )
+
+    if diarization == "online":
+        try:
+            from app.diarization import get_speaker_model
+
+            get_speaker_model()
+        except Exception as e:
+            raise HTTPException(
+                status_code=503, detail=f"Online diarization unavailable: {str(e)}"
+            )
 
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=".tmp") as tmp_file:
@@ -524,6 +709,30 @@ async def _process_transcription(
 
         chunks = None
 
+        diarize_task = None
+        speaker_assignments = None
+
+        if diarization == "online":
+            from app.diarization import online_diarize
+
+            diarize_chunks = [
+                (wav_chunk, start_ts, start_ts + len(wav_chunk) / sample_rate)
+                for wav_chunk, start_ts in chunks_to_transcribe
+            ]
+
+            loop = asyncio.get_event_loop()
+            diarize_task = loop.run_in_executor(
+                None,
+                lambda: online_diarize(
+                    diarize_chunks,
+                    speaker_similarity=speaker_similarity,
+                    speaker_max_n=speaker_max_n,
+                ),
+            )
+
+        elif diarization == "offline":
+            diarize_task = asyncio.create_task(offline_diarize(file))
+
         all_transcriptions = []
         detected_language = None
         total_chunks = len(chunks_to_transcribe)
@@ -559,7 +768,25 @@ async def _process_transcription(
             batch_tasks = None
             batch_results = None
 
+        chunks_for_diarization = chunks_to_transcribe if diarization == "online" else None
         chunks_to_transcribe = None
+
+        if diarize_task is not None:
+            try:
+                if diarization == "online":
+                    speaker_assignments = await diarize_task
+                    logger.info(
+                        f"Online diarization complete: {len(speaker_assignments)} assignments"
+                    )
+                elif diarization == "offline":
+                    diarize_result = await diarize_task
+                    speaker_assignments = diarize_result
+                    logger.info(
+                        f"Offline diarization complete: {len(diarize_result)} segments"
+                    )
+            except Exception as e:
+                logger.error(f"Diarization failed: {e}")
+                speaker_assignments = None
 
         logger.info(f"Phase 2 complete: {len(all_transcriptions)} chunks transcribed")
 
@@ -570,6 +797,14 @@ async def _process_transcription(
         raise HTTPException(status_code=500, detail=f"Error processing audio: {str(e)}")
 
     segments = parse_segments(combined_text)
+
+    if speaker_assignments is not None and segments:
+        segments = merge_speakers_with_segments(
+            segments=segments,
+            speaker_data=speaker_assignments,
+            mode=diarization,
+            chunks_to_transcribe=chunks_for_diarization,
+        )
 
     final_text = " ".join(seg["text"] for seg in segments) if segments else ""
 
