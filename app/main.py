@@ -581,7 +581,7 @@ async def audio_transcriptions(
     minimum_trigger_vad_ms: int = Form(MINIMUM_TRIGGER_VAD_MS),
     reject_segment_vad_ratio: float = Form(REJECT_SEGMENT_VAD_RATIO),
     diarization: str = Form("none"),  # none | online | offline
-    speaker_similarity: float = Form(0.75),  # for online, clustering threshold
+    speaker_similarity: float = Form(0.5),  # for online, clustering threshold
     speaker_max_n: int = Form(10),  # for online, max speakers
 ):
     """
@@ -617,7 +617,7 @@ async def _process_transcription(
     minimum_trigger_vad_ms: int,
     reject_segment_vad_ratio: float,
     diarization: str = "none",
-    speaker_similarity: float = 0.75,
+    speaker_similarity: float = 0.5,
     speaker_max_n: int = 10,
 ):
     """Internal transcription processing (wrapped by request semaphore)."""
