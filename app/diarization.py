@@ -134,8 +134,13 @@ def online_diarize(
     speaker_assignments = {}
     for idx, embedding in enumerate(embeddings):
         # malaya_speech.diarization.streaming() assigns speaker ID
-        # it returns the cluster ID for this embedding
-        speaker_id = malaya_speech.diarization.streaming(embedding, clustering)
+        # it returns strings like "speaker 0", "speaker 1", etc.
+        speaker_label = malaya_speech.diarization.streaming(embedding, clustering)
+        # Convert "speaker 0" -> 0, "speaker 1" -> 1, etc.
+        try:
+            speaker_id = int(speaker_label.replace("speaker ", ""))
+        except (ValueError, AttributeError):
+            speaker_id = 0
         speaker_assignments[idx] = speaker_id
 
     speaker_counts = {}
