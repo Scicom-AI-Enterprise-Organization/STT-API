@@ -111,11 +111,11 @@ def online_diarize(
     Returns:
         Dictionary mapping chunk_index -> speaker_id (0-indexed)
     """
-    from malaya_speech.model.clustering import StreamingKMeansMaxCluster
-    import malaya_speech
-
     if not chunks:
         return {}
+
+    from malaya_speech.model.clustering import StreamingKMeansMaxCluster
+    import malaya_speech
 
     # 1. extract
     audio_data = [chunk[0] for chunk in chunks]
