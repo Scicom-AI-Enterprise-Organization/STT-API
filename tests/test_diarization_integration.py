@@ -8,10 +8,81 @@ import aiohttp
 TEST_AUDIO = os.environ.get("TEST_AUDIO", "test_audio/masak.mp3")
 API_URL = os.environ.get("STT_API_URL", "http://localhost:9090")
 
+# Diarization modes to test - can be filtered via pytest -k
+DIARIZATION_MODES = ["none", "online", "offline"]
+
 
 @pytest.fixture
 def api_url():
     return API_URL
+
+
+@pytest.fixture
+def test_audio_path():
+    """Return test audio path, skip if not found."""
+    if not os.path.exists(TEST_AUDIO):
+        pytest.skip(f"Test audio not found: {TEST_AUDIO}")
+    return TEST_AUDIO
+
+
+class TestDiarizationParameterized:
+    """Parameterized tests for running same test across all diarization modes."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("diarization_mode", DIARIZATION_MODES)
+    async def test_transcription_succeeds(self, api_url, test_audio_path, diarization_mode):
+        """Test that transcription succeeds for each diarization mode."""
+        async with aiohttp.ClientSession() as session:
+            with open(test_audio_path, "rb") as f:
+                data = aiohttp.FormData()
+                data.add_field("file", f, filename="test.mp3")
+                data.add_field("response_format", "verbose_json")
+                data.add_field("diarization", diarization_mode)
+                if diarization_mode in ("online", "offline"):
+                    data.add_field("speaker_similarity", "0.75")
+                    data.add_field("speaker_max_n", "10")
+
+                async with session.post(
+                    f"{api_url}/audio/transcriptions", data=data
+                ) as r:
+                    # Skip if offline service unavailable
+                    if diarization_mode == "offline" and r.status == 503:
+                        pytest.skip("OSD service not available")
+
+                    assert r.status == 200, f"Failed for mode={diarization_mode}: {await r.text()}"
+                    result = await r.json()
+
+                    assert "text" in result
+                    assert "segments" in result
+                    assert isinstance(result["segments"], list)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("diarization_mode", ["online", "offline"])
+    async def test_speaker_labels_present(self, api_url, test_audio_path, diarization_mode):
+        """Test that speaker labels are present when diarization is enabled."""
+        async with aiohttp.ClientSession() as session:
+            with open(test_audio_path, "rb") as f:
+                data = aiohttp.FormData()
+                data.add_field("file", f, filename="test.mp3")
+                data.add_field("response_format", "verbose_json")
+                data.add_field("diarization", diarization_mode)
+                data.add_field("speaker_similarity", "0.75")
+                data.add_field("speaker_max_n", "10")
+
+                async with session.post(
+                    f"{api_url}/audio/transcriptions", data=data
+                ) as r:
+                    if diarization_mode == "offline" and r.status == 503:
+                        pytest.skip("OSD service not available")
+
+                    assert r.status == 200
+                    result = await r.json()
+
+                    if result["segments"]:
+                        for seg in result["segments"]:
+                            assert "speaker" in seg, f"Missing speaker in segment for mode={diarization_mode}"
+                            assert isinstance(seg["speaker"], int)
+                            assert seg["speaker"] >= 0
 
 
 class TestDiarizationIntegration:

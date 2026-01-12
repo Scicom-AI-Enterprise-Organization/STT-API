@@ -16,6 +16,7 @@ dependencies = [
     "librosa",
     "soundfile",
     "malaya-speech==1.4.0rc2",
+    "six",
 ]
 
 [project.optional-dependencies]

@@ -8,11 +8,17 @@ Usage:
     # Or for direct testing:
     STT_API_URL=http://localhost:9090 AUDIO_FILE=test_audio/masak.mp3 python stress_test.py
 
+    # Test with diarization:
+    DIARIZATION_MODE=online SPEAKER_SIMILARITY=0.75 docker compose run --rm stress-test
+
 Environment Variables:
     WARMUP_COUNT: Number of warmup requests (default: 3)
     CONCURRENCY: Number of concurrent requests (default: 50)
     STT_API_URL: URL of the STT API (default: http://stt-api:9090)
     AUDIO_FILE: Path to audio file for testing (default: /app/test_audio/masak.mp3)
+    DIARIZATION_MODE: Diarization mode - none, online, offline (default: none)
+    SPEAKER_SIMILARITY: Speaker clustering threshold for online mode (default: 0.75)
+    SPEAKER_MAX_N: Maximum speakers for online mode (default: 10)
 """
 
 import os
@@ -26,6 +32,9 @@ WARMUP_COUNT = int(os.environ.get("WARMUP_COUNT", "3"))
 CONCURRENCY = int(os.environ.get("CONCURRENCY", "50"))
 STT_API_URL = os.environ.get("STT_API_URL", "http://stt-api:9090")
 AUDIO_FILE = os.environ.get("AUDIO_FILE", "/app/test_audio/masak.mp3")
+DIARIZATION_MODE = os.environ.get("DIARIZATION_MODE", "none")
+SPEAKER_SIMILARITY = os.environ.get("SPEAKER_SIMILARITY", "0.75")
+SPEAKER_MAX_N = os.environ.get("SPEAKER_MAX_N", "10")
 
 
 def get_audio_duration(file_path: str) -> float:
@@ -57,7 +66,11 @@ async def transcribe_request(
             "file", audio_bytes, filename=filename, content_type="audio/mpeg"
         )
         data.add_field("language", "ms")
-        data.add_field("response_format", "json")
+        data.add_field("response_format", "verbose_json")
+        data.add_field("diarization", DIARIZATION_MODE)
+        if DIARIZATION_MODE in ("online", "offline"):
+            data.add_field("speaker_similarity", SPEAKER_SIMILARITY)
+            data.add_field("speaker_max_n", SPEAKER_MAX_N)
 
         async with session.post(url, data=data) as response:
             if response.status == 200:
@@ -100,6 +113,10 @@ def print_report(results: list, audio_duration: float, concurrency: int):
     print("\n--- Test Configuration ---")
     print(f"Concurrency: {concurrency}")
     print(f"Audio Duration: {audio_duration:.2f}s")
+    print(f"Diarization: {DIARIZATION_MODE}")
+    if DIARIZATION_MODE in ("online", "offline"):
+        print(f"  Speaker Similarity: {SPEAKER_SIMILARITY}")
+        print(f"  Max Speakers: {SPEAKER_MAX_N}")
     print(f"Total Requests: {len(results)}")
     print(f"Successful: {len(successful)}")
     print(f"Failed: {len(failed)}")
@@ -181,6 +198,7 @@ async def main():
 
     print(f"Audio duration: {audio_duration:.2f}s")
     print(f"API URL: {STT_API_URL}")
+    print(f"Diarization mode: {DIARIZATION_MODE}")
 
     # Warmup
     print(f"\n--- Warmup ({WARMUP_COUNT} requests) ---")

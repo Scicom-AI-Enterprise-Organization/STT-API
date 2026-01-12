@@ -51,6 +51,10 @@ services:
       - AUDIO_FILE=/app/test_audio/masak.mp3
       - CONCURRENCY=50
       - WARMUP_COUNT=3
+      # Diarization config (none, online, offline)
+      - DIARIZATION_MODE=none
+      - SPEAKER_SIMILARITY=0.75
+      - SPEAKER_MAX_N=10
     working_dir: /app
     command: uv run python stress_test.py
     depends_on:

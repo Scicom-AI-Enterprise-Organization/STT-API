@@ -292,26 +292,94 @@ curl -X POST "http://localhost:9090/audio/transcriptions" \
 
 ## Testing
 
-### Integration Tests
+### Quick Reference
 
-Run integration tests that call the API:
+| Test Type | Command |
+|-----------|---------|
+| Direct API test | `curl -X POST http://localhost:9090/audio/transcriptions -F "file=@audio.mp3"` |
+| Unit tests | `uv run pytest tests/test_main.py tests/test_diarization.py -v` |
+| Integration tests (container) | `docker compose --profile test run --rm stress-test uv run pytest tests/ -v` |
+| Stress test | `docker compose run --rm stress-test` |
+| Stress test with diarization | `docker compose run --rm -e DIARIZATION_MODE=online stress-test` |
+
+### Direct API Testing
+
+Test the API directly using curl:
 
 ```bash
-# Start the API
-docker-compose up -d
+# Basic transcription
+curl -X POST "http://localhost:9090/audio/transcriptions" \
+  -F "file=@test_audio/masak.mp3" \
+  -F "language=ms" \
+  -F "response_format=json"
 
-# Run tests
-docker compose -f test.yaml up --build
+# With online diarization
+curl -X POST "http://localhost:9090/audio/transcriptions" \
+  -F "file=@test_audio/masak.mp3" \
+  -F "response_format=verbose_json" \
+  -F "diarization=online" \
+  -F "speaker_similarity=0.75" \
+  -F "speaker_max_n=5"
+
+# With offline diarization (requires OSD service)
+curl -X POST "http://localhost:9090/audio/transcriptions" \
+  -F "file=@test_audio/masak.mp3" \
+  -F "response_format=verbose_json" \
+  -F "diarization=offline"
+
+# Health check
+curl http://localhost:9090/
 ```
 
 ### Unit Tests
 
+Run unit tests locally (no running API needed):
+
 ```bash
 # Install dev dependencies
-docker-compose exec stt-api uv sync --extra dev
+uv sync --extra dev
 
-# Run unit tests
-docker-compose exec stt-api uv run pytest tests/test_main.py -v
+# Run all unit tests
+uv run pytest tests/test_main.py tests/test_diarization.py -v
+
+# Run specific test
+uv run pytest tests/test_diarization.py::TestOnlineDiarization -v
+```
+
+### Integration Tests (Container-to-Container)
+
+Run integration tests from within the Docker network:
+
+```bash
+# Start the API first
+docker compose up -d stt-api
+
+# Run integration tests from stress-test container
+docker compose --profile test run --rm stress-test \
+  uv run pytest tests/test_integration.py tests/test_diarization_integration.py -v
+
+# Run only diarization tests
+docker compose --profile test run --rm stress-test \
+  uv run pytest tests/test_diarization_integration.py -v
+
+# Run parameterized tests for a specific diarization mode
+docker compose --profile test run --rm stress-test \
+  uv run pytest tests/test_diarization_integration.py -k "online" -v
+```
+
+### Integration Tests (Local to Container)
+
+Run integration tests from your local machine against the containerized API:
+
+```bash
+# Start the API
+docker compose up -d stt-api
+
+# Install dev dependencies locally
+uv sync --extra dev
+
+# Run tests (pointing to localhost)
+STT_API_URL=http://localhost:9090 uv run pytest tests/test_integration.py -v
 ```
 
 ---
@@ -323,11 +391,22 @@ The `stress_test.py` script benchmarks API performance under concurrent load.
 ### Running Stress Tests
 
 ```bash
-# Run with default settings (50 concurrent requests)
+# Run with default settings (50 concurrent requests, no diarization)
 docker compose run --rm stress-test
 
-# Run with custom concurrency
-docker compose run --rm -e CONCURRENCY=100 stress-test
+# Run with online diarization
+docker compose run --rm -e DIARIZATION_MODE=online stress-test
+
+# Run with offline diarization
+docker compose run --rm -e DIARIZATION_MODE=offline stress-test
+
+# Run with custom concurrency and diarization
+docker compose run --rm \
+  -e CONCURRENCY=100 \
+  -e DIARIZATION_MODE=online \
+  -e SPEAKER_SIMILARITY=0.8 \
+  -e SPEAKER_MAX_N=5 \
+  stress-test
 
 # Run with custom audio file
 docker compose run --rm -e AUDIO_FILE=/app/test_audio/custom.mp3 stress-test
@@ -341,6 +420,9 @@ docker compose run --rm -e AUDIO_FILE=/app/test_audio/custom.mp3 stress-test
 | `WARMUP_COUNT` | 3 | Number of warmup requests before test |
 | `STT_API_URL` | http://stt-api:9090 | API URL to test |
 | `AUDIO_FILE` | /app/test_audio/masak.mp3 | Audio file for testing |
+| `DIARIZATION_MODE` | none | Diarization mode: `none`, `online`, `offline` |
+| `SPEAKER_SIMILARITY` | 0.75 | Speaker clustering threshold (online mode) |
+| `SPEAKER_MAX_N` | 10 | Maximum speakers to detect (online mode) |
 
 ### Sample Output
 
@@ -352,6 +434,9 @@ STT-API STRESS TEST REPORT
 --- Test Configuration ---
 Concurrency: 100
 Audio Duration: 144.94s
+Diarization: online
+  Speaker Similarity: 0.75
+  Max Speakers: 10
 Total Requests: 100
 Successful: 100
 Failed: 0
