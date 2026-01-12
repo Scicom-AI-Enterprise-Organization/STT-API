@@ -15,6 +15,11 @@ logger = logging.getLogger(__name__)
 SPEAKER_EMBEDDING_BATCH_SIZE = int(os.environ.get("SPEAKER_EMBEDDING_BATCH_SIZE", "16"))
 SPEAKER_PRECISION_MODE = os.environ.get("SPEAKER_PRECISION_MODE", "FP32")
 
+# Minimum audio samples required for TitaNet embedding extraction
+# TitaNet uses hop_length=160 at 16kHz, needs multiple frames for mel spectrogram
+# 0.5 seconds = 8000 samples at 16kHz is a safe minimum
+MIN_CHUNK_SAMPLES = int(os.environ.get("MIN_CHUNK_SAMPLES_FOR_EMBEDDING", "8000"))
+
 _speaker_model = None
 
 def load_speaker_model():
@@ -117,12 +122,32 @@ def online_diarize(
     from malaya_speech.model.clustering import StreamingKMeansMaxCluster
     import malaya_speech
 
-    # 1. extract
-    audio_data = [chunk[0] for chunk in chunks]
+    # 1. Filter out chunks that are too short for embedding extraction
+    # TitaNet requires minimum audio length for mel spectrogram computation
+    valid_indices = []
+    valid_audio = []
+    skipped_count = 0
+    
+    for idx, chunk in enumerate(chunks):
+        audio = chunk[0]
+        if len(audio) >= MIN_CHUNK_SAMPLES:
+            valid_indices.append(idx)
+            valid_audio.append(audio)
+        else:
+            skipped_count += 1
+            logger.debug(f"Chunk {idx} too short for embedding ({len(audio)} samples < {MIN_CHUNK_SAMPLES})")
+    
+    if skipped_count > 0:
+        logger.info(f"Skipped {skipped_count} chunks too short for speaker embedding (min={MIN_CHUNK_SAMPLES} samples)")
+    
+    if not valid_audio:
+        logger.warning("No chunks long enough for speaker embedding extraction")
+        # Return all chunks assigned to speaker 0
+        return {idx: 0 for idx in range(len(chunks))}
 
-    # 2. batch
-    logger.info(f"Extracting speaker embeddings for {len(audio_data)} chunks...")
-    embeddings = extract_embeddings_batched(audio_data)
+    # 2. batch extract embeddings for valid chunks only
+    logger.info(f"Extracting speaker embeddings for {len(valid_audio)} chunks...")
+    embeddings = extract_embeddings_batched(valid_audio)
 
     # 3. streaming clustering
     logger.info(f"Running StreamingKMeans (similarity={speaker_similarity}, max_n={speaker_max_n})...")
@@ -131,8 +156,9 @@ def online_diarize(
         max_clusters=speaker_max_n
     )
 
-    speaker_assignments = {}
-    for idx, embedding in enumerate(embeddings):
+    # Map valid indices back to original chunk indices
+    valid_speaker_assignments = {}
+    for i, embedding in enumerate(embeddings):
         # malaya_speech.diarization.streaming() assigns speaker ID
         # it returns strings like "speaker 0", "speaker 1", etc.
         speaker_label = malaya_speech.diarization.streaming(embedding, clustering)
@@ -141,7 +167,26 @@ def online_diarize(
             speaker_id = int(speaker_label.replace("speaker ", ""))
         except (ValueError, AttributeError):
             speaker_id = 0
-        speaker_assignments[idx] = speaker_id
+        original_idx = valid_indices[i]
+        valid_speaker_assignments[original_idx] = speaker_id
+
+    # For skipped chunks, assign based on nearest valid chunk's speaker
+    speaker_assignments = {}
+    all_indices = list(range(len(chunks)))
+    
+    for idx in all_indices:
+        if idx in valid_speaker_assignments:
+            speaker_assignments[idx] = valid_speaker_assignments[idx]
+        else:
+            # Find nearest valid chunk and use its speaker
+            nearest_speaker = 0
+            min_distance = float('inf')
+            for valid_idx, speaker_id in valid_speaker_assignments.items():
+                distance = abs(idx - valid_idx)
+                if distance < min_distance:
+                    min_distance = distance
+                    nearest_speaker = speaker_id
+            speaker_assignments[idx] = nearest_speaker
 
     speaker_counts = {}
     for speaker_id in speaker_assignments.values():
