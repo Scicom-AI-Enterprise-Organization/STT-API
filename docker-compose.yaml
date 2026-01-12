@@ -7,7 +7,7 @@ services:
       dockerfile: Dockerfile
     container_name: stt-api
     ports:
-      - "9090:9090"
+      - "9091:9090"
     volumes:
       - "~/.cache/huggingface:/root/.cache/huggingface"
       - "./app:/app/app"
