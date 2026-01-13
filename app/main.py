@@ -41,6 +41,12 @@ logger.info(f"Request semaphore initialized with limit: {MAX_CONCURRENT_REQUESTS
 
 CHUNK_BATCH_SIZE = int(os.environ.get("CHUNK_BATCH_SIZE", "8"))
 
+# Diarization buffer threshold: number of chunks to accumulate before processing
+# Lower = more frequent processing (lower latency, more overhead)
+# Higher = better batching efficiency (higher latency, less overhead)
+# Default: 4 chunks balances latency and GPU batching efficiency
+DIARIZATION_BUFFER_THRESHOLD = 4
+
 VAD_WORKERS = int(os.environ.get("VAD_WORKERS", "8"))
 _vad_executor = None
 
@@ -750,6 +756,7 @@ async def _process_transcription(
             from malaya_speech.model.clustering import StreamingKMeansMaxCluster
             from app.diarization import (
                 process_chunks_batch_incremental,
+                assign_skipped_chunks_to_nearest,
                 MIN_CHUNK_SAMPLES,
             )
 
@@ -817,14 +824,14 @@ async def _process_transcription(
                             f"({len(wav_chunk)} samples < {MIN_CHUNK_SAMPLES})"
                         )
 
-            # Process diarization incrementally when buffer reaches threshold (e.g., 4 chunks)
+            # Process diarization incrementally when buffer reaches threshold
             # or at the end of the batch if we're near the end
             if (
                 diarization == "online"
                 and diarization_cluster
                 and pending_chunks_for_diarization
                 and (
-                    len(pending_chunks_for_diarization) >= 4
+                    len(pending_chunks_for_diarization) >= DIARIZATION_BUFFER_THRESHOLD
                     or batch_end >= total_chunks
                 )
             ):
@@ -872,24 +879,14 @@ async def _process_transcription(
 
         # Handle skipped chunks (too short for embedding) - assign to nearest valid chunk's speaker
         if diarization == "online" and speaker_assignments:
-            all_indices = set(range(total_chunks))
-            valid_indices = set(speaker_assignments.keys())
-            skipped_indices = all_indices - valid_indices
-
-            if skipped_indices:
+            skipped_count = total_chunks - len(speaker_assignments)
+            if skipped_count > 0:
                 logger.info(
-                    f"Assigning {len(skipped_indices)} skipped chunks to nearest valid chunk's speaker"
+                    f"Assigning {skipped_count} skipped chunks to nearest valid chunk's speaker"
                 )
-                for idx in skipped_indices:
-                    # Find nearest valid chunk and use its speaker
-                    nearest_speaker = 0
-                    min_distance = float("inf")
-                    for valid_idx, speaker_id in speaker_assignments.items():
-                        distance = abs(idx - valid_idx)
-                        if distance < min_distance:
-                            min_distance = distance
-                            nearest_speaker = speaker_id
-                    speaker_assignments[idx] = nearest_speaker
+                speaker_assignments = assign_skipped_chunks_to_nearest(
+                    speaker_assignments, total_chunks
+                )
 
         chunks_for_diarization = chunks_to_transcribe if diarization == "online" else None
         chunks_to_transcribe = None

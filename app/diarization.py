@@ -7,6 +7,7 @@ Reference: https://github.com/huseinzol05/backup-mesolitica-api/blob/master/app/
 
 import os
 import logging
+import bisect
 from typing import List, Dict, Tuple, Optional
 import numpy as np
 
@@ -163,6 +164,77 @@ def process_chunks_batch_incremental(
     return speaker_ids
 
 
+def assign_skipped_chunks_to_nearest(
+    speaker_assignments: Dict[int, int],
+    total_chunks: int,
+) -> Dict[int, int]:
+    """
+    Assign skipped chunks (too short for embedding) to nearest valid chunk's speaker.
+    
+    Optimized O(n log m) implementation using sorted indices and binary search,
+    where n = number of skipped chunks and m = number of valid chunks.
+    This is more efficient than the naive O(n×m) approach.
+    
+    Args:
+        speaker_assignments: Dictionary mapping valid chunk indices to speaker IDs
+        total_chunks: Total number of chunks (including skipped ones)
+    
+    Returns:
+        Updated speaker_assignments dictionary with skipped chunks assigned to
+        nearest valid chunk's speaker
+    """
+    if not speaker_assignments:
+        # If no valid assignments, assign all to speaker 0
+        return {idx: 0 for idx in range(total_chunks)}
+    
+    # Get all indices and find skipped ones
+    all_indices = set(range(total_chunks))
+    valid_indices = set(speaker_assignments.keys())
+    skipped_indices = all_indices - valid_indices
+    
+    if not skipped_indices:
+        # No skipped chunks, return as-is
+        return speaker_assignments
+    
+    # Sort valid indices once for binary search: O(m log m)
+    sorted_valid_indices = sorted(valid_indices)
+    
+    # For each skipped chunk, find nearest valid chunk: O(n log m)
+    result = speaker_assignments.copy()
+    
+    for skipped_idx in skipped_indices:
+        # Use binary search to find insertion point
+        pos = bisect.bisect_left(sorted_valid_indices, skipped_idx)
+        
+        # Find nearest valid chunk (check both neighbors)
+        nearest_idx = None
+        min_distance = float('inf')
+        
+        # Check left neighbor (if exists)
+        if pos > 0:
+            left_idx = sorted_valid_indices[pos - 1]
+            distance = abs(skipped_idx - left_idx)
+            if distance < min_distance:
+                min_distance = distance
+                nearest_idx = left_idx
+        
+        # Check right neighbor (if exists)
+        if pos < len(sorted_valid_indices):
+            right_idx = sorted_valid_indices[pos]
+            distance = abs(skipped_idx - right_idx)
+            if distance < min_distance:
+                nearest_idx = right_idx
+        
+        # Assign speaker from nearest valid chunk
+        if nearest_idx is not None:
+            result[skipped_idx] = speaker_assignments[nearest_idx]
+        else:
+            # Fallback (shouldn't happen, but safety check)
+            result[skipped_idx] = 0
+    
+    return result
+
+
 def online_diarize(
     chunks: List[Tuple[np.ndarray, float, float]],
     speaker_similarity: float = 0.3,
@@ -170,6 +242,12 @@ def online_diarize(
 ) -> Dict[int, int]:
     """
     Perform online speaker diarization on VAD Chunks.
+
+    .. deprecated:: 
+        This function processes all chunks in batch after transcription completes.
+        For new code, use incremental processing via `process_chunks_batch_incremental()`
+        which processes chunks as they are transcribed for better performance.
+        This function is kept for backward compatibility and test compatibility.
 
     Uses StreamkingKMeansMaxCluster for incremental speaker assignment.
 
@@ -259,22 +337,10 @@ def online_diarize(
         logger.debug(f"Cluster creation sequence: {cluster_creation_log[:10]}{'...' if len(cluster_creation_log) > 10 else ''}")
 
     # For skipped chunks, assign based on nearest valid chunk's speaker
-    speaker_assignments = {}
-    all_indices = list(range(len(chunks)))
-    
-    for idx in all_indices:
-        if idx in valid_speaker_assignments:
-            speaker_assignments[idx] = valid_speaker_assignments[idx]
-        else:
-            # Find nearest valid chunk and use its speaker
-            nearest_speaker = 0
-            min_distance = float('inf')
-            for valid_idx, speaker_id in valid_speaker_assignments.items():
-                distance = abs(idx - valid_idx)
-                if distance < min_distance:
-                    min_distance = distance
-                    nearest_speaker = speaker_id
-            speaker_assignments[idx] = nearest_speaker
+    # Use optimized shared function
+    speaker_assignments = assign_skipped_chunks_to_nearest(
+        valid_speaker_assignments, len(chunks)
+    )
 
     speaker_counts = {}
     for speaker_id in speaker_assignments.values():
