@@ -744,35 +744,36 @@ async def _process_transcription(
 
         chunks = None
 
-        diarize_task = None
-        speaker_assignments = None
-
+        # Initialize diarization cluster for online mode (created once, reused)
+        diarization_cluster = None
         if diarization == "online":
-            from app.diarization import online_diarize
-
-            # diarize_chunks needs (audio_data, start_ts, end_ts) format
-            # chunks_to_transcribe already has end_ts, so we can use it directly
-            diarize_chunks = [
-                (wav_chunk, start_ts, end_ts)
-                for wav_chunk, start_ts, end_ts in chunks_to_transcribe
-            ]
-
-            loop = asyncio.get_event_loop()
-            diarize_task = loop.run_in_executor(
-                None,
-                lambda: online_diarize(
-                    diarize_chunks,
-                    speaker_similarity=speaker_similarity,
-                    speaker_max_n=speaker_max_n,
-                ),
+            from malaya_speech.model.clustering import StreamingKMeansMaxCluster
+            from app.diarization import (
+                process_chunks_batch_incremental,
+                MIN_CHUNK_SAMPLES,
             )
 
-        elif diarization == "offline":
+            diarization_cluster = StreamingKMeansMaxCluster(
+                threshold=speaker_similarity,
+                max_clusters=speaker_max_n
+            )
+            logger.info(
+                f"Created StreamingKMeansMaxCluster (similarity={speaker_similarity}, max_n={speaker_max_n})"
+            )
+
+        # For offline mode, create task
+        diarize_task = None
+        if diarization == "offline":
             diarize_task = asyncio.create_task(offline_diarize(file))
 
         all_transcriptions = []
         detected_language = None
         total_chunks = len(chunks_to_transcribe)
+        speaker_assignments = {}  # Will be built incrementally for online mode
+
+        # Buffer for batching embedding extraction while maintaining incremental clustering
+        pending_chunks_for_diarization = []
+        pending_chunk_indices = []
 
         for batch_start in range(0, total_chunks, CHUNK_BATCH_SIZE):
             batch_end = min(batch_start + CHUNK_BATCH_SIZE, total_chunks)
@@ -796,34 +797,119 @@ async def _process_transcription(
 
             batch_results = await asyncio.gather(*batch_tasks)
 
-            for transcription, chunk_lang in batch_results:
+            for batch_idx, (transcription, chunk_lang) in enumerate(batch_results):
+                chunk_global_idx = batch_start + batch_idx
                 all_transcriptions.append(transcription)
                 if detected_language is None and chunk_lang is not None:
                     detected_language = chunk_lang
+
+                # For online diarization: collect chunks for incremental processing
+                if diarization == "online" and diarization_cluster:
+                    wav_chunk, _, _ = batch[batch_idx]
+                    # Filter out chunks too short for embedding
+                    if len(wav_chunk) >= MIN_CHUNK_SAMPLES:
+                        pending_chunks_for_diarization.append(wav_chunk)
+                        pending_chunk_indices.append(chunk_global_idx)
+                    else:
+                        # Mark as skipped - will assign to nearest valid chunk later
+                        logger.debug(
+                            f"Chunk {chunk_global_idx} too short for embedding "
+                            f"({len(wav_chunk)} samples < {MIN_CHUNK_SAMPLES})"
+                        )
+
+            # Process diarization incrementally when buffer reaches threshold (e.g., 4 chunks)
+            # or at the end of the batch if we're near the end
+            if (
+                diarization == "online"
+                and diarization_cluster
+                and pending_chunks_for_diarization
+                and (
+                    len(pending_chunks_for_diarization) >= 4
+                    or batch_end >= total_chunks
+                )
+            ):
+                # Extract embeddings in batches and assign speakers incrementally
+                batch_speaker_ids = process_chunks_batch_incremental(
+                    pending_chunks_for_diarization,
+                    diarization_cluster,
+                )
+
+                # Map speaker IDs to chunk indices
+                for chunk_idx, speaker_id in zip(
+                    pending_chunk_indices, batch_speaker_ids
+                ):
+                    speaker_assignments[chunk_idx] = speaker_id
+
+                logger.debug(
+                    f"Assigned speakers to {len(batch_speaker_ids)} chunks incrementally"
+                )
+
+                # Clear buffer
+                pending_chunks_for_diarization = []
+                pending_chunk_indices = []
 
             batch = None
             batch_tasks = None
             batch_results = None
 
+        # Process any remaining chunks in the buffer (shouldn't happen, but safety check)
+        if (
+            diarization == "online"
+            and diarization_cluster
+            and pending_chunks_for_diarization
+        ):
+            batch_speaker_ids = process_chunks_batch_incremental(
+                pending_chunks_for_diarization,
+                diarization_cluster,
+            )
+            for chunk_idx, speaker_id in zip(
+                pending_chunk_indices, batch_speaker_ids
+            ):
+                speaker_assignments[chunk_idx] = speaker_id
+            logger.debug(
+                f"Processed final {len(batch_speaker_ids)} chunks from buffer"
+            )
+
+        # Handle skipped chunks (too short for embedding) - assign to nearest valid chunk's speaker
+        if diarization == "online" and speaker_assignments:
+            all_indices = set(range(total_chunks))
+            valid_indices = set(speaker_assignments.keys())
+            skipped_indices = all_indices - valid_indices
+
+            if skipped_indices:
+                logger.info(
+                    f"Assigning {len(skipped_indices)} skipped chunks to nearest valid chunk's speaker"
+                )
+                for idx in skipped_indices:
+                    # Find nearest valid chunk and use its speaker
+                    nearest_speaker = 0
+                    min_distance = float("inf")
+                    for valid_idx, speaker_id in speaker_assignments.items():
+                        distance = abs(idx - valid_idx)
+                        if distance < min_distance:
+                            min_distance = distance
+                            nearest_speaker = speaker_id
+                    speaker_assignments[idx] = nearest_speaker
+
         chunks_for_diarization = chunks_to_transcribe if diarization == "online" else None
         chunks_to_transcribe = None
 
+        # Handle offline diarization task
         if diarize_task is not None:
             try:
-                if diarization == "online":
-                    speaker_assignments = await diarize_task
-                    logger.info(
-                        f"Online diarization complete: {len(speaker_assignments)} assignments"
-                    )
-                elif diarization == "offline":
-                    diarize_result = await diarize_task
-                    speaker_assignments = diarize_result
-                    logger.info(
-                        f"Offline diarization complete: {len(diarize_result)} segments"
-                    )
+                diarize_result = await diarize_task
+                speaker_assignments = diarize_result
+                logger.info(
+                    f"Offline diarization complete: {len(diarize_result)} segments"
+                )
             except Exception as e:
                 logger.error(f"Diarization failed: {e}")
                 speaker_assignments = None
+
+        if diarization == "online" and speaker_assignments:
+            logger.info(
+                f"Online diarization complete: {len(speaker_assignments)} assignments"
+            )
 
         logger.info(f"Phase 2 complete: {len(all_transcriptions)} chunks transcribed")
 

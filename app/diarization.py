@@ -89,6 +89,80 @@ def extract_embeddings_batched(
     return embeddings
 
 
+def process_chunk_incremental(
+    audio_chunk: np.ndarray,
+    diarization_cluster,
+) -> int:
+    """
+    Process a single chunk incrementally for online diarization.
+
+    Args:
+        audio_chunk: Audio data for the chunk (float32, 16kHz)
+        diarization_cluster: StreamingKMeansMaxCluster instance (reused)
+
+    Returns:
+        speaker_id: Assigned speaker ID (0-indexed)
+    """
+    import malaya_speech
+
+    # Extract embedding for this chunk
+    model = get_speaker_model()
+    embedding = model([audio_chunk])[0]  # Single chunk
+
+    # Assign speaker incrementally
+    speaker_label = malaya_speech.diarization.streaming(embedding, diarization_cluster)
+    try:
+        speaker_id = int(speaker_label.replace("speaker ", ""))
+    except (ValueError, AttributeError):
+        speaker_id = 0
+
+    return speaker_id
+
+
+def process_chunks_batch_incremental(
+    audio_chunks: List[np.ndarray],
+    diarization_cluster,
+    batch_size: int = SPEAKER_EMBEDDING_BATCH_SIZE,
+) -> List[int]:
+    """
+    Process chunks in batches but assign speakers incrementally.
+
+    This gives us GPU batching benefits while maintaining incremental clustering.
+    Embeddings are extracted in batches (GPU efficient), but speakers are assigned
+    one at a time to maintain incremental clustering state.
+
+    Args:
+        audio_chunks: List of audio numpy arrays (float32, 16kHz)
+        diarization_cluster: StreamingKMeansMaxCluster instance (reused)
+        batch_size: Number of chunks to process in one GPU call
+
+    Returns:
+        List of speaker IDs (0-indexed), one per chunk
+    """
+    import malaya_speech
+
+    model = get_speaker_model()
+    speaker_ids = []
+
+    # Extract embeddings in batches (GPU efficient)
+    for i in range(0, len(audio_chunks), batch_size):
+        batch = audio_chunks[i:i + batch_size]
+        batch_embeddings = model(batch)  # Batched GPU inference
+
+        # Assign speakers incrementally (one at a time)
+        for embedding in batch_embeddings:
+            speaker_label = malaya_speech.diarization.streaming(
+                embedding, diarization_cluster
+            )
+            try:
+                speaker_id = int(speaker_label.replace("speaker ", ""))
+            except (ValueError, AttributeError):
+                speaker_id = 0
+            speaker_ids.append(speaker_id)
+
+    return speaker_ids
+
+
 def online_diarize(
     chunks: List[Tuple[np.ndarray, float, float]],
     speaker_similarity: float = 0.3,
