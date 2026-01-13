@@ -5,7 +5,7 @@ import logging
 import io
 import tempfile
 import asyncio
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Dict
 from concurrent.futures import ProcessPoolExecutor
 import numpy as np
 import torch
@@ -453,6 +453,39 @@ def find_speaker_for_timestamp(
     return best_speaker
 
 
+def find_speaker_for_chunk_timestamp(
+    start: float, end: float, chunk_ranges: List[Tuple[float, float, int]], speaker_assignments: Dict[int, int]
+) -> Optional[int]:
+    """
+    Find the speaker for a given timestamp range using overlap with chunk boundaries.
+    Used for online diarization mode.
+
+    Args:
+        start: Segment start time
+        end: Segment end time
+        chunk_ranges: List of (chunk_start, chunk_end, chunk_idx) tuples
+        speaker_assignments: Dictionary mapping chunk_idx -> speaker_id
+
+    Returns:
+        Speaker ID (int) or None if no overlap found
+    """
+    best_overlap = 0
+    best_speaker = None
+
+    for chunk_start, chunk_end, chunk_idx in chunk_ranges:
+        # Calculate overlap between segment and chunk
+        overlap_start = max(start, chunk_start)
+        overlap_end = min(end, chunk_end)
+        overlap = max(0, overlap_end - overlap_start)
+
+        if overlap > best_overlap:
+            best_overlap = overlap
+            # Get speaker assignment for this chunk
+            best_speaker = speaker_assignments.get(chunk_idx, 0)
+
+    return best_speaker
+
+
 def merge_speakers_with_segments(
     segments: List[dict],
     speaker_data: dict,
@@ -468,30 +501,31 @@ def merge_speakers_with_segments(
             - online mode: {chunk_idx: speaker_id} from online_diarize()
             - offline mode: [{"start": float, "end": float, "speaker": str}, ...] from OSD
         mode: "online" or "offline"
-        chunks_to_transcribe: For online mode, list of (wav_data, start_ts) to map segments to chunks
+        chunks_to_transcribe: For online mode, list of (wav_data, start_ts, end_ts) to map segments to chunks
 
     Returns:
         Segments with added "speaker" field
     """
     if mode == "online" and chunks_to_transcribe:
-        # build a mapping of timestamp ranges to chunk indices
+        # Build a mapping of chunk timestamp ranges to chunk indices
+        # chunks_to_transcribe format: (wav_data, start_ts, end_ts)
         chunk_ranges = []
-        for idx, (_, start_ts) in enumerate(chunks_to_transcribe):
-            chunk_ranges.append((start_ts, idx))
+        for idx, (_, start_ts, end_ts) in enumerate(chunks_to_transcribe):
+            chunk_ranges.append((start_ts, end_ts, idx))
+        # Sort by start time for efficient lookup
         chunk_ranges.sort(key=lambda x: x[0])
 
         for seg in segments:
             seg_start = seg.get("start", 0)
+            seg_end = seg.get("end", seg_start)
 
-            # find which chunk this segment belongs to
-            chunk_idx = 0
-            for i, (chunk_start, idx) in enumerate(chunk_ranges):
-                if seg_start >= chunk_start:
-                    chunk_idx = idx
-                else:
-                    break
-
-            seg["speaker"] = speaker_data.get(chunk_idx, 0)
+            # Use overlap calculation to find the best matching chunk
+            # This ensures segments are assigned to the chunk with the most overlap,
+            # similar to how offline mode works
+            speaker = find_speaker_for_chunk_timestamp(
+                seg_start, seg_end, chunk_ranges, speaker_data
+            )
+            seg["speaker"] = speaker if speaker is not None else 0
 
     elif mode == "offline":
         # speaker_data is list of OSD segments
@@ -701,7 +735,8 @@ async def _process_transcription(
                     f"{start_ts:.2f}s-{end_ts:.2f}s "
                     f"(silence: {silence_ratio:.1%})"
                 )
-                chunks_to_transcribe.append((wav_chunk, start_ts))
+                # Store (wav_chunk, start_ts, end_ts) to preserve chunk boundaries for overlap calculation
+                chunks_to_transcribe.append((wav_chunk, start_ts, end_ts))
             else:
                 logger.info(
                     f"Chunk {chunk_idx + 1}/{len(chunks)}: Skipped (too silent: {silence_ratio:.1%})"
@@ -715,9 +750,11 @@ async def _process_transcription(
         if diarization == "online":
             from app.diarization import online_diarize
 
+            # diarize_chunks needs (audio_data, start_ts, end_ts) format
+            # chunks_to_transcribe already has end_ts, so we can use it directly
             diarize_chunks = [
-                (wav_chunk, start_ts, start_ts + len(wav_chunk) / sample_rate)
-                for wav_chunk, start_ts in chunks_to_transcribe
+                (wav_chunk, start_ts, end_ts)
+                for wav_chunk, start_ts, end_ts in chunks_to_transcribe
             ]
 
             loop = asyncio.get_event_loop()
@@ -754,7 +791,7 @@ async def _process_transcription(
                     timestamp_granularities="segment",
                     last_timestamp=start_ts,
                 )
-                for wav_chunk, start_ts in batch
+                for wav_chunk, start_ts, _ in batch
             ]
 
             batch_results = await asyncio.gather(*batch_tasks)
