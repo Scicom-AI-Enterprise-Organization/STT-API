@@ -1,0 +1,143 @@
+"""
+Local implementation of NemoSpeakerVector with FP16 support.
+
+Copied from malaya-speech and modified to support FP16 casting.
+Source: malaya_speech/torch_model/nemo.py and malaya_speech/supervised/classification.py
+"""
+
+import torch
+import yaml
+import numpy as np
+from malaya_speech.utils.padding import sequence_1d
+from malaya_speech.model.frame import Frame
+from malaya_speech.utils import nemo_featurization
+from malaya_speech.utils.nemo_featurization import (
+    AudioToMelSpectrogramPreprocessor,
+)
+from malaya_speech.nemo import conv_asr
+from malaya_speech.nemo.conv_asr import SpeakerDecoder
+from malaya_boilerplate.torch_utils import to_tensor_cuda, to_numpy
+from malaya_boilerplate.huggingface import download_files
+
+
+class SpeakerVector(torch.nn.Module):
+    """
+    Speaker embedding model using NeMo architecture.
+    
+    Copied from malaya_speech.torch_model.nemo.SpeakerVector
+    """
+    def __init__(self, config, pth, model, name):
+        super().__init__()
+
+        with open(config) as stream:
+            try:
+                d = yaml.safe_load(stream)
+            except yaml.YAMLError as exc:
+                raise ValueError('invalid yaml')
+
+        preprocessor = d['preprocessor'].copy()
+        preprocessor.pop('_target_')
+
+        encoder = d['encoder'].copy()
+        encoder_target = encoder.pop('_target_').split('.')[-1]
+
+        decoder = d['decoder'].copy()
+        decoder.pop('_target_')
+
+        self.preprocessor = AudioToMelSpectrogramPreprocessor(**preprocessor)
+        self.encoder = getattr(conv_asr, encoder_target)(**encoder)
+        self.decoder = SpeakerDecoder(**decoder)
+
+        self.load_state_dict(torch.load(pth, map_location='cpu'))
+
+        self.__model__ = model
+        self.__name__ = name
+
+    def forward(self, inputs):
+        """
+        Vectorize inputs.
+
+        Parameters
+        ----------
+        inputs: List[np.array]
+            List[np.array] or List[malaya_speech.model.frame.Frame].
+        """
+        inputs = [
+            input.array if isinstance(input, Frame) else input
+            for input in inputs
+        ]
+        cuda = next(self.parameters()).is_cuda
+        inputs, lengths = sequence_1d(
+            inputs, return_len=True
+        )
+        inputs = to_tensor_cuda(torch.Tensor(inputs.astype(np.float32)), cuda)
+        lengths = to_tensor_cuda(torch.Tensor(lengths), cuda)
+        o_processor = self.preprocessor(inputs, lengths)
+        o_encoder = self.encoder(*o_processor)
+        return self.decoder(*o_encoder)
+
+    def vectorize(self, inputs):
+        """
+        Vectorize inputs.
+
+        Parameters
+        ----------
+        inputs: List[np.array]
+            List[np.array] or List[malaya_speech.model.frame.Frame].
+
+        Returns
+        -------
+        result: np.array
+        """
+        r = self.forward(inputs=inputs)
+        return to_numpy(r[1])
+
+    def __call__(self, inputs):
+        return self.vectorize(inputs)
+
+
+def nemo_speaker_vector(model, **kwargs):
+    """
+    Load NeMo speaker vector model with FP16 casting.
+    
+    Copied from malaya_speech.supervised.classification.nemo_speaker_vector
+    and modified to add FP16 casting support.
+    
+    Parameters
+    ----------
+    model: str
+        Model identifier (e.g., 'huseinzol05/nemo-titanet_large')
+    **kwargs: dict
+        Additional arguments passed to download_files
+    
+    Returns
+    -------
+    model: SpeakerVector
+        Model instance cast to FP16 and moved to GPU if available
+    """
+    s3_file = {
+        'config': 'model_config.yaml',
+        'model': 'model_weights.ckpt',
+    }
+    path = download_files(model, s3_file, **kwargs)
+    
+    # Create model instance
+    speaker_model = SpeakerVector(
+        config=path['config'],
+        pth=path['model'],
+        model=model,
+        name='speaker-vector-nemo',
+    )
+    
+    # Set to eval mode
+    speaker_model.eval()
+    
+    # Move to GPU if available
+    if torch.cuda.is_available():
+        speaker_model = speaker_model.cuda()
+    
+    # Cast to FP16 for memory efficiency and faster inference
+    speaker_model = speaker_model.half()
+    
+    return speaker_model
+

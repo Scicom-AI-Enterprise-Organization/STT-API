@@ -13,7 +13,6 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 SPEAKER_EMBEDDING_BATCH_SIZE = int(os.environ.get("SPEAKER_EMBEDDING_BATCH_SIZE", "16"))
-SPEAKER_PRECISION_MODE = os.environ.get("SPEAKER_PRECISION_MODE", "FP32")
 
 # Minimum audio samples required for TitaNet embedding extraction
 # TitaNet uses hop_length=160 at 16kHz, needs multiple frames for mel spectrogram
@@ -27,24 +26,20 @@ def load_speaker_model():
     Load TitaNet Large model for speaker embedding extraction.
     Called once at application startup.
     
+    Uses local implementation with FP16 casting for memory efficiency.
     Reference: backup-mesolitica-api/app/main.py lines 140-144
-    
-    Precision modes supported by malaya-speech: 'FP16', 'FP32', 'BFLOAT16', 'FP64'
-    FP16 provides ~50% memory reduction and faster inference on compatible GPUs.
     """
     global _speaker_model
     if _speaker_model is not None:
         return _speaker_model
 
-    import malaya_speech
+    from app.nemo_speaker_vector import nemo_speaker_vector
 
-    logger.info(f"Loading TitaNet Large speaker embedding model (precision={SPEAKER_PRECISION_MODE})...")
-    _speaker_model = malaya_speech.speaker_vector.nemo(
-        model='huseinzol05/nemo-titanet_large',
-        precision_mode=SPEAKER_PRECISION_MODE
+    logger.info("Loading TitaNet Large speaker embedding model (FP16)...")
+    _speaker_model = nemo_speaker_vector(
+        model='huseinzol05/nemo-titanet_large'
     )
-    _ = _speaker_model.eval()
-    logger.info("TitaNet Large model loaded successfully")
+    logger.info("TitaNet Large model loaded successfully (FP16)")
 
     return _speaker_model
 
