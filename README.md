@@ -59,14 +59,17 @@ Long-form speech-to-text API that:
 │   │  ...                                                             │   │
 │   └─────────────────────────────────────────────────────────────────┘   │
 │                              │                                           │
-│                              ▼                                           │
-│   ┌─────────────────────────────────────────────────────────────────┐   │
-│   │              Upstream STT API Calls                              │   │
-│   │         (upstream_semaphore: max 100 concurrent)                 │   │
-│   │                                                                  │   │
-│   │    transcribe_chunk() ──► POST to STT_API_URL                   │   │
-│   │    (with timestamp adjustment)                                   │   │
-│   └─────────────────────────────────────────────────────────────────┘   │
+│                    ┌─────────┴─────────┐                                 │
+│                    ▼                   ▼                                 │
+│   ┌──────────────────────────┐  ┌─────────────────────────────────────┐ │
+│   │  Upstream STT API Calls  │  │  Online Diarization (if enabled)    │ │
+│   │  (upstream_semaphore:    │  │  (incremental, during transcription)│ │
+│   │   max 100 concurrent)    │  │                                     │ │
+│   │                          │  │  • Extract embeddings (batched)     │ │
+│   │  transcribe_chunk() ──►  │  │  • Assign speakers incrementally   │ │
+│   │  POST to STT_API_URL     │  │  • Reuse StreamingKMeansMaxCluster  │ │
+│   │  (with timestamp adj.)   │  │                                     │ │
+│   └──────────────────────────┘  └─────────────────────────────────────┘ │
 └─────────────────────────────────────────────────────────────────────────┘
                                     │
                                     ▼
@@ -84,7 +87,11 @@ Long-form speech-to-text API that:
 1. **Ingest**: Client uploads audio to `POST /audio/transcriptions`
 2. **VAD + Chunking**: Audio is processed through Silero VAD in parallel workers, split into chunks based on silence detection and max chunk length (25s)
 3. **Concurrent Transcription**: Chunks are sent concurrently to upstream STT API with timestamp adjustment
-4. **Merge & Respond**: All transcriptions are merged with global timestamps and returned
+4. **Online Diarization** (if enabled): Processes chunks incrementally during transcription:
+   - Extracts speaker embeddings in small batches (default: 4 chunks)
+   - Assigns speakers incrementally using StreamingKMeansMaxCluster
+   - Maintains GPU batching efficiency while enabling true incremental processing
+5. **Merge & Respond**: All transcriptions are merged with global timestamps and speaker assignments (if diarization enabled), then returned
 
 ### Concurrency Model
 
@@ -261,12 +268,18 @@ The API supports optional speaker diarization to identify who is speaking in eac
 | Mode | Description | Speed | Accuracy |
 |------|-------------|-------|----------|
 | `none` | No speaker labels (default) | Fastest | N/A |
-| `online` | TitaNet + StreamingKMeans | Fast | Good |
+| `online` | TitaNet + StreamingKMeans (incremental during transcription) | Fast | Good |
 | `offline` | External OSD service (pyannote) | Slow | Best |
 
 ### Online Diarization
 
-Uses TitaNet Large for speaker embeddings with batched GPU inference, combined with StreamingKMeansMaxCluster for incremental speaker assignment.
+Uses TitaNet Large for speaker embeddings with batched GPU inference, combined with StreamingKMeansMaxCluster for incremental speaker assignment. **Processes chunks incrementally during transcription** (not after all chunks complete), providing lower latency and better performance than batch processing.
+
+**How it works:**
+- Creates a single `StreamingKMeansMaxCluster` instance at the start
+- As chunks are transcribed, extracts embeddings in small batches (default: 4 chunks)
+- Assigns speakers incrementally using the shared cluster instance
+- Maintains GPU batching efficiency while enabling true incremental processing
 
 **Parameters:**
 - `speaker_similarity`: Cosine similarity threshold (0.0-1.0). Higher = stricter matching, fewer speakers. Default: 0.3
