@@ -96,7 +96,7 @@ def extract_embeddings_batched(
 
 def online_diarize(
     chunks: List[Tuple[np.ndarray, float, float]],
-    speaker_similarity: float = 0.5,
+    speaker_similarity: float = 0.3,
     speaker_max_n: int = 10,
 ) -> Dict[int, int]:
     """
@@ -111,7 +111,7 @@ def online_diarize(
         speaker_similarity: Cosine similarity threshold for same speaker (0.0-1.0)
                            Higher = stricter, fewer speakers
                            Lower = looser, more speakers
-                           Default: 0.5 (aligned with Mesolitica reference implementation)
+                           Default: 0.3
         speaker_max_n: Maximum number of speakers to detect
         
     Returns:
