@@ -188,7 +188,7 @@ curl -X POST "http://localhost:9090/audio/transcriptions" \
 | `minimum_trigger_vad_ms` | int | 1500 | Minimum audio length to trigger VAD (ms) |
 | `reject_segment_vad_ratio` | float | 0.9 | Reject segments with this ratio of silence (0.0-1.0) |
 | `diarization` | string | none | Diarization mode: `none`, `online`, or `offline` |
-| `speaker_similarity` | float | 0.75 | Online mode: speaker clustering threshold (0.0-1.0) |
+| `speaker_similarity` | float | 0.5 | Online mode: speaker clustering threshold (0.0-1.0) |
 | `speaker_max_n` | int | 10 | Online mode: maximum number of speakers |
 
 ### Response Formats
@@ -269,7 +269,7 @@ The API supports optional speaker diarization to identify who is speaking in eac
 Uses TitaNet Large for speaker embeddings with batched GPU inference, combined with StreamingKMeansMaxCluster for incremental speaker assignment.
 
 **Parameters:**
-- `speaker_similarity`: Cosine similarity threshold (0.0-1.0). Higher = stricter matching, fewer speakers. Default: 0.75
+- `speaker_similarity`: Cosine similarity threshold (0.0-1.0). Higher = stricter matching, fewer speakers. Default: 0.5 (aligned with Mesolitica reference implementation)
 - `speaker_max_n`: Maximum speakers to detect. Default: 10
 
 ### Offline Diarization
@@ -313,12 +313,11 @@ curl -X POST "http://localhost:9090/audio/transcriptions" \
   -F "language=ms" \
   -F "response_format=json"
 
-# With online diarization
+# With online diarization (speaker_similarity defaults to 0.5)
 curl -X POST "http://localhost:9090/audio/transcriptions" \
   -F "file=@test_audio/masak.mp3" \
   -F "response_format=verbose_json" \
   -F "diarization=online" \
-  -F "speaker_similarity=0.75" \
   -F "speaker_max_n=5"
 
 # With offline diarization (requires OSD service)
@@ -421,7 +420,7 @@ docker compose run --rm -e AUDIO_FILE=/app/test_audio/custom.mp3 stress-test
 | `STT_API_URL` | http://stt-api:9090 | API URL to test |
 | `AUDIO_FILE` | /app/test_audio/masak.mp3 | Audio file for testing |
 | `DIARIZATION_MODE` | none | Diarization mode: `none`, `online`, `offline` |
-| `SPEAKER_SIMILARITY` | 0.75 | Speaker clustering threshold (online mode) |
+| `SPEAKER_SIMILARITY` | 0.5 | Speaker clustering threshold (online mode) |
 | `SPEAKER_MAX_N` | 10 | Maximum speakers to detect (online mode) |
 
 ### Sample Output

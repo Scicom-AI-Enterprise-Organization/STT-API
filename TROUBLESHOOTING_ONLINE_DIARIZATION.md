@@ -187,3 +187,96 @@ The threshold interpretation for `StreamingKMeansMaxCluster` is still unclear. T
 
 This can be addressed in a follow-up if threshold tuning is still problematic after the mapping fixes.
 
+---
+
+## Critical Test Findings (Post-Fix)
+
+### Test Results Summary
+
+After implementing the fix (default threshold=0.5), testing with `yousaf-kerolming.mp3` (18-minute audio with 2 speakers):
+
+| Threshold | Clusters Created | Speaker Distribution | Status |
+|-----------|-----------------|---------------------|--------|
+| **0.5** (default) | 1 | All 224 chunks → speaker 0 | ❌ Still single speaker |
+| **0.4** | 1 | All 224 chunks → speaker 0 | ❌ Still single speaker |
+| **0.3** | 10 | Speaker 0: 81 chunks (36%), Speaker 1: 133 chunks (59%), 8 small clusters | ⚠️ Over-segmentation |
+| **Offline** (reference) | 2 | Speaker 0: 173 segments, Speaker 1: 163 segments | ✅ Correct |
+
+### Critical Observations
+
+1. **Sharp Threshold Transition**: There's a very sharp transition point between 0.4 and 0.3:
+   - Thresholds ≥ 0.4: All embeddings assigned to single cluster (speaker 0)
+   - Threshold ≤ 0.3: Creates multiple clusters (10 clusters at 0.3)
+   - This suggests embeddings have high inter-speaker similarity (>0.4) but low intra-speaker variance
+
+2. **Default Threshold (0.5) Still Too High**: Despite aligning with Mesolitica reference, threshold=0.5 does not work for this audio. This indicates:
+   - The architectural difference (VAD chunks vs transcribed segments) may affect embedding quality
+   - OR this particular audio has speakers with very similar voice characteristics
+   - OR embeddings extracted from VAD chunks are less discriminative than from transcribed segments
+
+3. **Over-segmentation at Lower Thresholds**: At threshold=0.3:
+   - Correctly identifies 2 main speakers (81 vs 133 chunks ≈ 36% vs 59%)
+   - But creates 8 additional small clusters (1-2 chunks each)
+   - This suggests threshold=0.3 is too low, causing false splits
+
+4. **Optimal Threshold Range**: Based on test results, optimal threshold appears to be **0.25-0.35** for this audio type:
+   - Below 0.3: Too many false splits
+   - Above 0.4: Single speaker assignment
+   - Need to test 0.25-0.35 range to find optimal balance
+
+### Recommendations
+
+1. **For Production Use**: 
+   - Default threshold=0.5 may not work for all audio types
+   - Consider making threshold configurable per request or audio type
+   - Add automatic threshold tuning based on initial clustering results
+
+2. **For This Specific Audio**:
+   - Use threshold=0.3 or lower (0.25-0.3 range)
+   - Accept some over-segmentation (small clusters can be merged post-processing)
+   - OR use offline diarization for better accuracy
+
+3. **Future Improvements**:
+   - Investigate why VAD chunk embeddings are less discriminative than transcribed segment embeddings
+   - Consider adaptive threshold based on embedding variance
+   - Add post-processing to merge small clusters (<5% of total chunks)
+
+### Tuning speaker_similarity
+
+The `speaker_similarity` threshold controls how strict the clustering is:
+
+- **Higher values (0.4-0.8)**: Stricter matching, fewer speakers detected
+  - Use when speakers have very distinct voices
+  - **WARNING**: Thresholds ≥ 0.4 may assign all chunks to single speaker if embeddings are similar
+  - May miss subtle speaker changes
+  
+- **Lower values (0.2-0.35)**: Looser matching, more speakers detected
+  - Use when speakers have similar voices or audio quality is lower
+  - May create false splits (one speaker split into multiple clusters)
+  - **Recommended range**: 0.25-0.35 for audio with similar-sounding speakers
+  
+- **Default (0.5)**: Balanced setting aligned with Mesolitica reference
+  - **NOTE**: May not work for all audio types (see Critical Test Findings above)
+  - Good starting point, but may need adjustment based on audio characteristics
+  - If all chunks assigned to single speaker, try lowering to 0.3-0.4
+  - If too many clusters created, try raising to 0.35-0.45
+
+### Threshold Selection Guide
+
+1. **Start with default (0.5)**
+2. **If all chunks → single speaker**: Lower threshold to 0.3-0.4
+3. **If too many clusters (>5)**: Raise threshold to 0.35-0.45
+4. **If 2-3 clusters with reasonable distribution**: Current threshold is good
+5. **For similar-sounding speakers**: Use 0.25-0.35 range
+6. **For very distinct speakers**: Can use 0.4-0.6, but test first
+
+### Architectural Notes
+
+**Difference from Mesolitica:**
+- **Mesolitica**: Extracts embeddings from transcribed segments (after transcription)
+- **Lata**: Extracts embeddings from VAD chunks (before transcription)
+
+This difference means:
+- Lata processes all chunks upfront, which is more efficient
+- Both approaches use the same clustering algorithm (`StreamingKMeansMaxCluster`)
+- The embedding source (VAD chunks vs transcribed segments) may affect quality, but both should work with proper threshold tuning

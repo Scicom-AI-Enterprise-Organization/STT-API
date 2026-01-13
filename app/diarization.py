@@ -96,7 +96,7 @@ def extract_embeddings_batched(
 
 def online_diarize(
     chunks: List[Tuple[np.ndarray, float, float]],
-    speaker_similarity: float = 0.75,
+    speaker_similarity: float = 0.5,
     speaker_max_n: int = 10,
 ) -> Dict[int, int]:
     """
@@ -111,6 +111,7 @@ def online_diarize(
         speaker_similarity: Cosine similarity threshold for same speaker (0.0-1.0)
                            Higher = stricter, fewer speakers
                            Lower = looser, more speakers
+                           Default: 0.5 (aligned with Mesolitica reference implementation)
         speaker_max_n: Maximum number of speakers to detect
         
     Returns:
@@ -158,6 +159,9 @@ def online_diarize(
 
     # Map valid indices back to original chunk indices
     valid_speaker_assignments = {}
+    seen_speakers = set()
+    cluster_creation_log = []
+    
     for i, embedding in enumerate(embeddings):
         # malaya_speech.diarization.streaming() assigns speaker ID
         # it returns strings like "speaker 0", "speaker 1", etc.
@@ -167,8 +171,23 @@ def online_diarize(
             speaker_id = int(speaker_label.replace("speaker ", ""))
         except (ValueError, AttributeError):
             speaker_id = 0
+        
+        # Track cluster creation vs assignment
+        is_new_cluster = speaker_id not in seen_speakers
+        if is_new_cluster:
+            seen_speakers.add(speaker_id)
+            cluster_creation_log.append((i, speaker_id))
+            logger.debug(f"Chunk {i}: Created new cluster (speaker {speaker_id})")
+        else:
+            logger.debug(f"Chunk {i}: Assigned to existing cluster (speaker {speaker_id})")
+        
         original_idx = valid_indices[i]
         valid_speaker_assignments[original_idx] = speaker_id
+    
+    # Log cluster creation summary
+    logger.info(f"Clustering complete: {len(seen_speakers)} clusters created from {len(embeddings)} embeddings")
+    if cluster_creation_log:
+        logger.debug(f"Cluster creation sequence: {cluster_creation_log[:10]}{'...' if len(cluster_creation_log) > 10 else ''}")
 
     # For skipped chunks, assign based on nearest valid chunk's speaker
     speaker_assignments = {}
@@ -191,6 +210,41 @@ def online_diarize(
     speaker_counts = {}
     for speaker_id in speaker_assignments.values():
         speaker_counts[speaker_id] = speaker_counts.get(speaker_id, 0) + 1
+    
+    # Log final speaker distribution
     logger.info(f"Speaker distribution: {speaker_counts}")
+    
+    # Validation: Check for diverse speaker assignments
+    unique_speakers = len(speaker_counts)
+    total_chunks = len(speaker_assignments)
+    
+    if unique_speakers == 1:
+        logger.warning(
+            f"All {total_chunks} chunks assigned to single speaker (speaker {list(speaker_counts.keys())[0]}). "
+            f"This may indicate: (1) threshold too high (current={speaker_similarity}), "
+            f"(2) audio contains only one speaker, or (3) embeddings not discriminative enough. "
+            f"Consider lowering speaker_similarity threshold (e.g., 0.3-0.4) or checking audio quality."
+        )
+    elif unique_speakers == 0:
+        logger.error("No speaker assignments made - this should not happen!")
+    else:
+        # Log distribution statistics
+        max_count = max(speaker_counts.values())
+        min_count = min(speaker_counts.values())
+        max_speaker = max(speaker_counts.items(), key=lambda x: x[1])[0]
+        min_speaker = min(speaker_counts.items(), key=lambda x: x[1])[0]
+        
+        logger.info(
+            f"Speaker diversity: {unique_speakers} speakers detected. "
+            f"Largest cluster: speaker {max_speaker} ({max_count} chunks, {max_count/total_chunks*100:.1f}%), "
+            f"Smallest cluster: speaker {min_speaker} ({min_count} chunks, {min_count/total_chunks*100:.1f}%)"
+        )
+        
+        # Warn if distribution is very imbalanced (>90% in one cluster)
+        if max_count / total_chunks > 0.9:
+            logger.warning(
+                f"Highly imbalanced speaker distribution: {max_count/total_chunks*100:.1f}% assigned to speaker {max_speaker}. "
+                f"Consider adjusting speaker_similarity threshold (current={speaker_similarity})."
+            )
 
     return speaker_assignments
