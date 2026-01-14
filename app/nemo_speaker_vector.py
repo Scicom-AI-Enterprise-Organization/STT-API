@@ -87,8 +87,12 @@ class SpeakerVector(torch.nn.Module):
         inputs, lengths = sequence_1d(inputs, return_len=True)
 
         # preprocessor always runs in fp32 (stft)
-        inputs = to_tensor_cuda(torch.Tensor(inputs.astype(np.float32)), cuda)
-        lengths = to_tensor_cuda(torch.Tensor(lengths), cuda)
+        inputs = to_tensor_cuda(torch.Tensor(inputs.astype(np.float32)), cuda).to(
+            dtype=torch.float16 if cuda else torch.float32
+        )
+        lengths = to_tensor_cuda(torch.Tensor(lengths), cuda).to(
+            dtype=torch.float16 if cuda else torch.float32
+        )
 
         # preprocessor output is fp32
         o_processor = self.preprocessor(inputs, lengths)

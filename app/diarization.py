@@ -11,10 +11,15 @@ import bisect
 from typing import List, Dict, Tuple
 import numpy as np
 import torch
+import torch.cuda as cuda
 
 logger = logging.getLogger(__name__)
 
 SPEAKER_EMBEDDING_BATCH_SIZE = int(os.environ.get("SPEAKER_EMBEDDING_BATCH_SIZE", "16"))
+
+# CUDA streams for overlapped host-device communication
+h2d_stream = cuda.Stream()
+compute_stream = cuda.Stream()
 
 # Minimum audio samples required for TitaNet embedding extraction
 # TitaNet uses hop_length=160 at 16kHz, needs multiple frames for mel spectrogram
@@ -85,13 +90,9 @@ def extract_embeddings_batched(
         )
 
         with torch.no_grad():
-            # `SpeakerVector` overrides `__call__` to return numpy (for legacy reasons),
-            # but for online diarization we want torch tensors (ideally staying on GPU).
-            # So we call `.forward()` explicitly.
-            #
-            # We keep autocast enabled on CUDA; the model itself disables autocast
-            # around STFT in the preprocessor where needed.
+            # Use CUDA streams for overlapped host-device communication
             with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
+                # Note: SpeakerVector.forward handles padding internally via sequence_1d
                 logits, batch_emb = model.forward(batch)
 
             # `batch_emb` is [B, D] torch tensor. Split into per-chunk tensors.
