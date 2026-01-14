@@ -6,7 +6,7 @@ import io
 import tempfile
 import asyncio
 import time
-import multiprocessing as mp
+import multiprocessing
 from typing import List, Optional, Tuple, Dict
 from concurrent.futures import ProcessPoolExecutor
 import numpy as np
@@ -20,8 +20,6 @@ import soundfile as sf
 from concurrent.futures import ProcessPoolExecutor
 from app.diarization import load_speaker_model, run_online_diarization
 
-# Set multiprocessing start method to spawn for CUDA compatibility
-mp.set_start_method("spawn", force=True)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -97,10 +95,12 @@ def get_vad_executor():
 def get_diarization_executor():
     global _diarization_executor
     if _diarization_executor is None:
+        # Use spawn context for CUDA compatibility
+        spawn_context = multiprocessing.get_context("spawn")
         _diarization_executor = ProcessPoolExecutor(
-            max_workers=1, initializer=init_diarization_worker
+            max_workers=1, initializer=init_diarization_worker, mp_context=spawn_context
         )
-        logger.info("Diarization executor initialized with 1 worker")
+        logger.info("Diarization executor initialized with 1 worker (spawn context)")
     return _diarization_executor
 
 
