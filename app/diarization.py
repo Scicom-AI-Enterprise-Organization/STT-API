@@ -89,14 +89,24 @@ def extract_embeddings_batched(
             f"Processing embedding batch {batch_num}/{total_batches} ({len(batch)} chunks)"
         )
 
-        with torch.no_grad():
-            # Use CUDA streams for overlapped host-device communication
-            with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
-                # Note: SpeakerVector.forward handles padding internally via sequence_1d
-                logits, batch_emb = model.forward(batch)
+        # Prepare batch: pad and create pinned tensors
+        inputs_pinned, lengths_pinned = model.prep_batch(batch)
 
-            # `batch_emb` is [B, D] torch tensor. Split into per-chunk tensors.
-            embeddings.extend(list(batch_emb.unbind(dim=0)))
+        # Transfer to GPU with H2D stream
+        with cuda.stream(h2d_stream):
+            inputs_gpu = inputs_pinned.to(model.device, non_blocking=True)
+            lengths_gpu = lengths_pinned.to(model.device, non_blocking=True)
+
+        # Compute with compute stream, waiting for transfer
+        with cuda.stream(compute_stream):
+            compute_stream.wait_stream(h2d_stream)
+            with torch.no_grad():
+                with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
+                    batch_emb = model.compute_batch(inputs_gpu, lengths_gpu)
+
+        # Synchronize and collect
+        compute_stream.synchronize()
+        embeddings.extend(list(batch_emb.unbind(dim=0)))
 
     return embeddings
 

@@ -11,6 +11,7 @@ import torch
 import yaml
 import numpy as np
 import torch.nn as nn
+from typing import List, Tuple
 from references.malaya_speech.utils.padding import sequence_1d
 from app.nemo_featurization import AudioToMelSpectrogramPreprocessor
 from references.malaya_speech.nemo import conv_asr
@@ -54,6 +55,7 @@ class SpeakerVector(torch.nn.Module):
         self.__name__ = name
 
         self._is_half = False
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     def half(self):
         """
@@ -122,6 +124,48 @@ class SpeakerVector(torch.nn.Module):
         """
         r = self.forward(inputs=inputs)
         return to_numpy(r[1])
+
+    def prep_batch(self, batch: List[np.ndarray]) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Prepare batch: pad sequences and create pinned tensors on CPU.
+
+        Returns:
+            inputs_pinned: Pinned tensor [B, T] on CPU
+            lengths_pinned: Pinned tensor [B] on CPU
+        """
+        inputs, lengths = sequence_1d(batch, return_len=True)
+        inputs_tensor = torch.Tensor(inputs.astype(np.float32))
+        lengths_tensor = torch.Tensor(lengths)
+
+        # Create pinned memory
+        inputs_pinned = inputs_tensor.pin_memory()
+        lengths_pinned = lengths_tensor.pin_memory()
+
+        return inputs_pinned, lengths_pinned
+
+    def compute_batch(
+        self, inputs_gpu: torch.Tensor, lengths_gpu: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Compute embeddings from pre-transferred tensors.
+
+        Args:
+            inputs_gpu: [B, T] tensor on GPU
+            lengths_gpu: [B] tensor on GPU
+
+        Returns:
+            batch_emb: [B, D] embeddings on GPU
+        """
+        # preprocessor always runs in fp32 (stft)
+        o_processor = self.preprocessor(inputs_gpu, lengths_gpu)
+
+        # IMPORTANT: Handle FP16 conversion
+        if self._is_half:
+            o_processor = (o_processor[0].half(), o_processor[1])
+
+        o_encoder = self.encoder(*o_processor)
+        logits, batch_emb = self.decoder(*o_encoder)
+        return batch_emb
 
     def __call__(self, inputs):
         return self.vectorize(inputs)
