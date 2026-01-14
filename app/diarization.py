@@ -56,7 +56,7 @@ def get_speaker_model():
 def extract_embeddings_batched(
     audio_chunks: List[np.ndarray],
     batch_size: int = SPEAKER_EMBEDDING_BATCH_SIZE,
-) -> List[np.ndarray]:
+) -> List[torch.Tensor]:
     """
     Extract speaker embeddings for multiple audio chunks using batched GPU inference.
 
@@ -65,7 +65,7 @@ def extract_embeddings_batched(
         batch_size: Number of chunks to process in one GPU call
 
     Returns:
-        List of embedding vectors (one per chunk)
+        List of embedding vectors (torch.Tensor, one per chunk)
     """
     model = get_speaker_model()
     embeddings = []
@@ -90,9 +90,15 @@ def extract_embeddings_batched(
             if is_fp16:
                 batch_embeddings = model(batch)
             else:
-                with torch.amp.autocast("cuda", enabled=torch.cuda.is_available()):
+                with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
                     batch_embeddings = model(batch)
-        embeddings.extend(batch_embeddings)
+
+            # batch_embeddings is a tuple: (logits, embeddings)
+            # We want the embeddings (second element)
+            if isinstance(batch_embeddings, tuple):
+                batch_embeddings = batch_embeddings[1]
+
+            embeddings.extend(batch_embeddings)
 
     return embeddings
 
@@ -173,7 +179,8 @@ def run_online_diarization(
     Returns:
         Dictionary mapping chunk_index -> speaker_id (0-indexed)
     """
-    from references.malaya_speech.model.clustering import StreamingKMeansMaxCluster
+    from app.clustering_torch import StreamingKMeansMaxClusterTorch
+    import torch
     import time
 
     if not audio_chunks:
@@ -209,11 +216,13 @@ def run_online_diarization(
     embeddings = extract_embeddings_batched(valid_chunks)
     logger.info(f"⏱️ Embedding extraction took: {time.time() - t_embed:.2f}s")
 
-    # 3. Cluster incrementally using StreamingKMeans
+    # 3. Cluster incrementally using StreamingKMeans (PyTorch version)
     t_cluster = time.time()
-    cluster = StreamingKMeansMaxCluster(
+    cluster = StreamingKMeansMaxClusterTorch(
         threshold=speaker_similarity, max_clusters=speaker_max_n
     )
+
+    # Embeddings are already torch tensors from the updated extract_embeddings_batched
 
     speaker_assignments = {}
     for i, embedding in enumerate(embeddings):
@@ -259,11 +268,15 @@ def process_chunk_incremental(
     diarization_cluster,
 ) -> int:
     """DEPRECATED: Use run_online_diarization() instead."""
-    from references.malaya_speech.model.clustering import StreamingKMeansMaxCluster
+    from app.clustering_torch import StreamingKMeansMaxClusterTorch
 
     model = get_speaker_model()
-    with torch.amp.autocast("cuda", enabled=torch.cuda.is_available()):
-        embedding = model([audio_chunk])[0]
+    with torch.no_grad():
+        embedding = model([audio_chunk])
+        if isinstance(embedding, tuple):
+            embedding = embedding[1][
+                0
+            ]  # Get embedding tensor from (logits, embeddings)
 
     speaker_id = diarization_cluster.streaming(embedding)
 
@@ -276,15 +289,19 @@ def process_chunks_batch_incremental(
     batch_size: int = SPEAKER_EMBEDDING_BATCH_SIZE,
 ) -> List[int]:
     """DEPRECATED: Use run_online_diarization() instead."""
-    from references.malaya_speech.model.clustering import StreamingKMeansMaxCluster
+    from app.clustering_torch import StreamingKMeansMaxClusterTorch
 
     model = get_speaker_model()
     speaker_ids = []
 
     for i in range(0, len(audio_chunks), batch_size):
         batch = audio_chunks[i : i + batch_size]
-        with torch.amp.autocast("cuda", enabled=torch.cuda.is_available()):
+        with torch.no_grad():
             batch_embeddings = model(batch)
+            if isinstance(batch_embeddings, tuple):
+                batch_embeddings = batch_embeddings[1]  # Get embedding tensors
+            if isinstance(batch_embeddings, tuple):
+                batch_embeddings = batch_embeddings[1]  # Get embedding tensors
 
         for embedding in batch_embeddings:
             speaker_id = diarization_cluster.streaming(embedding)

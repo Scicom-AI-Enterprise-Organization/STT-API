@@ -16,8 +16,8 @@ from references.malaya_speech.utils.padding import sequence_1d
 from app.nemo_featurization import AudioToMelSpectrogramPreprocessor
 from references.malaya_speech.nemo import conv_asr
 from references.malaya_speech.nemo.conv_asr import SpeakerDecoder
-from malaya_boilerplate.torch_utils import to_tensor_cuda, to_numpy
-from malaya_boilerplate.huggingface import download_files
+from app.torch_utils import to_tensor_cuda, to_numpy
+from app.huggingface import download_files
 
 
 class SpeakerVector(torch.nn.Module):
@@ -71,7 +71,7 @@ class SpeakerVector(torch.nn.Module):
         for module in self.decoder.modules():
             if isinstance(module, nn.BatchNorm1d):
                 module.float()
-        
+
         self._is_half = True
         return self
 
