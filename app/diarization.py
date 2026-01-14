@@ -75,6 +75,8 @@ def extract_embeddings_batched(
         f"Extracting embeddings for {total_chunks} chunks (batch_size={batch_size})"
     )
 
+    is_fp16 = next(model.parameters()).dtype == torch.float16
+
     for i in range(0, total_chunks, batch_size):
         batch = audio_chunks[i : i + batch_size]
         batch_num = i // batch_size + 1
@@ -85,8 +87,11 @@ def extract_embeddings_batched(
         )
 
         with torch.no_grad():
-            with torch.amp.autocast("cuda", enabled=torch.cuda.is_available()):
+            if is_fp16:
                 batch_embeddings = model(batch)
+            else:
+                with torch.amp.autocast("cuda", enabled=torch.cuda.is_available()):
+                    batch_embeddings = model(batch)
         embeddings.extend(batch_embeddings)
 
     return embeddings
