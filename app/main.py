@@ -536,14 +536,14 @@ def merge_speakers_with_segments(
             speaker = find_speaker_for_chunk_timestamp(
                 seg_start, seg_end, chunk_ranges, speaker_data
             )
-            seg["speaker"] = speaker if speaker is not None else 0
+            seg["speaker"] = int(speaker) if speaker is not None else 0
 
     elif mode == "offline":
         for seg in segments:
             speaker = find_speaker_for_timestamp(
                 seg.get("start", 0), seg.get("end", 0), speaker_data
             )
-            seg["speaker"] = speaker if speaker is not None else 0
+            seg["speaker"] = int(speaker) if speaker is not None else 0
 
     return segments
 

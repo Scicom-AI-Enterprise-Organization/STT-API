@@ -11,6 +11,7 @@ from operator import length_hint
 import torch
 import yaml
 import numpy as np
+import torch.nn as nn
 from references.malaya_speech.utils.padding import sequence_1d
 from app.nemo_featurization import AudioToMelSpectrogramPreprocessor
 from references.malaya_speech.nemo import conv_asr
@@ -58,9 +59,19 @@ class SpeakerVector(torch.nn.Module):
     def half(self):
         """
         Override half() to only convert encoder and decoder, not preprocessor
+        Preprocessor stays FP32 (STFT requirement)
+        BatchNorm layers need special handling
         """
         self.encoder = self.encoder.half()
         self.decoder = self.decoder.half()
+
+        for module in self.encoder.modules():
+            if isinstance(module, nn.BatchNorm1d):
+                module.float()
+        for module in self.decoder.modules():
+            if isinstance(module, nn.BatchNorm1d):
+                module.float()
+        
         self._is_half = True
         return self
 
