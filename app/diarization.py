@@ -89,10 +89,15 @@ def extract_embeddings_batched(
             f"Processing embedding batch {batch_num}/{total_batches} ({len(batch)} chunks)"
         )
 
-        # Prepare batch: pad and create pinned tensors
+        # Synchronize previous compute if not the first batch
+        if i > 0:
+            compute_stream.synchronize()
+            embeddings.extend(list(prev_batch_emb.unbind(dim=0)))
+
+        # Prepare batch: pad and create pinned tensors (CPU work)
         inputs_pinned, lengths_pinned = model.prep_batch(batch)
 
-        # Transfer to GPU with H2D stream
+        # Transfer to GPU with H2D stream (overlaps with previous compute if any)
         with cuda.stream(h2d_stream):
             inputs_gpu = inputs_pinned.to(model.device, non_blocking=True)
             lengths_gpu = lengths_pinned.to(model.device, non_blocking=True)
@@ -104,9 +109,12 @@ def extract_embeddings_batched(
                 with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
                     batch_emb = model.compute_batch(inputs_gpu, lengths_gpu)
 
-        # Synchronize and collect
-        compute_stream.synchronize()
-        embeddings.extend(list(batch_emb.unbind(dim=0)))
+        # Store for later collection
+        prev_batch_emb = batch_emb
+
+    # Final synchronize and collect last batch
+    compute_stream.synchronize()
+    embeddings.extend(list(prev_batch_emb.unbind(dim=0)))
 
     return embeddings
 
