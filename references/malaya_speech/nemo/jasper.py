@@ -459,6 +459,19 @@ class SqueezeExcite(nn.Module):
         max_len = x.shape[-1]
         if max_len > self.max_len:
             self.set_max_len(max_len)
+
+        if not self.training:
+            mask = self.make_pad_mask(lengths, max_audio_length=max_len, device=x.device)
+            mask = ~mask
+            x.masked_fill_(mask, 0.0)
+            y = self._se_pool_step(x, mask)
+            y = y.transpose(1, -1)
+            y = self.fc(y)
+            y = y.transpose(1, -1)
+            y = torch.sigmoid(y)
+            y = x * y
+            return y, lengths
+
         dtype = x.dtype
         # Computes in float32 to avoid instabilities during training with AMP.
         with torch.cuda.amp.autocast(enabled=False):
