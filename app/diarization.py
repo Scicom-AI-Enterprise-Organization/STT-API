@@ -168,8 +168,7 @@ def run_online_diarization(
     Returns:
         Dictionary mapping chunk_index -> speaker_id (0-indexed)
     """
-    import malaya_speech
-    from malaya_speech.model.clustering import StreamingKMeansMaxCluster
+    from references.malaya_speech.model.clustering import StreamingKMeansMaxCluster
     import time
 
     if not audio_chunks:
@@ -213,11 +212,7 @@ def run_online_diarization(
 
     speaker_assignments = {}
     for i, embedding in enumerate(embeddings):
-        label = malaya_speech.diarization.streaming(embedding, cluster)
-        try:
-            speaker_id = int(label.replace("speaker ", ""))
-        except (ValueError, AttributeError):
-            speaker_id = 0
+        speaker_id = cluster.streaming(embedding)
         speaker_assignments[valid_indices[i]] = speaker_id
 
     logger.info(f"⏱️ Clustering took: {time.time() - t_cluster:.2f}s")
@@ -259,17 +254,13 @@ def process_chunk_incremental(
     diarization_cluster,
 ) -> int:
     """DEPRECATED: Use run_online_diarization() instead."""
-    import malaya_speech
+    from references.malaya_speech.model.clustering import StreamingKMeansMaxCluster
 
     model = get_speaker_model()
     with torch.amp.autocast("cuda", enabled=torch.cuda.is_available()):
         embedding = model([audio_chunk])[0]
 
-    speaker_label = malaya_speech.diarization.streaming(embedding, diarization_cluster)
-    try:
-        speaker_id = int(speaker_label.replace("speaker ", ""))
-    except (ValueError, AttributeError):
-        speaker_id = 0
+    speaker_id = diarization_cluster.streaming(embedding)
 
     return speaker_id
 
@@ -280,7 +271,7 @@ def process_chunks_batch_incremental(
     batch_size: int = SPEAKER_EMBEDDING_BATCH_SIZE,
 ) -> List[int]:
     """DEPRECATED: Use run_online_diarization() instead."""
-    import malaya_speech
+    from references.malaya_speech.model.clustering import StreamingKMeansMaxCluster
 
     model = get_speaker_model()
     speaker_ids = []
@@ -291,13 +282,7 @@ def process_chunks_batch_incremental(
             batch_embeddings = model(batch)
 
         for embedding in batch_embeddings:
-            speaker_label = malaya_speech.diarization.streaming(
-                embedding, diarization_cluster
-            )
-            try:
-                speaker_id = int(speaker_label.replace("speaker ", ""))
-            except (ValueError, AttributeError):
-                speaker_id = 0
+            speaker_id = diarization_cluster.streaming(embedding)
             speaker_ids.append(speaker_id)
 
     return speaker_ids

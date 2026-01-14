@@ -5,7 +5,7 @@ torchaudio
 silero-vad
 numpy
 aiohttp
-malaya-speech==1.4.0rc2
+
 uvicorn[standard]
 librosa
 six

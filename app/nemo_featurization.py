@@ -24,8 +24,29 @@ import torch.nn as nn
 from packaging import version
 from abc import ABC, abstractmethod
 from typing import Optional, Union
-from malaya_speech.nemo.tdnn_attention import make_seq_mask_like
 import logging
+
+
+def make_seq_mask_like(lengths, like, time_dim=-1, valid_ones=False):
+    """
+    Create a mask for sequences based on lengths.
+
+    Args:
+        lengths: Tensor of sequence lengths
+        like: Tensor to match shape
+        time_dim: Dimension for time
+        valid_ones: If True, valid positions are 1, else invalid are 1
+
+    Returns:
+        Mask tensor
+    """
+    max_len = like.shape[time_dim]
+    arange = torch.arange(max_len, device=like.device, dtype=lengths.dtype)
+    mask = arange.unsqueeze(0) >= lengths.unsqueeze(1)
+    if valid_ones:
+        mask = ~mask
+    return mask
+
 
 logger = logging.getLogger(__name__)
 
@@ -47,26 +68,26 @@ CONSTANT = 1e-5
 def splice_frames(x, frame_splicing):
     """
     Splice frames by concatenating consecutive frames along the feature dimension.
-    
+
     Args:
         x: Input tensor of shape [B, D, T] (batch, features, time)
         frame_splicing: Number of consecutive frames to splice together
-    
+
     Returns:
         Tensor of shape [B, D*frame_splicing, T'] where T' is reduced
     """
     if frame_splicing <= 1:
         return x
-    
+
     B, D, T = x.shape
     # Calculate output time dimension
     T_out = T - frame_splicing + 1
-    
+
     # Create overlapping windows and concatenate along feature dimension
     frames = []
     for i in range(frame_splicing):
-        frames.append(x[:, :, i:i + T_out])
-    
+        frames.append(x[:, :, i : i + T_out])
+
     # Concatenate along feature dimension: [B, D*frame_splicing, T_out]
     return torch.cat(frames, dim=1)
 
@@ -516,7 +537,7 @@ class FilterbankFeatures(nn.Module):
             )
 
         # disable autocast to get full range of stft values
-        with torch.amp.autocast('cuda', enabled=False):
+        with torch.amp.autocast("cuda", enabled=False):
             x = self.stft(x)
 
         # torch stft returns complex tensor (of shape [B,N,T]); so convert to magnitude
@@ -734,7 +755,7 @@ class FilterbankFeaturesTA(nn.Module):
 
     def _extract_spectrograms(self, signals: torch.Tensor) -> torch.Tensor:
         # Complex FFT needs to be done in single precision
-        with torch.amp.autocast('cuda', enabled=False):
+        with torch.amp.autocast("cuda", enabled=False):
             features = self._mel_spec_extractor(waveform=signals)
         return features
 

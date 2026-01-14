@@ -11,11 +11,10 @@ from operator import length_hint
 import torch
 import yaml
 import numpy as np
-from malaya_speech.utils.padding import sequence_1d
-from malaya_speech.model.frame import Frame
+from references.malaya_speech.utils.padding import sequence_1d
 from app.nemo_featurization import AudioToMelSpectrogramPreprocessor
-from malaya_speech.nemo import conv_asr
-from malaya_speech.nemo.conv_asr import SpeakerDecoder
+from references.malaya_speech.nemo import conv_asr
+from references.malaya_speech.nemo.conv_asr import SpeakerDecoder
 from malaya_boilerplate.torch_utils import to_tensor_cuda, to_numpy
 from malaya_boilerplate.huggingface import download_files
 
@@ -72,12 +71,8 @@ class SpeakerVector(torch.nn.Module):
         Parameters
         ----------
         inputs: List[np.array]
-            List[np.array] or List[malaya_speech.model.frame.Frame].
         """
-        inputs = [
-            input.array if isinstance(input, Frame) else input 
-            for input in inputs
-        ]
+        inputs = inputs
         cuda = next(self.parameters()).is_cuda
         inputs, lengths = sequence_1d(inputs, return_len=True)
 
@@ -101,7 +96,6 @@ class SpeakerVector(torch.nn.Module):
         Parameters
         ----------
         inputs: List[np.array]
-            List[np.array] or List[malaya_speech.model.frame.Frame].
 
         Returns
         -------

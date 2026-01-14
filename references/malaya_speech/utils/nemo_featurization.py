@@ -25,8 +25,29 @@ import torch.nn as nn
 from packaging import version
 from abc import ABC, abstractmethod
 from typing import Optional, Union
-from malaya_speech.nemo.tdnn_attention import make_seq_mask_like
 import logging
+
+
+def make_seq_mask_like(lengths, like, time_dim=-1, valid_ones=False):
+    """
+    Create a mask for sequences based on lengths.
+
+    Args:
+        lengths: Tensor of sequence lengths
+        like: Tensor to match shape
+        time_dim: Dimension for time
+        valid_ones: If True, valid positions are 1, else invalid are 1
+
+    Returns:
+        Mask tensor
+    """
+    max_len = like.shape[time_dim]
+    arange = torch.arange(max_len, device=like.device, dtype=lengths.dtype)
+    mask = arange.unsqueeze(0) >= lengths.unsqueeze(1)
+    if valid_ones:
+        mask = ~mask
+    return mask
+
 
 logger = logging.getLogger(__name__)
 
@@ -35,7 +56,7 @@ try:
     import torchaudio.transforms
 
     TORCHAUDIO_VERSION = version.parse(torchaudio.__version__)
-    TORCHAUDIO_VERSION_MIN = version.parse('0.5')
+    TORCHAUDIO_VERSION_MIN = version.parse("0.5")
 
     HAVE_TORCHAUDIO = True
 except ModuleNotFoundError:
@@ -48,8 +69,12 @@ def normalize_batch(x, seq_len, normalize_type):
     x_mean = None
     x_std = None
     if normalize_type == "per_feature":
-        x_mean = torch.zeros((seq_len.shape[0], x.shape[1]), dtype=x.dtype, device=x.device)
-        x_std = torch.zeros((seq_len.shape[0], x.shape[1]), dtype=x.dtype, device=x.device)
+        x_mean = torch.zeros(
+            (seq_len.shape[0], x.shape[1]), dtype=x.dtype, device=x.device
+        )
+        x_std = torch.zeros(
+            (seq_len.shape[0], x.shape[1]), dtype=x.dtype, device=x.device
+        )
         for i in range(x.shape[0]):
             if x[i, :, : seq_len[i]].shape[1] == 1:
                 raise ValueError(
@@ -75,7 +100,8 @@ def normalize_batch(x, seq_len, normalize_type):
         x_mean = torch.tensor(normalize_type["fixed_mean"], device=x.device)
         x_std = torch.tensor(normalize_type["fixed_std"], device=x.device)
         return (
-            (x - x_mean.view(x.shape[0], x.shape[1]).unsqueeze(2)) / x_std.view(x.shape[0], x.shape[1]).unsqueeze(2),
+            (x - x_mean.view(x.shape[0], x.shape[1]).unsqueeze(2))
+            / x_std.view(x.shape[0], x.shape[1]).unsqueeze(2),
             x_mean,
             x_std,
         )
@@ -96,11 +122,11 @@ class AudioPreprocessor(ABC):
         self.hop_length = hop_length
 
         self.torch_windows = {
-            'hann': torch.hann_window,
-            'hamming': torch.hamming_window,
-            'blackman': torch.blackman_window,
-            'bartlett': torch.bartlett_window,
-            'ones': torch.ones,
+            "hann": torch.hann_window,
+            "hamming": torch.hamming_window,
+            "blackman": torch.blackman_window,
+            "bartlett": torch.bartlett_window,
+            "ones": torch.ones,
             None: torch.ones,
         }
 
@@ -117,70 +143,70 @@ class AudioPreprocessor(ABC):
 
 class AudioToMelSpectrogramPreprocessor(AudioPreprocessor, torch.nn.Module):
     """Featurizer module that converts wavs to mel spectrograms.
-        Args:
-            sample_rate (int): Sample rate of the input audio data.
-                Defaults to 16000
-            window_size (float): Size of window for fft in seconds
-                Defaults to 0.02
-            window_stride (float): Stride of window for fft in seconds
-                Defaults to 0.01
-            n_window_size (int): Size of window for fft in samples
-                Defaults to None. Use one of window_size or n_window_size.
-            n_window_stride (int): Stride of window for fft in samples
-                Defaults to None. Use one of window_stride or n_window_stride.
-            window (str): Windowing function for fft. can be one of ['hann',
-                'hamming', 'blackman', 'bartlett']
-                Defaults to "hann"
-            normalize (str): Can be one of ['per_feature', 'all_features']; all
-                other options disable feature normalization. 'all_features'
-                normalizes the entire spectrogram to be mean 0 with std 1.
-                'pre_features' normalizes per channel / freq instead.
-                Defaults to "per_feature"
-            n_fft (int): Length of FT window. If None, it uses the smallest power
-                of 2 that is larger than n_window_size.
-                Defaults to None
-            preemph (float): Amount of pre emphasis to add to audio. Can be
-                disabled by passing None.
-                Defaults to 0.97
-            features (int): Number of mel spectrogram freq bins to output.
-                Defaults to 64
-            lowfreq (int): Lower bound on mel basis in Hz.
-                Defaults to 0
-            highfreq  (int): Lower bound on mel basis in Hz.
-                Defaults to None
-            log (bool): Log features.
-                Defaults to True
-            log_zero_guard_type(str): Need to avoid taking the log of zero. There
-                are two options: "add" or "clamp".
-                Defaults to "add".
-            log_zero_guard_value(float, or str): Add or clamp requires the number
-                to add with or clamp to. log_zero_guard_value can either be a float
-                or "tiny" or "eps". torch.finfo is used if "tiny" or "eps" is
-                passed.
-                Defaults to 2**-24.
-            dither (float): Amount of white-noise dithering.
-                Defaults to 1e-5
-            pad_to (int): Ensures that the output size of the time dimension is
-                a multiple of pad_to.
-                Defaults to 16
-            frame_splicing (int): Defaults to 1
-            exact_pad (bool): If True, sets stft center to False and adds padding, such that num_frames = audio_length
-                // hop_length. Defaults to False.
-            pad_value (float): The value that shorter mels are padded with.
-                Defaults to 0
-            mag_power (float): The power that the linear spectrogram is raised to
-                prior to multiplication with mel basis.
-                Defaults to 2 for a power spec
-            rng : Random number generator
-            nb_augmentation_prob (float) : Probability with which narrowband augmentation would be applied to
-                samples in the batch.
-                Defaults to 0.0
-            nb_max_freq (int) : Frequency above which all frequencies will be masked for narrowband augmentation.
-                Defaults to 4000
-            use_torchaudio: Whether to use the `torchaudio` implementation.
-            stft_exact_pad: Deprecated argument, kept for compatibility with older checkpoints.
-            stft_conv: Deprecated argument, kept for compatibility with older checkpoints.
-        """
+    Args:
+        sample_rate (int): Sample rate of the input audio data.
+            Defaults to 16000
+        window_size (float): Size of window for fft in seconds
+            Defaults to 0.02
+        window_stride (float): Stride of window for fft in seconds
+            Defaults to 0.01
+        n_window_size (int): Size of window for fft in samples
+            Defaults to None. Use one of window_size or n_window_size.
+        n_window_stride (int): Stride of window for fft in samples
+            Defaults to None. Use one of window_stride or n_window_stride.
+        window (str): Windowing function for fft. can be one of ['hann',
+            'hamming', 'blackman', 'bartlett']
+            Defaults to "hann"
+        normalize (str): Can be one of ['per_feature', 'all_features']; all
+            other options disable feature normalization. 'all_features'
+            normalizes the entire spectrogram to be mean 0 with std 1.
+            'pre_features' normalizes per channel / freq instead.
+            Defaults to "per_feature"
+        n_fft (int): Length of FT window. If None, it uses the smallest power
+            of 2 that is larger than n_window_size.
+            Defaults to None
+        preemph (float): Amount of pre emphasis to add to audio. Can be
+            disabled by passing None.
+            Defaults to 0.97
+        features (int): Number of mel spectrogram freq bins to output.
+            Defaults to 64
+        lowfreq (int): Lower bound on mel basis in Hz.
+            Defaults to 0
+        highfreq  (int): Lower bound on mel basis in Hz.
+            Defaults to None
+        log (bool): Log features.
+            Defaults to True
+        log_zero_guard_type(str): Need to avoid taking the log of zero. There
+            are two options: "add" or "clamp".
+            Defaults to "add".
+        log_zero_guard_value(float, or str): Add or clamp requires the number
+            to add with or clamp to. log_zero_guard_value can either be a float
+            or "tiny" or "eps". torch.finfo is used if "tiny" or "eps" is
+            passed.
+            Defaults to 2**-24.
+        dither (float): Amount of white-noise dithering.
+            Defaults to 1e-5
+        pad_to (int): Ensures that the output size of the time dimension is
+            a multiple of pad_to.
+            Defaults to 16
+        frame_splicing (int): Defaults to 1
+        exact_pad (bool): If True, sets stft center to False and adds padding, such that num_frames = audio_length
+            // hop_length. Defaults to False.
+        pad_value (float): The value that shorter mels are padded with.
+            Defaults to 0
+        mag_power (float): The power that the linear spectrogram is raised to
+            prior to multiplication with mel basis.
+            Defaults to 2 for a power spec
+        rng : Random number generator
+        nb_augmentation_prob (float) : Probability with which narrowband augmentation would be applied to
+            samples in the batch.
+            Defaults to 0.0
+        nb_max_freq (int) : Frequency above which all frequencies will be masked for narrowband augmentation.
+            Defaults to 4000
+        use_torchaudio: Whether to use the `torchaudio` implementation.
+        stft_exact_pad: Deprecated argument, kept for compatibility with older checkpoints.
+        stft_conv: Deprecated argument, kept for compatibility with older checkpoints.
+    """
 
     def __init__(
         self,
@@ -198,7 +224,7 @@ class AudioToMelSpectrogramPreprocessor(AudioPreprocessor, torch.nn.Module):
         highfreq=None,
         log=True,
         log_zero_guard_type="add",
-        log_zero_guard_value=2 ** -24,
+        log_zero_guard_value=2**-24,
         dither=1e-5,
         pad_to=16,
         frame_splicing=1,
@@ -216,10 +242,14 @@ class AudioToMelSpectrogramPreprocessor(AudioPreprocessor, torch.nn.Module):
 
         self._sample_rate = sample_rate
         if window_size and n_window_size:
-            raise ValueError(f"{self} received both window_size and " f"n_window_size. Only one should be specified.")
+            raise ValueError(
+                f"{self} received both window_size and "
+                f"n_window_size. Only one should be specified."
+            )
         if window_stride and n_window_stride:
             raise ValueError(
-                f"{self} received both window_stride and " f"n_window_stride. Only one should be specified."
+                f"{self} received both window_stride and "
+                f"n_window_stride. Only one should be specified."
             )
         if window_size:
             n_window_size = int(window_size * self._sample_rate)
@@ -258,7 +288,9 @@ class AudioToMelSpectrogramPreprocessor(AudioPreprocessor, torch.nn.Module):
             stft_conv=stft_conv,  # Deprecated arguments; kept for config compatibility
         )
 
-    def input_example(self, max_batch: int = 8, max_dim: int = 32000, min_length: int = 200):
+    def input_example(
+        self, max_batch: int = 8, max_dim: int = 32000, min_length: int = 200
+    ):
         batch_size = torch.randint(low=1, high=max_batch, size=[1]).item()
         max_length = torch.randint(low=min_length, high=max_dim, size=[1]).item()
         signals = torch.rand(size=[batch_size, max_length]) * 2 - 1
@@ -294,7 +326,7 @@ class FilterbankFeatures(nn.Module):
         highfreq=None,
         log=True,
         log_zero_guard_type="add",
-        log_zero_guard_value=2 ** -24,
+        log_zero_guard_value=2**-24,
         dither=CONSTANT,
         pad_to=16,
         max_duration=16.7,
@@ -339,19 +371,23 @@ class FilterbankFeatures(nn.Module):
         self.win_length = n_window_size
         self.hop_length = n_window_stride
         self.n_fft = n_fft or 2 ** math.ceil(math.log2(self.win_length))
-        self.stft_pad_amount = (self.n_fft - self.hop_length) // 2 if exact_pad else None
+        self.stft_pad_amount = (
+            (self.n_fft - self.hop_length) // 2 if exact_pad else None
+        )
 
         if exact_pad:
             logger.info("STFT using exact pad")
         torch_windows = {
-            'hann': torch.hann_window,
-            'hamming': torch.hamming_window,
-            'blackman': torch.blackman_window,
-            'bartlett': torch.bartlett_window,
-            'none': None,
+            "hann": torch.hann_window,
+            "hamming": torch.hamming_window,
+            "blackman": torch.blackman_window,
+            "bartlett": torch.bartlett_window,
+            "none": None,
         }
         window_fn = torch_windows.get(window, None)
-        window_tensor = window_fn(self.win_length, periodic=False) if window_fn else None
+        window_tensor = (
+            window_fn(self.win_length, periodic=False) if window_fn else None
+        )
         self.register_buffer("window", window_tensor)
         self.stft = lambda x: torch.stft(
             x,
@@ -373,13 +409,21 @@ class FilterbankFeatures(nn.Module):
         highfreq = highfreq or sample_rate / 2
 
         filterbanks = torch.tensor(
-            librosa.filters.mel(sr=sample_rate, n_fft=self.n_fft, n_mels=nfilt, fmin=lowfreq, fmax=highfreq),
+            librosa.filters.mel(
+                sr=sample_rate,
+                n_fft=self.n_fft,
+                n_mels=nfilt,
+                fmin=lowfreq,
+                fmax=highfreq,
+            ),
             dtype=torch.float,
         ).unsqueeze(0)
         self.register_buffer("fb", filterbanks)
 
         # Calculate maximum sequence length
-        max_length = self.get_seq_len(torch.tensor(max_duration * sample_rate, dtype=torch.float))
+        max_length = self.get_seq_len(
+            torch.tensor(max_duration * sample_rate, dtype=torch.float)
+        )
         max_pad = pad_to - (max_length % pad_to) if pad_to > 0 else 0
         self.max_length = max_length + max_pad
         self.pad_value = pad_value
@@ -435,7 +479,11 @@ class FilterbankFeatures(nn.Module):
 
     def get_seq_len(self, seq_len):
         # Assuming that center is True is stft_pad_amount = 0
-        pad_amount = self.stft_pad_amount * 2 if self.stft_pad_amount is not None else self.n_fft // 2 * 2
+        pad_amount = (
+            self.stft_pad_amount * 2
+            if self.stft_pad_amount is not None
+            else self.n_fft // 2 * 2
+        )
         seq_len = torch.floor((seq_len + pad_amount - self.n_fft) / self.hop_length) + 1
         return seq_len.to(dtype=torch.long)
 
@@ -457,10 +505,12 @@ class FilterbankFeatures(nn.Module):
 
         # do preemphasis
         if self.preemph is not None:
-            x = torch.cat((x[:, 0].unsqueeze(1), x[:, 1:] - self.preemph * x[:, :-1]), dim=1)
+            x = torch.cat(
+                (x[:, 0].unsqueeze(1), x[:, 1:] - self.preemph * x[:, :-1]), dim=1
+            )
 
         # disable autocast to get full range of stft values
-        with torch.amp.autocast('cuda', enabled=False):
+        with torch.amp.autocast("cuda", enabled=False):
             x = self.stft(x)
 
         # torch stft returns complex tensor (of shape [B,N,T]); so convert to magnitude
@@ -472,7 +522,7 @@ class FilterbankFeatures(nn.Module):
         if self.training and self.nb_augmentation_prob > 0.0:
             for idx in range(x.shape[0]):
                 if self._rng.random() < self.nb_augmentation_prob:
-                    x[idx, self._nb_max_fft_bin:, :] = 0.0
+                    x[idx, self._nb_max_fft_bin :, :] = 0.0
 
         # get power spectrum
         if self.mag_power != 1.0:
@@ -505,11 +555,15 @@ class FilterbankFeatures(nn.Module):
         max_len = x.size(-1)
         mask = torch.arange(max_len).to(x.device)
         mask = mask.repeat(x.size(0), 1) >= seq_len.unsqueeze(1)
-        x = x.masked_fill(mask.unsqueeze(1).type(torch.bool).to(device=x.device), self.pad_value)
+        x = x.masked_fill(
+            mask.unsqueeze(1).type(torch.bool).to(device=x.device), self.pad_value
+        )
         del mask
         pad_to = self.pad_to
         if pad_to == "max":
-            x = nn.functional.pad(x, (0, self.max_length - x.size(-1)), value=self.pad_value)
+            x = nn.functional.pad(
+                x, (0, self.max_length - x.size(-1)), value=self.pad_value
+            )
         elif pad_to > 0:
             pad_amt = x.size(-1) % pad_to
             if pad_amt != 0:
@@ -536,7 +590,7 @@ class FilterbankFeaturesTA(nn.Module):
         highfreq: Optional[float] = None,
         log: bool = True,
         log_zero_guard_type: str = "add",
-        log_zero_guard_value: Union[float, str] = 2 ** -24,
+        log_zero_guard_value: Union[float, str] = 2**-24,
         dither: float = 1e-5,
         window: str = "hann",
         pad_to: int = 0,
@@ -549,34 +603,43 @@ class FilterbankFeaturesTA(nn.Module):
         nb_augmentation_prob: float = 0.0,  # Deprecated arguments; kept for config compatibility
         nb_max_freq: int = 4000,  # Deprecated arguments; kept for config compatibility
         mag_power: float = 2.0,  # Deprecated arguments; kept for config compatibility
-        rng: Optional[random.Random] = None,  # Deprecated arguments; kept for config compatibility
+        rng: Optional[
+            random.Random
+        ] = None,  # Deprecated arguments; kept for config compatibility
         stft_exact_pad: bool = False,  # Deprecated arguments; kept for config compatibility
         stft_conv: bool = False,  # Deprecated arguments; kept for config compatibility
     ):
         super().__init__()
         if not HAVE_TORCHAUDIO:
-            raise ValueError(f"Need to install torchaudio to instantiate a {self.__class__.__name__}")
+            raise ValueError(
+                f"Need to install torchaudio to instantiate a {self.__class__.__name__}"
+            )
 
         # Make sure log zero guard is supported, if given as a string
         supported_log_zero_guard_strings = {"eps", "tiny"}
-        if isinstance(log_zero_guard_value, str) and log_zero_guard_value not in supported_log_zero_guard_strings:
+        if (
+            isinstance(log_zero_guard_value, str)
+            and log_zero_guard_value not in supported_log_zero_guard_strings
+        ):
             raise ValueError(
                 f"Log zero guard value must either be a float or a member of {supported_log_zero_guard_strings}"
             )
 
         # Copied from `AudioPreprocessor` due to the ad-hoc structuring of the Mel Spec extractor class
         self.torch_windows = {
-            'hann': torch.hann_window,
-            'hamming': torch.hamming_window,
-            'blackman': torch.blackman_window,
-            'bartlett': torch.bartlett_window,
-            'ones': torch.ones,
+            "hann": torch.hann_window,
+            "hamming": torch.hamming_window,
+            "blackman": torch.blackman_window,
+            "bartlett": torch.bartlett_window,
+            "ones": torch.ones,
             None: torch.ones,
         }
 
         # Ensure we can look up the window function
         if window not in self.torch_windows:
-            raise ValueError(f"Got window value '{window}' but expected a member of {self.torch_windows.keys()}")
+            raise ValueError(
+                f"Got window value '{window}' but expected a member of {self.torch_windows.keys()}"
+            )
 
         self._win_length = n_window_size
         self._hop_length = n_window_stride
@@ -590,23 +653,25 @@ class FilterbankFeaturesTA(nn.Module):
         self._pad_to = pad_to
         self._pad_value = pad_value
         self._num_fft = n_fft
-        self._mel_spec_extractor: torchaudio.transforms.MelSpectrogram = torchaudio.transforms.MelSpectrogram(
-            sample_rate=self._sample_rate,
-            win_length=self._win_length,
-            hop_length=self._hop_length,
-            n_mels=nfilt,
-            window_fn=self.torch_windows[window],
-            mel_scale="slaney",
-            norm="slaney",
-            n_fft=n_fft,
-            f_max=highfreq,
-            f_min=lowfreq,
-            wkwargs={"periodic": False},
+        self._mel_spec_extractor: torchaudio.transforms.MelSpectrogram = (
+            torchaudio.transforms.MelSpectrogram(
+                sample_rate=self._sample_rate,
+                win_length=self._win_length,
+                hop_length=self._hop_length,
+                n_mels=nfilt,
+                window_fn=self.torch_windows[window],
+                mel_scale="slaney",
+                norm="slaney",
+                n_fft=n_fft,
+                f_max=highfreq,
+                f_min=lowfreq,
+                wkwargs={"periodic": False},
+            )
         )
 
     @property
     def filter_banks(self):
-        """ Matches the analogous class """
+        """Matches the analogous class"""
         return self._mel_spec_extractor.mel_scale.fb
 
     def _resolve_log_zero_guard_value(self, dtype: torch.dtype) -> float:
@@ -627,15 +692,23 @@ class FilterbankFeaturesTA(nn.Module):
         return signals
 
     def _compute_output_lengths(self, input_lengths: torch.Tensor) -> torch.Tensor:
-        out_lengths = input_lengths.div(self._hop_length, rounding_mode="floor").add(1).long()
+        out_lengths = (
+            input_lengths.div(self._hop_length, rounding_mode="floor").add(1).long()
+        )
         return out_lengths
 
     def _apply_pad_to(self, features: torch.Tensor) -> torch.Tensor:
         # Only apply during training; else need to capture dynamic shape for exported models
-        if not self.training or self._pad_to == 0 or features.shape[-1] % self._pad_to == 0:
+        if (
+            not self.training
+            or self._pad_to == 0
+            or features.shape[-1] % self._pad_to == 0
+        ):
             return features
         pad_length = self._pad_to - (features.shape[-1] % self._pad_to)
-        return torch.nn.functional.pad(features, pad=(0, pad_length), value=self._pad_value)
+        return torch.nn.functional.pad(
+            features, pad=(0, pad_length), value=self._pad_value
+        )
 
     def _apply_log(self, features: torch.Tensor) -> torch.Tensor:
         if self._use_log:
@@ -645,37 +718,50 @@ class FilterbankFeaturesTA(nn.Module):
             elif self._log_zero_guard_type == "clamp":
                 features = features.clamp(min=zero_guard)
             else:
-                raise ValueError(f"Unsupported log zero guard type: '{self._log_zero_guard_type}'")
+                raise ValueError(
+                    f"Unsupported log zero guard type: '{self._log_zero_guard_type}'"
+                )
             features = features.log()
         return features
 
     def _extract_spectrograms(self, signals: torch.Tensor) -> torch.Tensor:
         # Complex FFT needs to be done in single precision
-        with torch.amp.autocast('cuda', enabled=False):
+        with torch.amp.autocast("cuda", enabled=False):
             features = self._mel_spec_extractor(waveform=signals)
         return features
 
-    def _apply_normalization(self, features: torch.Tensor, lengths: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
+    def _apply_normalization(
+        self, features: torch.Tensor, lengths: torch.Tensor, eps: float = 1e-5
+    ) -> torch.Tensor:
         # For consistency, this function always does a masked fill even if not normalizing.
-        mask: torch.Tensor = make_seq_mask_like(lengths=lengths, like=features, time_dim=-1, valid_ones=False)
+        mask: torch.Tensor = make_seq_mask_like(
+            lengths=lengths, like=features, time_dim=-1, valid_ones=False
+        )
         features = features.masked_fill(mask, 0.0)
         # Maybe don't normalize
         if self._normalize_strategy is None:
             return features
         # Use the log zero guard for the sqrt zero guard
         guard_value = self._resolve_log_zero_guard_value(features.dtype)
-        if self._normalize_strategy == "per_feature" or self._normalize_strategy == "all_features":
+        if (
+            self._normalize_strategy == "per_feature"
+            or self._normalize_strategy == "all_features"
+        ):
             # 'all_features' reduces over each sample; 'per_feature' reduces over each channel
             reduce_dim = 2
             if self._normalize_strategy == "all_features":
                 reduce_dim = [1, 2]
             # [B, D, T] -> [B, D, 1] or [B, 1, 1]
-            means = features.sum(dim=reduce_dim, keepdim=True).div(lengths.view(-1, 1, 1))
+            means = features.sum(dim=reduce_dim, keepdim=True).div(
+                lengths.view(-1, 1, 1)
+            )
             stds = (
                 features.sub(means)
                 .masked_fill(mask, 0.0)
                 .pow(2.0)
-                .sum(dim=reduce_dim, keepdim=True)  # [B, D, T] -> [B, D, 1] or [B, 1, 1]
+                .sum(
+                    dim=reduce_dim, keepdim=True
+                )  # [B, D, T] -> [B, D, 1] or [B, 1, 1]
                 .div(lengths.view(-1, 1, 1) - 1)  # assume biased estimator
                 .clamp(min=guard_value)  # avoid sqrt(0)
                 .sqrt()
@@ -741,31 +827,36 @@ class AudioToMFCCPreprocessor(AudioPreprocessor, torch.nn.Module):
         window_stride=0.01,
         n_window_size=None,
         n_window_stride=None,
-        window='hann',
+        window="hann",
         n_fft=None,
         lowfreq=0.0,
         highfreq=None,
         n_mels=64,
         n_mfcc=64,
         dct_type=2,
-        norm='ortho',
+        norm="ortho",
         log=True,
     ):
-        super().__init__(int(window_size * sample_rate), int(window_stride * sample_rate))
+        super().__init__(
+            int(window_size * sample_rate), int(window_stride * sample_rate)
+        )
 
         self._sample_rate = sample_rate
         if not HAVE_TORCHAUDIO:
-
             raise ModuleNotFoundError(
                 "torchaudio is not installed but is necessary for "
                 "AudioToMFCCPreprocessor. We recommend you try "
                 "building it from source for the PyTorch version you have."
             )
         if window_size and n_window_size:
-            raise ValueError(f"{self} received both window_size and " f"n_window_size. Only one should be specified.")
+            raise ValueError(
+                f"{self} received both window_size and "
+                f"n_window_size. Only one should be specified."
+            )
         if window_stride and n_window_stride:
             raise ValueError(
-                f"{self} received both window_stride and " f"n_window_stride. Only one should be specified."
+                f"{self} received both window_stride and "
+                f"n_window_stride. Only one should be specified."
             )
         # Get win_length (n_window_size) and hop_length (n_window_stride)
         if window_size:
@@ -775,14 +866,14 @@ class AudioToMFCCPreprocessor(AudioPreprocessor, torch.nn.Module):
 
         mel_kwargs = {}
 
-        mel_kwargs['f_min'] = lowfreq
-        mel_kwargs['f_max'] = highfreq
-        mel_kwargs['n_mels'] = n_mels
+        mel_kwargs["f_min"] = lowfreq
+        mel_kwargs["f_max"] = highfreq
+        mel_kwargs["n_mels"] = n_mels
 
-        mel_kwargs['n_fft'] = n_fft or 2 ** math.ceil(math.log2(n_window_size))
+        mel_kwargs["n_fft"] = n_fft or 2 ** math.ceil(math.log2(n_window_size))
 
-        mel_kwargs['win_length'] = n_window_size
-        mel_kwargs['hop_length'] = n_window_stride
+        mel_kwargs["win_length"] = n_window_size
+        mel_kwargs["hop_length"] = n_window_stride
 
         # Set window_fn. None defaults to torch.ones.
         window_fn = self.torch_windows.get(window, None)
@@ -791,7 +882,7 @@ class AudioToMFCCPreprocessor(AudioPreprocessor, torch.nn.Module):
                 f"Window argument for AudioProcessor is invalid: {window}."
                 f"For no window function, use 'ones' or None."
             )
-        mel_kwargs['window_fn'] = window_fn
+        mel_kwargs["window_fn"] = window_fn
 
         # Use torchaudio's implementation of MFCCs as featurizer
         self.featurizer = torchaudio.transforms.MFCC(
@@ -805,5 +896,7 @@ class AudioToMFCCPreprocessor(AudioPreprocessor, torch.nn.Module):
 
     def get_features(self, input_signal, length):
         features = self.featurizer(input_signal)
-        seq_len = torch.ceil(length.to(torch.float32) / self.hop_length).to(dtype=torch.long)
+        seq_len = torch.ceil(length.to(torch.float32) / self.hop_length).to(
+            dtype=torch.long
+        )
         return features, seq_len
