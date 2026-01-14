@@ -7,7 +7,6 @@ Source: malaya_speech/torch_model/nemo.py and malaya_speech/supervised/classific
 Uses local nemo_featurization (copied and modified to support FP16) instead of malaya_speech's version.
 """
 
-from operator import length_hint
 import torch
 import yaml
 import numpy as np
@@ -33,7 +32,7 @@ class SpeakerVector(torch.nn.Module):
         with open(config) as stream:
             try:
                 d = yaml.safe_load(stream)
-            except yaml.YAMLError as exc:
+            except yaml.YAMLError:
                 raise ValueError("invalid yaml")
 
         preprocessor = d["preprocessor"].copy()
@@ -94,7 +93,12 @@ class SpeakerVector(torch.nn.Module):
         # preprocessor output is fp32
         o_processor = self.preprocessor(inputs, lengths)
 
-        if next(self.encoder.parameters()).dtype == torch.float16:
+        # IMPORTANT:
+        # We cannot reliably infer "model is half" by looking at the *first* encoder
+        # parameter's dtype because BatchNorm layers are explicitly cast back to fp32.
+        # That can cause fp32 features to be fed into fp16 conv layers -> dtype mismatch:
+        #   "Input type (float) and bias type (c10::Half) should be the same"
+        if self._is_half:
             o_processor = (o_processor[0].half(), o_processor[1])
 
         o_encoder = self.encoder(*o_processor)

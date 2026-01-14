@@ -23,8 +23,7 @@ services:
       - STT_API_URL=http://stt-engine:9090
       - OSD_API_URL=http://osd-osd-1:8000
       - ENABLE_ONLINE_DIARIZATION=true
-      - SPEAKER_EMBEDDING_BATCH_SIZE=16
-      - SPEAKER_PRECISION_MODE=FP16
+      - SPEAKER_EMBEDDING_BATCH_SIZE=64
       # - CUDA_VISIBLE_DEVICES=2
     deploy:
       resources:

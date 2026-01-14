@@ -75,8 +75,6 @@ def extract_embeddings_batched(
         f"Extracting embeddings for {total_chunks} chunks (batch_size={batch_size})"
     )
 
-    is_fp16 = next(model.parameters()).dtype == torch.float16
-
     for i in range(0, total_chunks, batch_size):
         batch = audio_chunks[i : i + batch_size]
         batch_num = i // batch_size + 1
@@ -87,18 +85,17 @@ def extract_embeddings_batched(
         )
 
         with torch.no_grad():
-            if is_fp16:
-                batch_embeddings = model(batch)
-            else:
-                with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
-                    batch_embeddings = model(batch)
+            # `SpeakerVector` overrides `__call__` to return numpy (for legacy reasons),
+            # but for online diarization we want torch tensors (ideally staying on GPU).
+            # So we call `.forward()` explicitly.
+            #
+            # We keep autocast enabled on CUDA; the model itself disables autocast
+            # around STFT in the preprocessor where needed.
+            with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
+                logits, batch_emb = model.forward(batch)
 
-            # batch_embeddings is a tuple: (logits, embeddings)
-            # We want the embeddings (second element)
-            if isinstance(batch_embeddings, tuple):
-                batch_embeddings = batch_embeddings[1]
-
-            embeddings.extend(batch_embeddings)
+            # `batch_emb` is [B, D] torch tensor. Split into per-chunk tensors.
+            embeddings.extend(list(batch_emb.unbind(dim=0)))
 
     return embeddings
 
