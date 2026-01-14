@@ -5,6 +5,7 @@ import logging
 import io
 import tempfile
 import asyncio
+import time
 from typing import List, Optional, Tuple, Dict
 from concurrent.futures import ProcessPoolExecutor
 import numpy as np
@@ -15,7 +16,8 @@ import urllib.parse
 from fastapi import FastAPI, File, Form, HTTPException
 import librosa
 import soundfile as sf
-from app.diarization import load_speaker_model, online_diarize
+from concurrent.futures import ProcessPoolExecutor
+from app.diarization import load_speaker_model, run_online_diarization
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -39,16 +41,11 @@ MAX_CONCURRENT_REQUESTS = int(os.environ.get("MAX_CONCURRENT_REQUESTS", "20"))
 request_semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
 logger.info(f"Request semaphore initialized with limit: {MAX_CONCURRENT_REQUESTS}")
 
-CHUNK_BATCH_SIZE = int(os.environ.get("CHUNK_BATCH_SIZE", "8"))
-
-# Diarization buffer threshold: number of chunks to accumulate before processing
-# Lower = more frequent processing (lower latency, more overhead)
-# Higher = better batching efficiency (higher latency, less overhead)
-# Default: 4 chunks balances latency and GPU batching efficiency
-DIARIZATION_BUFFER_THRESHOLD = 4
+CHUNK_BATCH_SIZE = int(os.environ.get("CHUNK_BATCH_SIZE", "64"))
 
 VAD_WORKERS = int(os.environ.get("VAD_WORKERS", "8"))
 _vad_executor = None
+_diarization_executor = None
 
 sample_rate = SAMPLE_RATE
 maxlen = MAX_CHUNK_LENGTH
@@ -74,6 +71,14 @@ def init_vad_worker():
     logger.info(f"Worker {os.getpid()} initialized with Silero VAD")
 
 
+def init_diarization_worker():
+    """Initialize diarization model in worker process."""
+    from app.diarization import load_speaker_model
+
+    load_speaker_model()
+    logger.info(f"Worker {os.getpid()} initialized with speaker model")
+
+
 def get_vad_executor():
     """Get or create the VAD ProcessPoolExecutor."""
     global _vad_executor
@@ -85,15 +90,24 @@ def get_vad_executor():
     return _vad_executor
 
 
+def get_diarization_executor():
+    global _diarization_executor
+    if _diarization_executor is None:
+        _diarization_executor = ProcessPoolExecutor(
+            max_workers=1, 
+            initializer=init_diarization_worker
+        )
+        logger.info("Diarization executor initialized with 1 worker")
+    return _diarization_executor
+
+
 def initialize_models():
-    """
-    Initialize all models at startup.
-    """
+    """Initialize all models at startup."""
     get_vad_executor()
 
     if ENABLE_ONLINE_DIARIZATION:
         try:
-            load_speaker_model()
+            get_diarization_executor()
         except Exception as e:
             logger.warning(
                 f"Failed to load speaker model: {e}. Online diarization disabled."
@@ -379,16 +393,15 @@ async def offline_diarize(
     """
     Call external OSD service for precise speaker diarization.
 
-    The OSD service use pyannote/speaker-diarization-3.1 which is more accurate but slower than online diarization.
+    The OSD service uses pyannote/speaker-diarization-3.1 which is more accurate
+    but slower than online diarization.
 
     Args:
         audio_bytes: Raw audio file bytes
         filename: Original filename for format detection
 
-        Returns:
+    Returns:
         List of diarization segments: [{"start": float, "end": float, "speaker": str}, ...]
-
-    Reference: osd/app/main.py - /diarize endpoint
     """
     url = urllib.parse.urljoin(OSD_API_URL, "/diarize")
 
@@ -403,7 +416,6 @@ async def offline_diarize(
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.post(url, data=form_data) as r:
                 if r.status == 200:
-                    # OSD returns: [{"segment": ..., "label": ..., "speaker": "SPEAKER_00", "start": 0.0, "end": 1.5}, ...]
                     result = await r.json()
                     logger.info(f"OSD returned {len(result)} diarization segments")
                     return result
@@ -443,14 +455,12 @@ def find_speaker_for_timestamp(
         dia_end = dia_seg.get("end", 0)
         speaker = dia_seg.get("speaker", "SPEAKER_00")
 
-        # Calculate overlap
         overlap_start = max(start, dia_start)
         overlap_end = min(end, dia_end)
         overlap = max(0, overlap_end - overlap_start)
 
         if overlap > best_overlap:
             best_overlap = overlap
-            # Convert "SPEAKER_00" -> 0, "SPEAKER_01" -> 1, etc.
             try:
                 best_speaker = int(speaker.replace("SPEAKER_", ""))
             except (ValueError, AttributeError):
@@ -460,7 +470,10 @@ def find_speaker_for_timestamp(
 
 
 def find_speaker_for_chunk_timestamp(
-    start: float, end: float, chunk_ranges: List[Tuple[float, float, int]], speaker_assignments: Dict[int, int]
+    start: float,
+    end: float,
+    chunk_ranges: List[Tuple[float, float, int]],
+    speaker_assignments: Dict[int, int],
 ) -> Optional[int]:
     """
     Find the speaker for a given timestamp range using overlap with chunk boundaries.
@@ -479,14 +492,12 @@ def find_speaker_for_chunk_timestamp(
     best_speaker = None
 
     for chunk_start, chunk_end, chunk_idx in chunk_ranges:
-        # Calculate overlap between segment and chunk
         overlap_start = max(start, chunk_start)
         overlap_end = min(end, chunk_end)
         overlap = max(0, overlap_end - overlap_start)
 
         if overlap > best_overlap:
             best_overlap = overlap
-            # Get speaker assignment for this chunk
             best_speaker = speaker_assignments.get(chunk_idx, 0)
 
     return best_speaker
@@ -504,37 +515,30 @@ def merge_speakers_with_segments(
     Args:
         segments: Transcription segments [{"id": 0, "start": 0.0, "end": 3.5, "text": "..."}, ...]
         speaker_data: Either:
-            - online mode: {chunk_idx: speaker_id} from online_diarize()
+            - online mode: {chunk_idx: speaker_id} from run_online_diarization()
             - offline mode: [{"start": float, "end": float, "speaker": str}, ...] from OSD
         mode: "online" or "offline"
-        chunks_to_transcribe: For online mode, list of (wav_data, start_ts, end_ts) to map segments to chunks
+        chunks_to_transcribe: For online mode, list of (wav_data, start_ts, end_ts)
 
     Returns:
         Segments with added "speaker" field
     """
     if mode == "online" and chunks_to_transcribe:
-        # Build a mapping of chunk timestamp ranges to chunk indices
-        # chunks_to_transcribe format: (wav_data, start_ts, end_ts)
         chunk_ranges = []
         for idx, (_, start_ts, end_ts) in enumerate(chunks_to_transcribe):
             chunk_ranges.append((start_ts, end_ts, idx))
-        # Sort by start time for efficient lookup
         chunk_ranges.sort(key=lambda x: x[0])
 
         for seg in segments:
             seg_start = seg.get("start", 0)
             seg_end = seg.get("end", seg_start)
 
-            # Use overlap calculation to find the best matching chunk
-            # This ensures segments are assigned to the chunk with the most overlap,
-            # similar to how offline mode works
             speaker = find_speaker_for_chunk_timestamp(
                 seg_start, seg_end, chunk_ranges, speaker_data
             )
             seg["speaker"] = speaker if speaker is not None else 0
 
     elif mode == "offline":
-        # speaker_data is list of OSD segments
         for seg in segments:
             speaker = find_speaker_for_timestamp(
                 seg.get("start", 0), seg.get("end", 0), speaker_data
@@ -555,11 +559,6 @@ def vad_parallel(
     """
     Process audio with VAD using multiple processes.
 
-    Splits audio into VAD_WORKERS segments, processes each in parallel, then combines results.
-
-    Note: This approach has a limitation - VAD state is not shared between segments,
-    which may cause slightly different chunking at segment boundaries (typically 3-5 extra chunks).
-
     Args:
         audio_data: Audio data as numpy array
         sample_rate: Sample rate of audio
@@ -575,7 +574,6 @@ def vad_parallel(
     segment_duration = audio_duration / VAD_WORKERS
     segment_samples = int(segment_duration * sample_rate)
 
-    # Split audio into segments for each worker
     segments = []
     for i in range(VAD_WORKERS):
         start_sample = i * segment_samples
@@ -595,11 +593,9 @@ def vad_parallel(
             )
         )
 
-    # Process segments in parallel
     executor = get_vad_executor()
     results = list(executor.map(process_audio_segment, segments))
 
-    # Combine results
     all_chunks = []
     for segment_chunks in results:
         all_chunks.extend(segment_chunks)
@@ -621,8 +617,8 @@ async def audio_transcriptions(
     minimum_trigger_vad_ms: int = Form(MINIMUM_TRIGGER_VAD_MS),
     reject_segment_vad_ratio: float = Form(REJECT_SEGMENT_VAD_RATIO),
     diarization: str = Form("none"),  # none | online | offline
-    speaker_similarity: float = Form(0.3),  # for online, clustering threshold
-    speaker_max_n: int = Form(10),  # for online, max speakers
+    speaker_similarity: float = Form(0.5),
+    speaker_max_n: int = Form(5),
 ):
     """
     Long audio transcription API with VAD chunking.
@@ -634,6 +630,9 @@ async def audio_transcriptions(
     - minimum_silent_ms: Minimum silence duration for VAD trigger (ms)
     - minimum_trigger_vad_ms: Minimum audio length to trigger VAD (ms)
     - reject_segment_vad_ratio: Reject segments with this ratio of silence (0.0-1.0)
+    - diarization: 'none', 'online', or 'offline'
+    - speaker_similarity: Cosine similarity threshold for online diarization
+    - speaker_max_n: Maximum speakers for online diarization
     """
     async with request_semaphore:
         return await _process_transcription(
@@ -661,7 +660,8 @@ async def _process_transcription(
     speaker_max_n: int = 10,
 ):
     """Internal transcription processing (wrapped by request semaphore)."""
-    logger.info(f"Request: language={language}")
+    t_total_start = time.time()
+    logger.info(f"Request: language={language}, diarization={diarization}")
 
     if language is None:
         language = "null"
@@ -688,14 +688,13 @@ async def _process_transcription(
 
     if diarization == "online":
         try:
-            from app.diarization import get_speaker_model
-
-            get_speaker_model()
+            get_diarization_executor()
         except Exception as e:
             raise HTTPException(
                 status_code=503, detail=f"Online diarization unavailable: {str(e)}"
             )
 
+    # Phase 1: Load audio
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=".tmp") as tmp_file:
             tmp_file.write(file)
@@ -713,9 +712,9 @@ async def _process_transcription(
             status_code=400, detail=f"Error loading audio file: {str(e)}"
         )
 
-    chunks = []
-
     try:
+        # Phase 2: VAD chunking
+        t_vad_start = time.time()
         logger.info(f"Phase 1: VAD chunking (parallel, {VAD_WORKERS} workers)...")
         chunks = vad_parallel(
             audio_data=audio_data,
@@ -725,72 +724,72 @@ async def _process_transcription(
             minimum_silent_ms=minimum_silent_ms,
             minimum_trigger_vad_ms=minimum_trigger_vad_ms,
         )
-        logger.info(f"Phase 1 complete: {len(chunks)} chunks created")
+        logger.info(
+            f"⏱️ Phase 1 complete: {len(chunks)} chunks created in {time.time() - t_vad_start:.2f}s"
+        )
 
-        audio_data = None
+        audio_data = None  # Free memory
 
-        logger.info("Phase 2: Transcribing chunks concurrently...")
-
+        # Filter chunks by silence ratio
         chunks_to_transcribe = []
         for chunk_idx, (wav_chunk, start_ts, end_ts, silence_ratio) in enumerate(
             chunks
         ):
             if silence_ratio <= reject_segment_vad_ratio:
-                logger.info(
-                    f"Chunk {chunk_idx + 1}/{len(chunks)}: "
-                    f"{start_ts:.2f}s-{end_ts:.2f}s "
-                    f"(silence: {silence_ratio:.1%})"
-                )
-                # Store (wav_chunk, start_ts, end_ts) to preserve chunk boundaries for overlap calculation
                 chunks_to_transcribe.append((wav_chunk, start_ts, end_ts))
             else:
-                logger.info(
+                logger.debug(
                     f"Chunk {chunk_idx + 1}/{len(chunks)}: Skipped (too silent: {silence_ratio:.1%})"
                 )
 
-        chunks = None
+        chunks = None  # Free memory
+        total_chunks = len(chunks_to_transcribe)
+        logger.info(f"Chunks to transcribe: {total_chunks}")
 
-        # Initialize diarization cluster for online mode (created once, reused)
-        diarization_cluster = None
-        if diarization == "online":
-            from malaya_speech.model.clustering import StreamingKMeansMaxCluster
-            from app.diarization import (
-                process_chunks_batch_incremental,
-                assign_skipped_chunks_to_nearest,
-                MIN_CHUNK_SAMPLES,
-            )
-
-            diarization_cluster = StreamingKMeansMaxCluster(
-                threshold=speaker_similarity,
-                max_clusters=speaker_max_n
-            )
-            logger.info(
-                f"Created StreamingKMeansMaxCluster (similarity={speaker_similarity}, max_n={speaker_max_n})"
-            )
-
-        # For offline mode, create task
+        # Phase 3: Start diarization task in parallel (if enabled)
         diarize_task = None
+        audio_chunks_for_diarization = None
+
         if diarization == "offline":
+            logger.info("Starting offline diarization in background...")
             diarize_task = asyncio.create_task(offline_diarize(file))
+
+        elif diarization == "online":
+            logger.info("Starting online diarization in background...")
+            # Extract audio data for diarization
+            audio_chunks_for_diarization = [
+                wav_chunk for wav_chunk, _, _ in chunks_to_transcribe
+            ]
+
+            loop = asyncio.get_event_loop()
+            diarize_task = loop.run_in_executor(
+                get_diarization_executor(),
+                run_online_diarization,
+                audio_chunks_for_diarization,
+                speaker_similarity,
+                speaker_max_n,
+            )
+
+        # Phase 4: Transcription (runs in parallel with diarization)
+        t_transcribe_start = time.time()
+        logger.info("Phase 2: Transcribing chunks concurrently...")
 
         all_transcriptions = []
         detected_language = None
-        total_chunks = len(chunks_to_transcribe)
-        speaker_assignments = {}  # Will be built incrementally for online mode
-
-        # Buffer for batching embedding extraction while maintaining incremental clustering
-        pending_chunks_for_diarization = []
-        pending_chunk_indices = []
 
         for batch_start in range(0, total_chunks, CHUNK_BATCH_SIZE):
             batch_end = min(batch_start + CHUNK_BATCH_SIZE, total_chunks)
             batch = chunks_to_transcribe[batch_start:batch_end]
 
+            batch_num = batch_start // CHUNK_BATCH_SIZE + 1
+            total_batches = (total_chunks + CHUNK_BATCH_SIZE - 1) // CHUNK_BATCH_SIZE
+
             logger.info(
-                f"Processing batch {batch_start // CHUNK_BATCH_SIZE + 1}/"
-                f"{(total_chunks + CHUNK_BATCH_SIZE - 1) // CHUNK_BATCH_SIZE} "
+                f"Processing batch {batch_num}/{total_batches} "
                 f"(chunks {batch_start + 1}-{batch_end})"
             )
+
+            t_batch_start = time.time()
 
             batch_tasks = [
                 transcribe_chunk(
@@ -804,111 +803,36 @@ async def _process_transcription(
 
             batch_results = await asyncio.gather(*batch_tasks)
 
-            for batch_idx, (transcription, chunk_lang) in enumerate(batch_results):
-                chunk_global_idx = batch_start + batch_idx
+            logger.info(
+                f"⏱️ Batch {batch_num} STT took: {time.time() - t_batch_start:.2f}s"
+            )
+
+            for transcription, chunk_lang in batch_results:
                 all_transcriptions.append(transcription)
                 if detected_language is None and chunk_lang is not None:
                     detected_language = chunk_lang
 
-                # For online diarization: collect chunks for incremental processing
-                if diarization == "online" and diarization_cluster:
-                    wav_chunk, _, _ = batch[batch_idx]
-                    # Filter out chunks too short for embedding
-                    if len(wav_chunk) >= MIN_CHUNK_SAMPLES:
-                        pending_chunks_for_diarization.append(wav_chunk)
-                        pending_chunk_indices.append(chunk_global_idx)
-                    else:
-                        # Mark as skipped - will assign to nearest valid chunk later
-                        logger.debug(
-                            f"Chunk {chunk_global_idx} too short for embedding "
-                            f"({len(wav_chunk)} samples < {MIN_CHUNK_SAMPLES})"
-                        )
+        logger.info(
+            f"⏱️ Phase 2 complete: {len(all_transcriptions)} chunks transcribed in {time.time() - t_transcribe_start:.2f}s"
+        )
 
-            # Process diarization incrementally when buffer reaches threshold
-            # or at the end of the batch if we're near the end
-            if (
-                diarization == "online"
-                and diarization_cluster
-                and pending_chunks_for_diarization
-                and (
-                    len(pending_chunks_for_diarization) >= DIARIZATION_BUFFER_THRESHOLD
-                    or batch_end >= total_chunks
-                )
-            ):
-                # Extract embeddings in batches and assign speakers incrementally
-                batch_speaker_ids = process_chunks_batch_incremental(
-                    pending_chunks_for_diarization,
-                    diarization_cluster,
-                )
-
-                # Map speaker IDs to chunk indices
-                for chunk_idx, speaker_id in zip(
-                    pending_chunk_indices, batch_speaker_ids
-                ):
-                    speaker_assignments[chunk_idx] = speaker_id
-
-                logger.debug(
-                    f"Assigned speakers to {len(batch_speaker_ids)} chunks incrementally"
-                )
-
-                # Clear buffer
-                pending_chunks_for_diarization = []
-                pending_chunk_indices = []
-
-            batch = None
-            batch_tasks = None
-            batch_results = None
-
-        # Process any remaining chunks in the buffer (shouldn't happen, but safety check)
-        if (
-            diarization == "online"
-            and diarization_cluster
-            and pending_chunks_for_diarization
-        ):
-            batch_speaker_ids = process_chunks_batch_incremental(
-                pending_chunks_for_diarization,
-                diarization_cluster,
-            )
-            for chunk_idx, speaker_id in zip(
-                pending_chunk_indices, batch_speaker_ids
-            ):
-                speaker_assignments[chunk_idx] = speaker_id
-            logger.debug(
-                f"Processed final {len(batch_speaker_ids)} chunks from buffer"
-            )
-
-        # Handle skipped chunks (too short for embedding) - assign to nearest valid chunk's speaker
-        if diarization == "online" and speaker_assignments:
-            skipped_count = total_chunks - len(speaker_assignments)
-            if skipped_count > 0:
-                logger.info(
-                    f"Assigning {skipped_count} skipped chunks to nearest valid chunk's speaker"
-                )
-                speaker_assignments = assign_skipped_chunks_to_nearest(
-                    speaker_assignments, total_chunks
-                )
-
-        chunks_for_diarization = chunks_to_transcribe if diarization == "online" else None
-        chunks_to_transcribe = None
-
-        # Handle offline diarization task
+        # Phase 5: Wait for diarization to complete
+        speaker_assignments = None
         if diarize_task is not None:
+            t_diar_wait = time.time()
             try:
-                diarize_result = await diarize_task
-                speaker_assignments = diarize_result
-                logger.info(
-                    f"Offline diarization complete: {len(diarize_result)} segments"
-                )
+                speaker_assignments = await diarize_task
+                if diarization == "offline":
+                    logger.info(
+                        f"⏱️ Offline diarization complete: {len(speaker_assignments)} segments (waited {time.time() - t_diar_wait:.2f}s)"
+                    )
+                else:
+                    logger.info(
+                        f"⏱️ Online diarization complete: {len(speaker_assignments)} assignments (waited {time.time() - t_diar_wait:.2f}s)"
+                    )
             except Exception as e:
                 logger.error(f"Diarization failed: {e}")
                 speaker_assignments = None
-
-        if diarization == "online" and speaker_assignments:
-            logger.info(
-                f"Online diarization complete: {len(speaker_assignments)} assignments"
-            )
-
-        logger.info(f"Phase 2 complete: {len(all_transcriptions)} chunks transcribed")
 
         combined_text = "".join(all_transcriptions)
 
@@ -916,6 +840,7 @@ async def _process_transcription(
         logger.error(f"Error processing audio: {e}")
         raise HTTPException(status_code=500, detail=f"Error processing audio: {str(e)}")
 
+    # Phase 6: Parse and merge results
     segments = parse_segments(combined_text)
 
     if speaker_assignments is not None and segments:
@@ -923,13 +848,17 @@ async def _process_transcription(
             segments=segments,
             speaker_data=speaker_assignments,
             mode=diarization,
-            chunks_to_transcribe=chunks_for_diarization,
+            chunks_to_transcribe=chunks_to_transcribe
+            if diarization == "online"
+            else None,
         )
 
     final_text = " ".join(seg["text"] for seg in segments) if segments else ""
 
     if not final_text:
         final_text = re.sub(pattern, "", combined_text).strip()
+
+    logger.info(f"⏱️ Total processing time: {time.time() - t_total_start:.2f}s")
 
     if response_format == "verbose_json":
         duration = segments[-1]["end"] if segments else 0.0

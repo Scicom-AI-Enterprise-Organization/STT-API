@@ -8,8 +8,9 @@ Reference: https://github.com/huseinzol05/backup-mesolitica-api/blob/master/app/
 import os
 import logging
 import bisect
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple
 import numpy as np
+import torch
 
 logger = logging.getLogger(__name__)
 
@@ -22,11 +23,12 @@ MIN_CHUNK_SAMPLES = int(os.environ.get("MIN_CHUNK_SAMPLES_FOR_EMBEDDING", "8000"
 
 _speaker_model = None
 
+
 def load_speaker_model():
     """
     Load TitaNet Large model for speaker embedding extraction.
     Called once at application startup.
-    
+
     Uses local implementation with FP16 casting for memory efficiency.
     Reference: backup-mesolitica-api/app/main.py lines 140-144
     """
@@ -36,11 +38,9 @@ def load_speaker_model():
 
     from app.nemo_speaker_vector import nemo_speaker_vector
 
-    logger.info("Loading TitaNet Large speaker embedding model (FP16)...")
-    _speaker_model = nemo_speaker_vector(
-        model='huseinzol05/nemo-titanet_large'
-    )
-    logger.info("TitaNet Large model loaded successfully (FP16)")
+    logger.info("Loading TitaNet Large speaker embedding model...")
+    _speaker_model = nemo_speaker_vector(model="huseinzol05/nemo-titanet_large")
+    logger.info("TitaNet Large model loaded successfully")
 
     return _speaker_model
 
@@ -52,65 +52,219 @@ def get_speaker_model():
         raise RuntimeError("Speaker model not loaded. Call load_speaker_model() first.")
     return _speaker_model
 
+
 def extract_embeddings_batched(
     audio_chunks: List[np.ndarray],
     batch_size: int = SPEAKER_EMBEDDING_BATCH_SIZE,
 ) -> List[np.ndarray]:
     """
-    Extract speaker embeddings for multiple audio chunks using batched gpu inference.
-    
-    Meso: speaker_v([sample_wav])[0] - one chunk at a time
+    Extract speaker embeddings for multiple audio chunks using batched GPU inference.
 
     Args:
         audio_chunks: List of audio numpy arrays (float32, 16kHz)
-        batch_size: Number of chunks to process in one gpu call
+        batch_size: Number of chunks to process in one GPU call
 
     Returns:
-        List of embedding vectors (one per chunk) 
+        List of embedding vectors (one per chunk)
     """
     model = get_speaker_model()
     embeddings = []
 
     total_chunks = len(audio_chunks)
-    logger.debug(f"Extracting embeddings for {total_chunks} chunks (batch_size={batch_size})")
+    logger.debug(
+        f"Extracting embeddings for {total_chunks} chunks (batch_size={batch_size})"
+    )
 
     for i in range(0, total_chunks, batch_size):
-        batch = audio_chunks[i:i + batch_size]
+        batch = audio_chunks[i : i + batch_size]
         batch_num = i // batch_size + 1
         total_batches = (total_chunks + batch_size - 1) // batch_size
 
-        logger.debug(f"Processing embedding batch {batch_num}/{total_batches} ({len(batch)} chunks)")
+        logger.debug(
+            f"Processing embedding batch {batch_num}/{total_batches} ({len(batch)} chunks)"
+        )
 
-        # TitaNet handles variable-length audio via internal padding
-        # This single call processes all chunks in the batch on GPU 
-
-        batch_embeddings = model(batch)
+        with torch.no_grad():
+            with torch.amp.autocast("cuda", enabled=torch.cuda.is_available()):
+                batch_embeddings = model(batch)
         embeddings.extend(batch_embeddings)
 
     return embeddings
 
 
+def assign_skipped_chunks_to_nearest(
+    speaker_assignments: Dict[int, int],
+    total_chunks: int,
+) -> Dict[int, int]:
+    """
+    Assign skipped chunks (too short for embedding) to nearest valid chunk's speaker.
+
+    Optimized O(n log m) implementation using sorted indices and binary search,
+    where n = number of skipped chunks and m = number of valid chunks.
+
+    Args:
+        speaker_assignments: Dictionary mapping valid chunk indices to speaker IDs
+        total_chunks: Total number of chunks (including skipped ones)
+
+    Returns:
+        Updated speaker_assignments dictionary with skipped chunks assigned
+    """
+    if not speaker_assignments:
+        return {idx: 0 for idx in range(total_chunks)}
+
+    all_indices = set(range(total_chunks))
+    valid_indices = set(speaker_assignments.keys())
+    skipped_indices = all_indices - valid_indices
+
+    if not skipped_indices:
+        return speaker_assignments
+
+    sorted_valid_indices = sorted(valid_indices)
+    result = speaker_assignments.copy()
+
+    for skipped_idx in skipped_indices:
+        pos = bisect.bisect_left(sorted_valid_indices, skipped_idx)
+
+        nearest_idx = None
+        min_distance = float("inf")
+
+        if pos > 0:
+            left_idx = sorted_valid_indices[pos - 1]
+            distance = abs(skipped_idx - left_idx)
+            if distance < min_distance:
+                min_distance = distance
+                nearest_idx = left_idx
+
+        if pos < len(sorted_valid_indices):
+            right_idx = sorted_valid_indices[pos]
+            distance = abs(skipped_idx - right_idx)
+            if distance < min_distance:
+                nearest_idx = right_idx
+
+        if nearest_idx is not None:
+            result[skipped_idx] = speaker_assignments[nearest_idx]
+        else:
+            result[skipped_idx] = 0
+
+    return result
+
+
+def run_online_diarization(
+    audio_chunks: List[np.ndarray],
+    speaker_similarity: float = 0.3,
+    speaker_max_n: int = 10,
+) -> Dict[int, int]:
+    """
+    Run full online diarization pipeline.
+
+    Designed to be called via ProcessPoolExecutor for parallel execution
+    alongside transcription. The model is loaded via executor initializer.
+
+    Args:
+        audio_chunks: List of audio numpy arrays (float32, 16kHz)
+        speaker_similarity: Cosine similarity threshold for same speaker (0.0-1.0)
+        speaker_max_n: Maximum number of speakers to detect
+
+    Returns:
+        Dictionary mapping chunk_index -> speaker_id (0-indexed)
+    """
+    import malaya_speech
+    from malaya_speech.model.clustering import StreamingKMeansMaxCluster
+    import time
+
+    if not audio_chunks:
+        return {}
+
+    t_start = time.time()
+    logger.info(f"Starting online diarization for {len(audio_chunks)} chunks...")
+
+    # 1. Filter valid chunks (long enough for embedding)
+    valid_chunks = []
+    valid_indices = []
+    skipped_count = 0
+
+    for idx, chunk in enumerate(audio_chunks):
+        if len(chunk) >= MIN_CHUNK_SAMPLES:
+            valid_chunks.append(chunk)
+            valid_indices.append(idx)
+        else:
+            skipped_count += 1
+            logger.debug(
+                f"Chunk {idx} too short for embedding ({len(chunk)} < {MIN_CHUNK_SAMPLES})"
+            )
+
+    if skipped_count > 0:
+        logger.info(f"Skipped {skipped_count} chunks too short for embedding")
+
+    if not valid_chunks:
+        logger.warning("No chunks long enough for speaker embedding")
+        return {i: 0 for i in range(len(audio_chunks))}
+
+    # 2. Extract ALL embeddings at once (batched GPU inference)
+    t_embed = time.time()
+    embeddings = extract_embeddings_batched(valid_chunks)
+    logger.info(f"⏱️ Embedding extraction took: {time.time() - t_embed:.2f}s")
+
+    # 3. Cluster incrementally using StreamingKMeans
+    t_cluster = time.time()
+    cluster = StreamingKMeansMaxCluster(
+        threshold=speaker_similarity, max_clusters=speaker_max_n
+    )
+
+    speaker_assignments = {}
+    for i, embedding in enumerate(embeddings):
+        label = malaya_speech.diarization.streaming(embedding, cluster)
+        try:
+            speaker_id = int(label.replace("speaker ", ""))
+        except (ValueError, AttributeError):
+            speaker_id = 0
+        speaker_assignments[valid_indices[i]] = speaker_id
+
+    logger.info(f"⏱️ Clustering took: {time.time() - t_cluster:.2f}s")
+
+    # 4. Assign skipped chunks to nearest valid chunk's speaker
+    result = assign_skipped_chunks_to_nearest(speaker_assignments, len(audio_chunks))
+
+    # Log summary
+    speaker_counts = {}
+    for speaker_id in result.values():
+        speaker_counts[speaker_id] = speaker_counts.get(speaker_id, 0) + 1
+
+    logger.info(
+        f"⏱️ Online diarization complete in {time.time() - t_start:.2f}s | "
+        f"Speakers: {len(speaker_counts)} | Distribution: {speaker_counts}"
+    )
+
+    return result
+
+
+# Keep for backward compatibility, but deprecated
+def online_diarize(
+    chunks: List[Tuple[np.ndarray, float, float]],
+    speaker_similarity: float = 0.3,
+    speaker_max_n: int = 10,
+) -> Dict[int, int]:
+    """
+    DEPRECATED: Use run_online_diarization() instead.
+
+    This function exists for backward compatibility.
+    """
+    audio_chunks = [chunk[0] for chunk in chunks]
+    return run_online_diarization(audio_chunks, speaker_similarity, speaker_max_n)
+
+
+# Keep these for backward compatibility but they're no longer used in main flow
 def process_chunk_incremental(
     audio_chunk: np.ndarray,
     diarization_cluster,
 ) -> int:
-    """
-    Process a single chunk incrementally for online diarization.
-
-    Args:
-        audio_chunk: Audio data for the chunk (float32, 16kHz)
-        diarization_cluster: StreamingKMeansMaxCluster instance (reused)
-
-    Returns:
-        speaker_id: Assigned speaker ID (0-indexed)
-    """
+    """DEPRECATED: Use run_online_diarization() instead."""
     import malaya_speech
 
-    # Extract embedding for this chunk
     model = get_speaker_model()
-    embedding = model([audio_chunk])[0]  # Single chunk
+    with torch.amp.autocast("cuda", enabled=torch.cuda.is_available()):
+        embedding = model([audio_chunk])[0]
 
-    # Assign speaker incrementally
     speaker_label = malaya_speech.diarization.streaming(embedding, diarization_cluster)
     try:
         speaker_id = int(speaker_label.replace("speaker ", ""))
@@ -125,32 +279,17 @@ def process_chunks_batch_incremental(
     diarization_cluster,
     batch_size: int = SPEAKER_EMBEDDING_BATCH_SIZE,
 ) -> List[int]:
-    """
-    Process chunks in batches but assign speakers incrementally.
-
-    This gives us GPU batching benefits while maintaining incremental clustering.
-    Embeddings are extracted in batches (GPU efficient), but speakers are assigned
-    one at a time to maintain incremental clustering state.
-
-    Args:
-        audio_chunks: List of audio numpy arrays (float32, 16kHz)
-        diarization_cluster: StreamingKMeansMaxCluster instance (reused)
-        batch_size: Number of chunks to process in one GPU call
-
-    Returns:
-        List of speaker IDs (0-indexed), one per chunk
-    """
+    """DEPRECATED: Use run_online_diarization() instead."""
     import malaya_speech
 
     model = get_speaker_model()
     speaker_ids = []
 
-    # Extract embeddings in batches (GPU efficient)
     for i in range(0, len(audio_chunks), batch_size):
-        batch = audio_chunks[i:i + batch_size]
-        batch_embeddings = model(batch)  # Batched GPU inference
+        batch = audio_chunks[i : i + batch_size]
+        with torch.amp.autocast("cuda", enabled=torch.cuda.is_available()):
+            batch_embeddings = model(batch)
 
-        # Assign speakers incrementally (one at a time)
         for embedding in batch_embeddings:
             speaker_label = malaya_speech.diarization.streaming(
                 embedding, diarization_cluster
@@ -162,224 +301,3 @@ def process_chunks_batch_incremental(
             speaker_ids.append(speaker_id)
 
     return speaker_ids
-
-
-def assign_skipped_chunks_to_nearest(
-    speaker_assignments: Dict[int, int],
-    total_chunks: int,
-) -> Dict[int, int]:
-    """
-    Assign skipped chunks (too short for embedding) to nearest valid chunk's speaker.
-    
-    Optimized O(n log m) implementation using sorted indices and binary search,
-    where n = number of skipped chunks and m = number of valid chunks.
-    This is more efficient than the naive O(n×m) approach.
-    
-    Args:
-        speaker_assignments: Dictionary mapping valid chunk indices to speaker IDs
-        total_chunks: Total number of chunks (including skipped ones)
-    
-    Returns:
-        Updated speaker_assignments dictionary with skipped chunks assigned to
-        nearest valid chunk's speaker
-    """
-    if not speaker_assignments:
-        # If no valid assignments, assign all to speaker 0
-        return {idx: 0 for idx in range(total_chunks)}
-    
-    # Get all indices and find skipped ones
-    all_indices = set(range(total_chunks))
-    valid_indices = set(speaker_assignments.keys())
-    skipped_indices = all_indices - valid_indices
-    
-    if not skipped_indices:
-        # No skipped chunks, return as-is
-        return speaker_assignments
-    
-    # Sort valid indices once for binary search: O(m log m)
-    sorted_valid_indices = sorted(valid_indices)
-    
-    # For each skipped chunk, find nearest valid chunk: O(n log m)
-    result = speaker_assignments.copy()
-    
-    for skipped_idx in skipped_indices:
-        # Use binary search to find insertion point
-        pos = bisect.bisect_left(sorted_valid_indices, skipped_idx)
-        
-        # Find nearest valid chunk (check both neighbors)
-        nearest_idx = None
-        min_distance = float('inf')
-        
-        # Check left neighbor (if exists)
-        if pos > 0:
-            left_idx = sorted_valid_indices[pos - 1]
-            distance = abs(skipped_idx - left_idx)
-            if distance < min_distance:
-                min_distance = distance
-                nearest_idx = left_idx
-        
-        # Check right neighbor (if exists)
-        if pos < len(sorted_valid_indices):
-            right_idx = sorted_valid_indices[pos]
-            distance = abs(skipped_idx - right_idx)
-            if distance < min_distance:
-                nearest_idx = right_idx
-        
-        # Assign speaker from nearest valid chunk
-        if nearest_idx is not None:
-            result[skipped_idx] = speaker_assignments[nearest_idx]
-        else:
-            # Fallback (shouldn't happen, but safety check)
-            result[skipped_idx] = 0
-    
-    return result
-
-
-def online_diarize(
-    chunks: List[Tuple[np.ndarray, float, float]],
-    speaker_similarity: float = 0.3,
-    speaker_max_n: int = 10,
-) -> Dict[int, int]:
-    """
-    Perform online speaker diarization on VAD Chunks.
-
-    .. deprecated:: 
-        This function processes all chunks in batch after transcription completes.
-        For new code, use incremental processing via `process_chunks_batch_incremental()`
-        which processes chunks as they are transcribed for better performance.
-        This function is kept for backward compatibility and test compatibility.
-
-    Uses StreamkingKMeansMaxCluster for incremental speaker assignment.
-
-    Reference: backup-mesolitica-api/app/main.py lines 849-852, 554-557
-
-    Args:
-        chunks: List of (audio_data, start_ts, end_ts) from VAD
-        speaker_similarity: Cosine similarity threshold for same speaker (0.0-1.0)
-                           Higher = stricter, fewer speakers
-                           Lower = looser, more speakers
-                           Default: 0.3
-        speaker_max_n: Maximum number of speakers to detect
-        
-    Returns:
-        Dictionary mapping chunk_index -> speaker_id (0-indexed)
-    """
-    if not chunks:
-        return {}
-
-    from malaya_speech.model.clustering import StreamingKMeansMaxCluster
-    import malaya_speech
-
-    # 1. Filter out chunks that are too short for embedding extraction
-    # TitaNet requires minimum audio length for mel spectrogram computation
-    valid_indices = []
-    valid_audio = []
-    skipped_count = 0
-    
-    for idx, chunk in enumerate(chunks):
-        audio = chunk[0]
-        if len(audio) >= MIN_CHUNK_SAMPLES:
-            valid_indices.append(idx)
-            valid_audio.append(audio)
-        else:
-            skipped_count += 1
-            logger.debug(f"Chunk {idx} too short for embedding ({len(audio)} samples < {MIN_CHUNK_SAMPLES})")
-    
-    if skipped_count > 0:
-        logger.info(f"Skipped {skipped_count} chunks too short for speaker embedding (min={MIN_CHUNK_SAMPLES} samples)")
-    
-    if not valid_audio:
-        logger.warning("No chunks long enough for speaker embedding extraction")
-        # Return all chunks assigned to speaker 0
-        return {idx: 0 for idx in range(len(chunks))}
-
-    # 2. batch extract embeddings for valid chunks only
-    logger.info(f"Extracting speaker embeddings for {len(valid_audio)} chunks...")
-    embeddings = extract_embeddings_batched(valid_audio)
-
-    # 3. streaming clustering
-    logger.info(f"Running StreamingKMeans (similarity={speaker_similarity}, max_n={speaker_max_n})...")
-    clustering = StreamingKMeansMaxCluster(
-        threshold=speaker_similarity,
-        max_clusters=speaker_max_n
-    )
-
-    # Map valid indices back to original chunk indices
-    valid_speaker_assignments = {}
-    seen_speakers = set()
-    cluster_creation_log = []
-    
-    for i, embedding in enumerate(embeddings):
-        # malaya_speech.diarization.streaming() assigns speaker ID
-        # it returns strings like "speaker 0", "speaker 1", etc.
-        speaker_label = malaya_speech.diarization.streaming(embedding, clustering)
-        # Convert "speaker 0" -> 0, "speaker 1" -> 1, etc.
-        try:
-            speaker_id = int(speaker_label.replace("speaker ", ""))
-        except (ValueError, AttributeError):
-            speaker_id = 0
-        
-        # Track cluster creation vs assignment
-        is_new_cluster = speaker_id not in seen_speakers
-        if is_new_cluster:
-            seen_speakers.add(speaker_id)
-            cluster_creation_log.append((i, speaker_id))
-            logger.debug(f"Chunk {i}: Created new cluster (speaker {speaker_id})")
-        else:
-            logger.debug(f"Chunk {i}: Assigned to existing cluster (speaker {speaker_id})")
-        
-        original_idx = valid_indices[i]
-        valid_speaker_assignments[original_idx] = speaker_id
-    
-    # Log cluster creation summary
-    logger.info(f"Clustering complete: {len(seen_speakers)} clusters created from {len(embeddings)} embeddings")
-    if cluster_creation_log:
-        logger.debug(f"Cluster creation sequence: {cluster_creation_log[:10]}{'...' if len(cluster_creation_log) > 10 else ''}")
-
-    # For skipped chunks, assign based on nearest valid chunk's speaker
-    # Use optimized shared function
-    speaker_assignments = assign_skipped_chunks_to_nearest(
-        valid_speaker_assignments, len(chunks)
-    )
-
-    speaker_counts = {}
-    for speaker_id in speaker_assignments.values():
-        speaker_counts[speaker_id] = speaker_counts.get(speaker_id, 0) + 1
-    
-    # Log final speaker distribution
-    logger.info(f"Speaker distribution: {speaker_counts}")
-    
-    # Validation: Check for diverse speaker assignments
-    unique_speakers = len(speaker_counts)
-    total_chunks = len(speaker_assignments)
-    
-    if unique_speakers == 1:
-        logger.warning(
-            f"All {total_chunks} chunks assigned to single speaker (speaker {list(speaker_counts.keys())[0]}). "
-            f"This may indicate: (1) threshold too high (current={speaker_similarity}), "
-            f"(2) audio contains only one speaker, or (3) embeddings not discriminative enough. "
-            f"Consider lowering speaker_similarity threshold (e.g., 0.3-0.4) or checking audio quality."
-        )
-    elif unique_speakers == 0:
-        logger.error("No speaker assignments made - this should not happen!")
-    else:
-        # Log distribution statistics
-        max_count = max(speaker_counts.values())
-        min_count = min(speaker_counts.values())
-        max_speaker = max(speaker_counts.items(), key=lambda x: x[1])[0]
-        min_speaker = min(speaker_counts.items(), key=lambda x: x[1])[0]
-        
-        logger.info(
-            f"Speaker diversity: {unique_speakers} speakers detected. "
-            f"Largest cluster: speaker {max_speaker} ({max_count} chunks, {max_count/total_chunks*100:.1f}%), "
-            f"Smallest cluster: speaker {min_speaker} ({min_count} chunks, {min_count/total_chunks*100:.1f}%)"
-        )
-        
-        # Warn if distribution is very imbalanced (>90% in one cluster)
-        if max_count / total_chunks > 0.9:
-            logger.warning(
-                f"Highly imbalanced speaker distribution: {max_count/total_chunks*100:.1f}% assigned to speaker {max_speaker}. "
-                f"Consider adjusting speaker_similarity threshold (current={speaker_similarity})."
-            )
-
-    return speaker_assignments

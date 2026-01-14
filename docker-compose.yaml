@@ -25,12 +25,13 @@ services:
       - ENABLE_ONLINE_DIARIZATION=true
       - SPEAKER_EMBEDDING_BATCH_SIZE=16
       - SPEAKER_PRECISION_MODE=FP16
+      # - CUDA_VISIBLE_DEVICES=2
     deploy:
       resources:
         reservations:
           devices:
             - driver: nvidia
-              count: 1
+              device_ids: ['2']
               capabilities: [gpu]
     restart: unless-stopped
     working_dir: /app
