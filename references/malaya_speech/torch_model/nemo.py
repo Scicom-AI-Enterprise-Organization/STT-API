@@ -54,8 +54,12 @@ class SpeakerVector(torch.nn.Module):
         ]
         cuda = next(self.parameters()).is_cuda
         inputs, lengths = sequence_1d(inputs, return_len=True)
-        inputs = to_tensor_cuda(torch.Tensor(inputs.astype(np.float32)), cuda)
-        lengths = to_tensor_cuda(torch.Tensor(lengths), cuda)
+        inputs = to_tensor_cuda(torch.Tensor(inputs.astype(np.float32)), cuda).to(
+            dtype=torch.float16 if cuda else torch.float32
+        )
+        lengths = to_tensor_cuda(torch.Tensor(lengths), cuda).to(
+            dtype=torch.float16 if cuda else torch.float32
+        )
         o_processor = self.preprocessor(inputs, lengths)
         o_encoder = self.encoder(*o_processor)
         return self.decoder(*o_encoder)
@@ -136,8 +140,12 @@ class Classification(torch.nn.Module):
         ]
         cuda = next(self.parameters()).is_cuda
         inputs, lengths = sequence_1d(inputs, return_len=True)
-        inputs = to_tensor_cuda(torch.Tensor(inputs.astype(np.float32)), cuda)
-        lengths = to_tensor_cuda(torch.Tensor(lengths), cuda)
+        inputs = to_tensor_cuda(torch.Tensor(inputs.astype(np.float32)), cuda).to(
+            dtype=torch.float16 if cuda else torch.float32
+        )
+        lengths = to_tensor_cuda(torch.Tensor(lengths), cuda).to(
+            dtype=torch.float16 if cuda else torch.float32
+        )
         o_processor = self.preprocessor(inputs, lengths)
         o_encoder = self.encoder(*o_processor)
         try:
