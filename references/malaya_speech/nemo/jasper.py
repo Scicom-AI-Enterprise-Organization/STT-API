@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 import math
 from typing import Callable, Iterable, List, Optional, Tuple
 
@@ -33,7 +34,7 @@ jasper_activations = {
 }
 
 
-def tds_uniform_(tensor, mode='fan_in'):
+def tds_uniform_(tensor, mode="fan_in"):
     """
     Uniform Initialization from the paper [Sequence-to-Sequence Speech Recognition with Time-Depth Separable Convolutions](https://www.isca-speech.org/archive/Interspeech_2019/pdfs/2460.pdf)
     Normalized to -
@@ -56,7 +57,7 @@ def tds_uniform_(tensor, mode='fan_in'):
         return tensor.uniform_(-bound, bound)
 
 
-def tds_normal_(tensor, mode='fan_in'):
+def tds_normal_(tensor, mode="fan_in"):
     """
     Normal Initialization from the paper [Sequence-to-Sequence Speech Recognition with Time-Depth Separable Convolutions](https://www.isca-speech.org/archive/Interspeech_2019/pdfs/2460.pdf)
     Normalized to -
@@ -79,22 +80,22 @@ def tds_normal_(tensor, mode='fan_in'):
         return tensor.normal_(0.0, bound)
 
 
-def init_weights(m, mode: Optional[str] = 'xavier_uniform'):
+def init_weights(m, mode: Optional[str] = "xavier_uniform"):
     if isinstance(m, MaskedConv1d):
         init_weights(m.conv, mode)
     if isinstance(m, (nn.Conv1d, nn.Linear)):
         if mode is not None:
-            if mode == 'xavier_uniform':
+            if mode == "xavier_uniform":
                 nn.init.xavier_uniform_(m.weight, gain=1.0)
-            elif mode == 'xavier_normal':
+            elif mode == "xavier_normal":
                 nn.init.xavier_normal_(m.weight, gain=1.0)
-            elif mode == 'kaiming_uniform':
+            elif mode == "kaiming_uniform":
                 nn.init.kaiming_uniform_(m.weight, nonlinearity="relu")
-            elif mode == 'kaiming_normal':
+            elif mode == "kaiming_normal":
                 nn.init.kaiming_normal_(m.weight, nonlinearity="relu")
-            elif mode == 'tds_uniform':
+            elif mode == "tds_uniform":
                 tds_uniform_(m.weight)
-            elif mode == 'tds_normal':
+            elif mode == "tds_normal":
                 tds_normal_(m.weight)
             else:
                 raise ValueError("Unknown Initialization mode: {0}".format(mode))
@@ -159,7 +160,9 @@ def get_asymtric_padding(kernel_size, stride, dilation, future_context):
 
 
 @torch.jit.script
-def _se_pool_step_script_infer(x: torch.Tensor, context_window: int, mask: torch.Tensor):
+def _se_pool_step_script_infer(
+    x: torch.Tensor, context_window: int, mask: torch.Tensor
+):
     """
     Calculates the masked average over padded limited context segment during inference mode.
 
@@ -173,7 +176,9 @@ def _se_pool_step_script_infer(x: torch.Tensor, context_window: int, mask: torch
     """
     timesteps = x.shape[-1]
     if timesteps < context_window:
-        y = torch.sum(x, dim=-1, keepdim=True) / mask.sum(dim=-1, keepdim=True).to(x.dtype)
+        y = torch.sum(x, dim=-1, keepdim=True) / mask.sum(dim=-1, keepdim=True).to(
+            x.dtype
+        )
     else:
         # << During inference prefer to use entire context >>
         # x = x[:, :, :context_window]  # [B, C, context_window]
@@ -182,13 +187,17 @@ def _se_pool_step_script_infer(x: torch.Tensor, context_window: int, mask: torch
         # mask = mask.sum(dim=-1, keepdim=True).to(x.dtype)  # [B, C, 1]
         # y = x.sum(dim=-1, keepdim=True)  # [B, 1, 1]
         # y = y / (mask + 1e-8)  # [B, C, 1]
-        y = torch.sum(x, dim=-1, keepdim=True) / mask.sum(dim=-1, keepdim=True).to(x.dtype)
+        y = torch.sum(x, dim=-1, keepdim=True) / mask.sum(dim=-1, keepdim=True).to(
+            x.dtype
+        )
 
     return y
 
 
 @torch.jit.script
-def _se_pool_step_script_train(x: torch.Tensor, context_window: int, mask: torch.Tensor):
+def _se_pool_step_script_train(
+    x: torch.Tensor, context_window: int, mask: torch.Tensor
+):
     """
     Calculates the masked average over padded limited context segment during training mode.
     Randomly slices a segment of length `context_window` from signal+padded input tensor across all channels and
@@ -204,11 +213,17 @@ def _se_pool_step_script_train(x: torch.Tensor, context_window: int, mask: torch
     """
     timesteps = x.shape[-1]
     if timesteps < context_window:
-        y = torch.sum(x, dim=-1, keepdim=True) / mask.sum(dim=-1, keepdim=True).to(x.dtype)
+        y = torch.sum(x, dim=-1, keepdim=True) / mask.sum(dim=-1, keepdim=True).to(
+            x.dtype
+        )
     else:
-        start_idx = torch.randint(0, timesteps - context_window, size=[1], dtype=torch.int32)[0]
-        x = x[:, :, start_idx: (start_idx + context_window)]  # [B, C, context_window]
-        mask = mask[:, :, start_idx: (start_idx + context_window)]  # [B, 1, context_window]
+        start_idx = torch.randint(
+            0, timesteps - context_window, size=[1], dtype=torch.int32
+        )[0]
+        x = x[:, :, start_idx : (start_idx + context_window)]  # [B, C, context_window]
+        mask = mask[
+            :, :, start_idx : (start_idx + context_window)
+        ]  # [B, 1, context_window]
 
         mask = mask.sum(dim=-1, keepdim=True).to(x.dtype)  # [B, C, 1]
         y = x.sum(dim=-1, keepdim=True)  # [B, 1, 1]
@@ -218,7 +233,9 @@ def _se_pool_step_script_train(x: torch.Tensor, context_window: int, mask: torch
 
 
 @torch.jit.script
-def _masked_conv_init_lens(lens: torch.Tensor, current_maxlen: int, original_maxlen: torch.Tensor):
+def _masked_conv_init_lens(
+    lens: torch.Tensor, current_maxlen: int, original_maxlen: torch.Tensor
+):
     if current_maxlen > original_maxlen:
         new_lens = torch.arange(current_maxlen)
         new_max_lens = torch.tensor(current_maxlen)
@@ -281,13 +298,15 @@ class MaskedConv1d(nn.Module):
 
         # Calculations for "same" padding cache
         self.same_padding = (self.conv.stride[0] == 1) and (
-            2 * self.conv.padding[0] == self.conv.dilation[0] * (self.conv.kernel_size[0] - 1)
+            2 * self.conv.padding[0]
+            == self.conv.dilation[0] * (self.conv.kernel_size[0] - 1)
         )
         if self.pad_layer is None:
             self.same_padding_asymmetric = False
         else:
             self.same_padding_asymmetric = (self.conv.stride[0] == 1) and (
-                sum(self._padding) == self.conv.dilation[0] * (self.conv.kernel_size[0] - 1)
+                sum(self._padding)
+                == self.conv.dilation[0] * (self.conv.kernel_size[0] - 1)
             )
 
         # `self.lens` caches consecutive integers from 0 to `self.max_len` that are used to compute the mask for a
@@ -303,18 +322,24 @@ class MaskedConv1d(nn.Module):
         if self.pad_layer is None:
             return (
                 torch.div(
-                    lens + 2 * self.conv.padding[0] - self.conv.dilation[0] * (self.conv.kernel_size[0] - 1) - 1,
+                    lens
+                    + 2 * self.conv.padding[0]
+                    - self.conv.dilation[0] * (self.conv.kernel_size[0] - 1)
+                    - 1,
                     self.conv.stride[0],
-                    rounding_mode='trunc',
+                    rounding_mode="trunc",
                 )
                 + 1
             )
         else:
             return (
                 torch.div(
-                    lens + sum(self._padding) - self.conv.dilation[0] * (self.conv.kernel_size[0] - 1) - 1,
+                    lens
+                    + sum(self._padding)
+                    - self.conv.dilation[0] * (self.conv.kernel_size[0] - 1)
+                    - 1,
                     self.conv.stride[0],
-                    rounding_mode='trunc',
+                    rounding_mode="trunc",
                 )
                 + 1
             )
@@ -346,7 +371,9 @@ class MaskedConv1d(nn.Module):
 
     def update_masked_length(self, max_len, seq_range=None, device=None):
         if seq_range is None:
-            self.lens, self.max_len = _masked_conv_init_lens(self.lens, max_len, self.max_len)
+            self.lens, self.max_len = _masked_conv_init_lens(
+                self.lens, max_len, self.max_len
+            )
             self.lens = self.lens.to(device)
         else:
             self.lens = seq_range
@@ -384,7 +411,7 @@ class SqueezeExcite(nn.Module):
         channels: int,
         reduction_ratio: int,
         context_window: int = -1,
-        interpolation_mode: str = 'nearest',
+        interpolation_mode: str = "nearest",
         activation: Optional[Callable] = None,
     ):
         """
@@ -436,7 +463,9 @@ class SqueezeExcite(nn.Module):
         # Computes in float32 to avoid instabilities during training with AMP.
         with torch.cuda.amp.autocast(enabled=False):
             # Create sample mask - 1 represents value, 0 represents pad
-            mask = self.make_pad_mask(lengths, max_audio_length=max_len, device=x.device)
+            mask = self.make_pad_mask(
+                lengths, max_audio_length=max_len, device=x.device
+            )
             mask = ~mask  # 0 represents value, 1 represents pad
             x = x.float()  # For stable AMP, SE must be computed at fp32.
             x.masked_fill_(mask, 0.0)  # mask padded values explicitly to 0
@@ -451,7 +480,7 @@ class SqueezeExcite(nn.Module):
 
             y = torch.sigmoid(y)
             y = x * y
-        return y, lengths
+        return y.to(dtype), lengths
 
     def _se_pool_step(self, x, mask):
         # Negate mask back to represent 1 for signal and 0 for padded timestep.
@@ -459,7 +488,9 @@ class SqueezeExcite(nn.Module):
 
         if self.context_window < 0:
             # [B, C, 1] - Masked Average over value + padding.
-            y = torch.sum(x, dim=-1, keepdim=True) / mask.sum(dim=-1, keepdim=True).type(x.dtype)
+            y = torch.sum(x, dim=-1, keepdim=True) / mask.sum(
+                dim=-1, keepdim=True
+            ).type(x.dtype)
         else:
             # [B, C, 1] - Masked Average over value + padding with limited context.
             # During training randomly subsegments a context_window chunk of timesteps.
@@ -471,17 +502,17 @@ class SqueezeExcite(nn.Module):
         return y
 
     def set_max_len(self, max_len, seq_range=None):
-        """ Sets maximum input length.
-            Pre-calculates internal seq_range mask.
+        """Sets maximum input length.
+        Pre-calculates internal seq_range mask.
         """
         self.max_len = max_len
         if seq_range is None:
             device = next(self.parameters()).device
             seq_range = torch.arange(0, self.max_len, device=device)
-        if hasattr(self, 'seq_range'):
+        if hasattr(self, "seq_range"):
             self.seq_range = seq_range
         else:
-            self.register_buffer('seq_range', seq_range, persistent=False)
+            self.register_buffer("seq_range", seq_range, persistent=False)
 
     def make_pad_mask(self, seq_lens, max_audio_length, device=None):
         """Make masking for padding."""
@@ -490,7 +521,9 @@ class SqueezeExcite(nn.Module):
         if self.seq_range.device != seq_lens.device:
             seq_lens = seq_lens.to(self.seq_range.device)
 
-        mask = self.seq_range[:max_audio_length].expand(seq_lens.size(0), -1) < seq_lens.unsqueeze(-1)  # [B, T]; bool
+        mask = self.seq_range[:max_audio_length].expand(
+            seq_lens.size(0), -1
+        ) < seq_lens.unsqueeze(-1)  # [B, T]; bool
         mask = mask.unsqueeze(1)  # [B, 1, T]
 
         return mask
@@ -513,8 +546,10 @@ class SqueezeExcite(nn.Module):
                 Say the window_stride = 0.01s, then a context window of 128 represents 128 * 0.01 s
                 of context to compute the Squeeze step.
         """
-        if hasattr(self, 'context_window'):
-            logging.info(f"Changing Squeeze-Excitation context window from {self.context_window} to {context_window}")
+        if hasattr(self, "context_window"):
+            logging.info(
+                f"Changing Squeeze-Excitation context window from {self.context_window} to {context_window}"
+            )
 
         self.context_window = context_window
 
@@ -642,7 +677,7 @@ class JasperBlock(nn.Module):
         kernel_size_factor=1,
         stride=1,
         dilation=1,
-        padding='same',
+        padding="same",
         dropout=0.2,
         activation=None,
         residual=True,
@@ -651,13 +686,13 @@ class JasperBlock(nn.Module):
         heads=-1,
         normalization="batch",
         norm_groups=1,
-        residual_mode='add',
+        residual_mode="add",
         residual_panes=[],
         conv_mask=False,
         se=False,
         se_reduction_ratio=16,
         se_context_window=-1,
-        se_interpolation_mode='nearest',
+        se_interpolation_mode="nearest",
         stride_last=False,
         future_context: int = -1,
     ):
@@ -668,14 +703,18 @@ class JasperBlock(nn.Module):
 
         kernel_size_factor = float(kernel_size_factor)
         if isinstance(kernel_size, Iterable):
-            kernel_size = [compute_new_kernel_size(k, kernel_size_factor) for k in kernel_size]
+            kernel_size = [
+                compute_new_kernel_size(k, kernel_size_factor) for k in kernel_size
+            ]
         else:
             kernel_size = [compute_new_kernel_size(kernel_size, kernel_size_factor)]
 
         if future_context < 0:
             padding_val = get_same_padding(kernel_size[0], stride[0], dilation[0])
         else:
-            padding_val = get_asymtric_padding(kernel_size[0], stride[0], dilation[0], future_context)
+            padding_val = get_asymtric_padding(
+                kernel_size[0], stride[0], dilation[0], future_context
+            )
 
         self.inplanes = inplanes
         self.planes = planes
@@ -710,7 +749,9 @@ class JasperBlock(nn.Module):
                 )
             )
 
-            conv.extend(self._get_act_dropout_layer(drop_prob=dropout, activation=activation))
+            conv.extend(
+                self._get_act_dropout_layer(drop_prob=dropout, activation=activation)
+            )
 
             inplanes_loop = planes
 
@@ -749,7 +790,7 @@ class JasperBlock(nn.Module):
         if residual:
             res_list = nn.ModuleList()
 
-            if residual_mode == 'stride_add':
+            if residual_mode == "stride_add":
                 stride_val = stride
             else:
                 stride_val = [1]
@@ -775,7 +816,9 @@ class JasperBlock(nn.Module):
         else:
             self.res = None
 
-        self.mout = nn.Sequential(*self._get_act_dropout_layer(drop_prob=dropout, activation=activation))
+        self.mout = nn.Sequential(
+            *self._get_act_dropout_layer(drop_prob=dropout, activation=activation)
+        )
 
     def _get_conv(
         self,
@@ -873,16 +916,21 @@ class JasperBlock(nn.Module):
             ]
 
         if normalization == "group":
-            layers.append(nn.GroupNorm(num_groups=norm_groups, num_channels=out_channels))
+            layers.append(
+                nn.GroupNorm(num_groups=norm_groups, num_channels=out_channels)
+            )
         elif normalization == "instance":
-            layers.append(nn.GroupNorm(num_groups=out_channels, num_channels=out_channels))
+            layers.append(
+                nn.GroupNorm(num_groups=out_channels, num_channels=out_channels)
+            )
         elif normalization == "layer":
             layers.append(nn.GroupNorm(num_groups=1, num_channels=out_channels))
         elif normalization == "batch":
             layers.append(nn.BatchNorm1d(out_channels, eps=1e-3, momentum=0.1))
         else:
             raise ValueError(
-                f"Normalization method ({normalization}) does not match" f" one of [batch, layer, group, instance]."
+                f"Normalization method ({normalization}) does not match"
+                f" one of [batch, layer, group, instance]."
             )
 
         if groups > 1:
@@ -895,7 +943,9 @@ class JasperBlock(nn.Module):
         layers = [activation, nn.Dropout(p=drop_prob)]
         return layers
 
-    def forward(self, input_: Tuple[List[Tensor], Optional[Tensor]]) -> Tuple[List[Tensor], Optional[Tensor]]:
+    def forward(
+        self, input_: Tuple[List[Tensor], Optional[Tensor]]
+    ) -> Tuple[List[Tensor], Optional[Tensor]]:
         """
         Forward pass of the module.
 
@@ -936,7 +986,7 @@ class JasperBlock(nn.Module):
                     else:
                         res_out = res_layer(res_out)
 
-                if self.residual_mode == 'add' or self.residual_mode == 'stride_add':
+                if self.residual_mode == "add" or self.residual_mode == "stride_add":
                     out = out + res_out
                 else:
                     out = torch.max(out, res_out)
@@ -1005,8 +1055,12 @@ class ParallelBlock(nn.Module):
 
         if residual_mode == "conv":
             if in_filters is None or out_filters is None:
-                raise ValueError("in_filters and out_filters have to be specified when using 'conv' residual mode.")
-            self.res_conv = MaskedConv1d(in_filters, out_filters, kernel_size=1, bias=False, use_mask=True)
+                raise ValueError(
+                    "in_filters and out_filters have to be specified when using 'conv' residual mode."
+                )
+            self.res_conv = MaskedConv1d(
+                in_filters, out_filters, kernel_size=1, bias=False, use_mask=True
+            )
 
     def get_dropout_mask(self):
         weights = self.dropout(self.weights)
