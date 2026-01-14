@@ -14,17 +14,6 @@ services:
       - stt-venv:/app/.venv
     environment:
       - PYTHONUNBUFFERED=1
-      - OMP_NUM_THREADS=2
-      - OPENBLAS_NUM_THREADS=2
-      - MKL_NUM_THREADS=2
-      - VAD_WORKERS=4
-      - MAX_CONCURRENT_REQUESTS=50
-      - MAX_CONCURRENT_UPSTREAM=100
-      - STT_API_URL=http://stt-engine:9090
-      - OSD_API_URL=http://osd-osd-1:8000
-      - ENABLE_ONLINE_DIARIZATION=true
-      - SPEAKER_EMBEDDING_BATCH_SIZE=64
-      # - CUDA_VISIBLE_DEVICES=2
     deploy:
       resources:
         reservations:

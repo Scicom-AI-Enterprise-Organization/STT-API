@@ -106,7 +106,7 @@ def extract_embeddings_batched(
         with cuda.stream(compute_stream):
             compute_stream.wait_stream(h2d_stream)
             with torch.no_grad():
-                with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
+                with torch.amp.autocast('cuda', enabled=torch.cuda.is_available()):
                     batch_emb = model.compute_batch(inputs_gpu, lengths_gpu)
 
         # Store for later collection
