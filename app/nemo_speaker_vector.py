@@ -55,14 +55,14 @@ class SpeakerVector(torch.nn.Module):
 
         self._is_half = False
 
-    # def half(self):
-    #     """
-    #     Override half() to only convert encoder and decoder, not preprocessor
-    #     """
-    #     self.encoder = self.encoder.half()
-    #     self.decoder = self.decoder.half()
-    #     self._is_half = True
-    #     return self
+    def half(self):
+        """
+        Override half() to only convert encoder and decoder, not preprocessor
+        """
+        self.encoder = self.encoder.half()
+        self.decoder = self.decoder.half()
+        self._is_half = True
+        return self
 
     def forward(self, inputs):
         """
@@ -146,6 +146,6 @@ def nemo_speaker_vector(model, **kwargs):
     if torch.cuda.is_available():
         speaker_model = speaker_model.cuda()
         # this is the part that convert weights to fp16
-        # speaker_model = speaker_model.half()
+        speaker_model = speaker_model.half()
 
     return speaker_model
