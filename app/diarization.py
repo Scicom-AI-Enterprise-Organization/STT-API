@@ -223,7 +223,7 @@ def run_online_diarization(
     # Log summary
     speaker_counts = {}
     for speaker_id in result.values():
-        speaker_counts[speaker_id] = speaker_counts.get(speaker_id, 0) + 1
+        speaker_counts[int(speaker_id)] = speaker_counts.get(int(speaker_id), 0) + 1
 
     logger.info(
         f"⏱️ Online diarization complete in {time.time() - t_start:.2f}s | "
