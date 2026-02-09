@@ -15,6 +15,7 @@ import aiohttp
 from aiohttp import FormData
 import urllib.parse
 from fastapi import FastAPI, File, Form, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 import librosa
 import soundfile as sf
 from concurrent.futures import ProcessPoolExecutor
@@ -217,6 +218,14 @@ def process_audio_segment(args: Tuple) -> List[Tuple]:
 
 
 app = FastAPI(title="STT API", description="Long audio transcription API with VAD")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 async def transcribe_chunk(
