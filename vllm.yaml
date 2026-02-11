@@ -1,6 +1,8 @@
 version: '3.8'
 services:
   stt-engine:
+    env_file:
+      - .env_vllm
     build:
       context: .
       dockerfile: Dockerfile_vllm
@@ -20,9 +22,11 @@ services:
       - stt-network
     command:
       - --model
-      - openai/whisper-large-v3-turbo
+      - ${STT_MODEL:-openai/whisper-large-v3-turbo}
       - --port
       - "9089"
+      - --gpu-memory-utilization 
+      - ${GPU_MEM_UTIL:-0.9}
 
 networks:
   stt-network:
