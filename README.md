@@ -128,12 +128,18 @@ Long-form speech-to-text API that:
 docker network create stt-network
 ```
 
-### 2. Configure Environment (Optional)
+### 2. Run vLLM,
+
+```bash
+docker compose -f vllm.yaml up --detach
+```
+
+### 3. Configure Environment (Optional)
 
 Create a `.env` file:
 
 ```bash
-STT_API_URL=https://stt-engine-rtx.aies.scicom.dev
+STT_API_URL=http://stt-engine:9089
 SAMPLE_RATE=16000
 MAX_CHUNK_LENGTH=25
 MINIMUM_SILENT_MS=200
@@ -143,7 +149,7 @@ MAX_CONCURRENT_REQUESTS=20
 VAD_WORKERS=8
 ```
 
-### 3. Build and Run
+### 4. Build and Run
 
 ```bash
 # Start the service
