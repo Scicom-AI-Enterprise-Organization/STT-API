@@ -1,0 +1,29 @@
+version: '3.8'
+services:
+  stt-engine:
+    build:
+      context: .
+      dockerfile: Dockerfile_vllm
+    container_name: stt-engine
+    ports:
+      - "9089:9089"
+    ipc: host
+    shm_size: 10.24gb
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0"]
+              capabilities: [gpu]
+    networks:
+      - stt-network
+    command:
+      - --model
+      - openai/whisper-large-v3-turbo
+      - --port
+      - "9089"
+
+networks:
+  stt-network:
+    external: true
