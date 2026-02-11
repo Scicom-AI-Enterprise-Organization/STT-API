@@ -6,7 +6,7 @@ Long-form speech-to-text API that:
 - **Keeps global timestamps** across all chunks
 - **Transcribes chunks concurrently** for improved performance
 - **Proxies to an upstream STT engine** via an OpenAI-compatible `/v1/audio/transcriptions` endpoint
-- **Speaker diarization** with online (TitaNet + StreamingKMeans) or offline (pyannote) modes
+- **Speaker diarization** with online (TitaNet + StreamingKMeans + CUDA Streams) or offline (pyannote) modes
 
 ---
 
@@ -131,6 +131,19 @@ docker network create stt-network
 ### 2. Run vLLM,
 
 ```bash
+docker compose -f vllm.yaml up --detach
+```
+
+Or if you have private model,
+
+Make sure you create [.env_vllm](.env_vllm),
+
+```
+HUGGING_FACE_HUB_TOKEN=
+```
+
+```bash
+STT_MODEL=openai/whisper-medium GPU_MEM_UTIL=0.7 \
 docker compose -f vllm.yaml up --detach
 ```
 
