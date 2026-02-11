@@ -1,0 +1,35 @@
+services:
+  stress-test:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: stt-stress-test
+    volumes:
+      - "./stress_test.py:/app/stress_test.py"
+      - "./test_audio:/app/test_audio"
+      - stt-venv:/app/.venv
+    environment:
+      - PYTHONUNBUFFERED=1
+      - STT_API_URL=http://stt-api:9090
+      - AUDIO_FILE=/app/test_audio/masak.mp3
+      - CONCURRENCY=50
+      - WARMUP_COUNT=3
+      # Diarization config (none, online, offline)
+      - DIARIZATION_MODE=none
+      - SPEAKER_SIMILARITY=0.75
+      - SPEAKER_MAX_N=10
+    working_dir: /app
+    command: uv run python stress_test.py
+    depends_on:
+      - stt-api
+    networks:
+      - stt-network
+    profiles:
+      - test
+
+networks:
+  stt-network:
+    external: true
+
+volumes:
+  stt-venv:
