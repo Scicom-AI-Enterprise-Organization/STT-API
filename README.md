@@ -166,16 +166,10 @@ VAD_WORKERS=8
 
 ```bash
 # Start the service
-docker-compose up --build
+docker compose up --build
 
 # Or run in detached mode
-docker-compose up -d
-
-# View logs
-docker-compose logs -f stt-api
-
-# Stop the service
-docker-compose down
+docker compose up -d
 ```
 
 The API will be available at `http://localhost:9090`.
