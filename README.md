@@ -6,6 +6,7 @@ Long-form speech-to-text API that:
 - **Keeps global timestamps** across all chunks
 - **Transcribes chunks concurrently** for improved performance
 - **Proxies to an upstream STT engine** via an OpenAI-compatible `/v1/audio/transcriptions` endpoint
+- **Speaker diarization** with online (TitaNet + StreamingKMeans) or offline (pyannote) modes
 
 ---
 
@@ -58,14 +59,17 @@ Long-form speech-to-text API that:
 │   │  ...                                                             │   │
 │   └─────────────────────────────────────────────────────────────────┘   │
 │                              │                                           │
-│                              ▼                                           │
-│   ┌─────────────────────────────────────────────────────────────────┐   │
-│   │              Upstream STT API Calls                              │   │
-│   │         (upstream_semaphore: max 100 concurrent)                 │   │
-│   │                                                                  │   │
-│   │    transcribe_chunk() ──► POST to STT_API_URL                   │   │
-│   │    (with timestamp adjustment)                                   │   │
-│   └─────────────────────────────────────────────────────────────────┘   │
+│                    ┌─────────┴─────────┐                                 │
+│                    ▼                   ▼                                 │
+│   ┌──────────────────────────┐  ┌─────────────────────────────────────┐ │
+│   │  Upstream STT API Calls  │  │  Online Diarization (if enabled)    │ │
+│   │  (upstream_semaphore:    │  │  (incremental, during transcription)│ │
+│   │   max 100 concurrent)    │  │                                     │ │
+│   │                          │  │  • Extract embeddings (batched)     │ │
+│   │  transcribe_chunk() ──►  │  │  • Assign speakers incrementally   │ │
+│   │  POST to STT_API_URL     │  │  • Reuse StreamingKMeansMaxCluster  │ │
+│   │  (with timestamp adj.)   │  │                                     │ │
+│   └──────────────────────────┘  └─────────────────────────────────────┘ │
 └─────────────────────────────────────────────────────────────────────────┘
                                     │
                                     ▼
@@ -83,7 +87,11 @@ Long-form speech-to-text API that:
 1. **Ingest**: Client uploads audio to `POST /audio/transcriptions`
 2. **VAD + Chunking**: Audio is processed through Silero VAD in parallel workers, split into chunks based on silence detection and max chunk length (25s)
 3. **Concurrent Transcription**: Chunks are sent concurrently to upstream STT API with timestamp adjustment
-4. **Merge & Respond**: All transcriptions are merged with global timestamps and returned
+4. **Online Diarization** (if enabled): Processes chunks incrementally during transcription:
+   - Extracts speaker embeddings in small batches (default: 4 chunks)
+   - Assigns speakers incrementally using StreamingKMeansMaxCluster
+   - Maintains GPU batching efficiency while enabling true incremental processing
+5. **Merge & Respond**: All transcriptions are merged with global timestamps and speaker assignments (if diarization enabled), then returned
 
 ### Concurrency Model
 
@@ -186,6 +194,9 @@ curl -X POST "http://localhost:9090/audio/transcriptions" \
 | `minimum_silent_ms` | int | 200 | Minimum silence duration for VAD trigger (ms) |
 | `minimum_trigger_vad_ms` | int | 1500 | Minimum audio length to trigger VAD (ms) |
 | `reject_segment_vad_ratio` | float | 0.9 | Reject segments with this ratio of silence (0.0-1.0) |
+| `diarization` | string | none | Diarization mode: `none`, `online`, or `offline` |
+| `speaker_similarity` | float | 0.3 | Online mode: speaker clustering threshold (0.0-1.0) |
+| `speaker_max_n` | int | 10 | Online mode: maximum number of speakers |
 
 ### Response Formats
 
@@ -219,32 +230,168 @@ curl -X POST "http://localhost:9090/audio/transcriptions" \
 }
 ```
 
+**`verbose_json` with diarization**:
+```json
+{
+  "language": "en",
+  "duration": 144.94,
+  "text": "Hello there. Hi, how are you?",
+  "segments": [
+    {
+      "id": 0,
+      "start": 0.0,
+      "end": 3.68,
+      "text": "Hello there.",
+      "speaker": 0
+    },
+    {
+      "id": 1,
+      "start": 3.68,
+      "end": 7.42,
+      "text": "Hi, how are you?",
+      "speaker": 1
+    }
+  ]
+}
+```
+
 **`text`**: Plain text string
+
+---
+
+## Speaker Diarization
+
+The API supports optional speaker diarization to identify who is speaking in each segment.
+
+### Diarization Modes
+
+| Mode | Description | Speed | Accuracy |
+|------|-------------|-------|----------|
+| `none` | No speaker labels (default) | Fastest | N/A |
+| `online` | TitaNet + StreamingKMeans (incremental during transcription) | Fast | Good |
+| `offline` | External OSD service (pyannote) | Slow | Best |
+
+### Online Diarization
+
+Uses TitaNet Large for speaker embeddings with batched GPU inference, combined with StreamingKMeansMaxCluster for incremental speaker assignment. **Processes chunks incrementally during transcription** (not after all chunks complete), providing lower latency and better performance than batch processing.
+
+**How it works:**
+- Creates a single `StreamingKMeansMaxCluster` instance at the start
+- As chunks are transcribed, extracts embeddings in small batches (default: 4 chunks)
+- Assigns speakers incrementally using the shared cluster instance
+- Maintains GPU batching efficiency while enabling true incremental processing
+
+**Parameters:**
+- `speaker_similarity`: Cosine similarity threshold (0.0-1.0). Higher = stricter matching, fewer speakers. Default: 0.3
+- `speaker_max_n`: Maximum speakers to detect. Default: 10
+
+### Offline Diarization
+
+Calls an external OSD (Offline Speaker Diarization) service running pyannote/speaker-diarization-3.1. More accurate but requires the OSD service to be running and takes longer.
+
+### Example with Diarization
+
+```bash
+curl -X POST "http://localhost:9090/audio/transcriptions" \
+  -F "file=@meeting.mp3" \
+  -F "language=en" \
+  -F "response_format=verbose_json" \
+  -F "diarization=online" \
+  -F "speaker_similarity=0.7" \
+  -F "speaker_max_n=5"
+```
 
 ---
 
 ## Testing
 
-### Integration Tests
+### Quick Reference
 
-Run integration tests that call the API:
+| Test Type | Command |
+|-----------|---------|
+| Direct API test | `curl -X POST http://localhost:9090/audio/transcriptions -F "file=@audio.mp3"` |
+| Unit tests | `uv run pytest tests/test_main.py tests/test_diarization.py -v` |
+| Integration tests (container) | `docker compose --profile test run --rm stress-test uv run pytest tests/ -v` |
+| Stress test | `docker compose run --rm stress-test` |
+| Stress test with diarization | `docker compose run --rm -e DIARIZATION_MODE=online stress-test` |
+
+### Direct API Testing
+
+Test the API directly using curl:
 
 ```bash
-# Start the API
-docker-compose up -d
+# Basic transcription
+curl -X POST "http://localhost:9090/audio/transcriptions" \
+  -F "file=@test_audio/masak.mp3" \
+  -F "language=ms" \
+  -F "response_format=json"
 
-# Run tests
-docker compose -f test.yaml up --build
+# With online diarization (speaker_similarity defaults to 0.3)
+curl -X POST "http://localhost:9090/audio/transcriptions" \
+  -F "file=@test_audio/masak.mp3" \
+  -F "response_format=verbose_json" \
+  -F "diarization=online" \
+  -F "speaker_max_n=5"
+
+# With offline diarization (requires OSD service)
+curl -X POST "http://localhost:9090/audio/transcriptions" \
+  -F "file=@test_audio/masak.mp3" \
+  -F "response_format=verbose_json" \
+  -F "diarization=offline"
+
+# Health check
+curl http://localhost:9090/
 ```
 
 ### Unit Tests
 
+Run unit tests locally (no running API needed):
+
 ```bash
 # Install dev dependencies
-docker-compose exec stt-api uv sync --extra dev
+uv sync --extra dev
 
-# Run unit tests
-docker-compose exec stt-api uv run pytest tests/test_main.py -v
+# Run all unit tests
+uv run pytest tests/test_main.py tests/test_diarization.py -v
+
+# Run specific test
+uv run pytest tests/test_diarization.py::TestOnlineDiarization -v
+```
+
+### Integration Tests (Container-to-Container)
+
+Run integration tests from within the Docker network:
+
+```bash
+# Start the API first
+docker compose up -d stt-api
+
+# Run integration tests from stress-test container
+docker compose --profile test run --rm stress-test \
+  uv run pytest tests/test_integration.py tests/test_diarization_integration.py -v
+
+# Run only diarization tests
+docker compose --profile test run --rm stress-test \
+  uv run pytest tests/test_diarization_integration.py -v
+
+# Run parameterized tests for a specific diarization mode
+docker compose --profile test run --rm stress-test \
+  uv run pytest tests/test_diarization_integration.py -k "online" -v
+```
+
+### Integration Tests (Local to Container)
+
+Run integration tests from your local machine against the containerized API:
+
+```bash
+# Start the API
+docker compose up -d stt-api
+
+# Install dev dependencies locally
+uv sync --extra dev
+
+# Run tests (pointing to localhost)
+STT_API_URL=http://localhost:9090 uv run pytest tests/test_integration.py -v
 ```
 
 ---
@@ -256,11 +403,22 @@ The `stress_test.py` script benchmarks API performance under concurrent load.
 ### Running Stress Tests
 
 ```bash
-# Run with default settings (50 concurrent requests)
+# Run with default settings (50 concurrent requests, no diarization)
 docker compose run --rm stress-test
 
-# Run with custom concurrency
-docker compose run --rm -e CONCURRENCY=100 stress-test
+# Run with online diarization
+docker compose run --rm -e DIARIZATION_MODE=online stress-test
+
+# Run with offline diarization
+docker compose run --rm -e DIARIZATION_MODE=offline stress-test
+
+# Run with custom concurrency and diarization
+docker compose run --rm \
+  -e CONCURRENCY=100 \
+  -e DIARIZATION_MODE=online \
+  -e SPEAKER_SIMILARITY=0.8 \
+  -e SPEAKER_MAX_N=5 \
+  stress-test
 
 # Run with custom audio file
 docker compose run --rm -e AUDIO_FILE=/app/test_audio/custom.mp3 stress-test
@@ -274,6 +432,9 @@ docker compose run --rm -e AUDIO_FILE=/app/test_audio/custom.mp3 stress-test
 | `WARMUP_COUNT` | 3 | Number of warmup requests before test |
 | `STT_API_URL` | http://stt-api:9090 | API URL to test |
 | `AUDIO_FILE` | /app/test_audio/masak.mp3 | Audio file for testing |
+| `DIARIZATION_MODE` | none | Diarization mode: `none`, `online`, `offline` |
+| `SPEAKER_SIMILARITY` | 0.3 | Speaker clustering threshold (online mode) |
+| `SPEAKER_MAX_N` | 10 | Maximum speakers to detect (online mode) |
 
 ### Sample Output
 
@@ -285,6 +446,9 @@ STT-API STRESS TEST REPORT
 --- Test Configuration ---
 Concurrency: 100
 Audio Duration: 144.94s
+Diarization: online
+  Speaker Similarity: 0.75
+  Max Speakers: 10
 Total Requests: 100
 Successful: 100
 Failed: 0
@@ -442,6 +606,14 @@ VAD RTF (lower is better):
 | `OMP_NUM_THREADS` | 2 | OpenMP threads per process |
 | `OPENBLAS_NUM_THREADS` | 2 | OpenBLAS threads per process |
 | `MKL_NUM_THREADS` | 2 | Intel MKL threads per process |
+
+### Diarization Configuration
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `OSD_API_URL` | http://osd:8000 | Offline diarization service URL |
+| `ENABLE_ONLINE_DIARIZATION` | true | Load TitaNet model at startup |
+| `SPEAKER_EMBEDDING_BATCH_SIZE` | 16 | Batch size for speaker embedding GPU inference |
 
 ---
 
