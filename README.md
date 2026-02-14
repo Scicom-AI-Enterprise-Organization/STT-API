@@ -170,7 +170,7 @@ VAD_WORKERS=8
 docker compose up --build
 ```
 
-The API will be available at `http://localhost:9090`.
+The API will be available at `http://localhost:9091`.
 
 ### Running Without Docker
 
@@ -179,7 +179,7 @@ The API will be available at `http://localhost:9090`.
 uv sync
 
 # Run the server
-uv run uvicorn app.main:app --host 0.0.0.0 --port 9090
+uv run uvicorn app.main:app --host 0.0.0.0 --port 9091
 ```
 
 ---
@@ -189,7 +189,7 @@ uv run uvicorn app.main:app --host 0.0.0.0 --port 9090
 ### Basic Transcription
 
 ```bash
-curl -X POST "http://localhost:9090/audio/transcriptions" \
+curl -X POST "http://localhost:9091/audio/transcriptions" \
   -F "file=@audio.mp3" \
   -F "language=en" \
   -F "response_format=json"
@@ -344,12 +344,12 @@ All state is cleaned up on disconnect.
 
 ### Demo Page
 
-Visit `http://localhost:9090/streaming` for a browser-based demo with microphone capture, audio visualizer, and live transcription display.
+Visit `http://localhost:9091/streaming` for a browser-based demo with microphone capture, audio visualizer, and live transcription display.
 
 ### JavaScript Example
 
 ```javascript
-const ws = new WebSocket('ws://localhost:9090/ws?language=en');
+const ws = new WebSocket('ws://localhost:9091/ws?language=en');
 ws.binaryType = 'arraybuffer';
 
 const audioContext = new AudioContext({ sampleRate: 16000 });
@@ -410,7 +410,7 @@ Calls an external OSD (Offline Speaker Diarization) service running pyannote/spe
 ### Example with Diarization
 
 ```bash
-curl -X POST "http://localhost:9090/audio/transcriptions" \
+curl -X POST "http://localhost:9091/audio/transcriptions" \
   -F "file=@meeting.mp3" \
   -F "language=en" \
   -F "response_format=verbose_json" \
@@ -427,7 +427,7 @@ curl -X POST "http://localhost:9090/audio/transcriptions" \
 
 | Test Type | Command |
 |-----------|---------|
-| Direct API test | `curl -X POST http://localhost:9090/audio/transcriptions -F "file=@audio.mp3"` |
+| Direct API test | `curl -X POST http://localhost:9091/audio/transcriptions -F "file=@audio.mp3"` |
 | Unit tests | `uv run pytest tests/test_main.py tests/test_diarization.py -v` |
 | Integration tests (container) | `docker compose --profile test run --rm stress-test uv run pytest tests/ -v` |
 | Stress test | `docker compose run --rm stress-test` |
@@ -439,26 +439,26 @@ Test the API directly using curl:
 
 ```bash
 # Basic transcription
-curl -X POST "http://localhost:9090/audio/transcriptions" \
+curl -X POST "http://localhost:9091/audio/transcriptions" \
   -F "file=@test_audio/masak.mp3" \
   -F "language=ms" \
   -F "response_format=json"
 
 # With online diarization (speaker_similarity defaults to 0.3)
-curl -X POST "http://localhost:9090/audio/transcriptions" \
+curl -X POST "http://localhost:9091/audio/transcriptions" \
   -F "file=@test_audio/masak.mp3" \
   -F "response_format=verbose_json" \
   -F "diarization=online" \
   -F "speaker_max_n=5"
 
 # With offline diarization (requires OSD service)
-curl -X POST "http://localhost:9090/audio/transcriptions" \
+curl -X POST "http://localhost:9091/audio/transcriptions" \
   -F "file=@test_audio/masak.mp3" \
   -F "response_format=verbose_json" \
   -F "diarization=offline"
 
 # Health check
-curl http://localhost:9090/
+curl http://localhost:9091/
 ```
 
 ### Unit Tests
@@ -509,7 +509,7 @@ docker compose up -d stt-api
 uv sync --extra dev
 
 # Run tests (pointing to localhost)
-STT_API_URL=http://localhost:9090 uv run pytest tests/test_integration.py -v
+STT_API_URL=http://localhost:9091 uv run pytest tests/test_integration.py -v
 ```
 
 ---
@@ -522,7 +522,13 @@ The `stress_test.py` script benchmarks API performance under concurrent load.
 
 ```bash
 # Run with default settings (50 concurrent requests, no diarization)
-docker compose run --rm stress-test
+docker compose -f stress-test.yaml run --rm stress-test
+
+# Run with default settings for websocket (50 concurrent requests, no diarization)
+docker compose -f stress-test-ws.yaml run --rm stress-test-ws
+
+# Run with default settings for websocket with 100 concurrency
+docker compose -f stress-test-ws.yaml run --rm -e CONCURRENCY=100 stress-test-ws
 
 # Run with online diarization
 docker compose run --rm -e DIARIZATION_MODE=online stress-test
@@ -548,13 +554,15 @@ docker compose run --rm -e AUDIO_FILE=/app/test_audio/custom.mp3 stress-test
 |---------------------|---------|-------------|
 | `CONCURRENCY` | 50 | Number of concurrent requests |
 | `WARMUP_COUNT` | 3 | Number of warmup requests before test |
-| `STT_API_URL` | http://stt-api:9090 | API URL to test |
+| `STT_API_URL` | http://stt-api:9091 | API URL to test |
 | `AUDIO_FILE` | /app/test_audio/masak.mp3 | Audio file for testing |
 | `DIARIZATION_MODE` | none | Diarization mode: `none`, `online`, `offline` |
 | `SPEAKER_SIMILARITY` | 0.3 | Speaker clustering threshold (online mode) |
 | `SPEAKER_MAX_N` | 10 | Maximum speakers to detect (online mode) |
 
 ### Sample Output
+
+Based on single RTX 3090 Ti,
 
 ```
 ==================================================
@@ -594,6 +602,84 @@ Total Wall Time: 192.346s
 Requests/second: 0.52
 Audio seconds processed/second: 75.36
 ==================================================
+```
+
+### Sample Output WS
+
+Based on single RTX 3090 Ti,
+
+```
+Using WebSocket library: websockets
+Loading audio file: /app/test_audio/masak.mp3
+Audio duration: 144.94s
+Audio samples: 2318976
+API URL: http://stt-api:9091
+WebSocket URL: ws://stt-api:9091/ws?language=ms
+
+--- Warmup (3 clients) ---
+  Warmup 1: 2.745s, 9 segments, TTFT: 0.174s [ok]
+  Warmup 2: 2.790s, 10 segments, TTFT: 0.089s [ok]
+  Warmup 3: 2.773s, 10 segments, TTFT: 0.091s [ok]
+
+--- Running Stress Test (100 concurrent clients) ---
+Completed in 81.041s
+
+============================================================
+STT-API WEBSOCKET STRESS TEST REPORT
+============================================================
+
+--- Test Configuration ---
+Concurrency: 100
+Audio Duration: 144.94s
+Language: ms
+Chunk Size: 100ms
+Total Clients: 100
+Successful: 91
+Failed: 9
+Success Rate: 91.0%
+
+--- Failed Clients ---
+  Client 4: None
+  Client 5: None
+  Client 9: None
+  Client 12: None
+  Client 15: None
+  ... and 4 more
+
+--- Total Session Time ---
+Min: 8.913s
+Max: 71.009s
+Avg: 36.843s
+P50: 37.112s
+P90: 70.640s
+P95: 70.698s
+P99: 71.009s
+
+--- Time to First Transcription (TTFT) ---
+Min: 8.604s
+Max: 15.076s
+Avg: 10.903s
+P50: 10.772s
+P90: 12.962s
+
+--- Segments ---
+Total Transcription Segments: 568
+Total Silent Segments: 728
+Avg Segments/Client: 6.2
+
+--- Real-Time Factor (RTF) ---
+(RTF < 1.0 means faster than real-time)
+Min RTF: 0.061
+Max RTF: 0.490
+Avg RTF: 0.254
+P50 RTF: 0.256
+
+--- Throughput ---
+Total Wall Time: 71.009s
+Clients/second: 1.28
+Audio seconds processed/second: 185.75
+
+============================================================
 ```
 
 ### Key Metrics

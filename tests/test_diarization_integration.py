@@ -6,7 +6,7 @@ import aiohttp
 
 # Skip if no test audio available
 TEST_AUDIO = os.environ.get("TEST_AUDIO", "test_audio/masak.mp3")
-API_URL = os.environ.get("STT_API_URL", "http://localhost:9090")
+API_URL = os.environ.get("STT_API_URL", "http://localhost:9091")
 
 # Diarization modes to test - can be filtered via pytest -k
 DIARIZATION_MODES = ["none", "online", "offline"]

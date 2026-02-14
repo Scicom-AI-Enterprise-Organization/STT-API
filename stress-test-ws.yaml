@@ -1,11 +1,11 @@
 services:
-  stress-test:
+  stress-test-ws:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: stt-stress-test
+    container_name: stt-stress-test-ws
     volumes:
-      - "./stress_test.py:/app/stress_test.py"
+      - "./stress_test_ws.py:/app/stress_test_ws.py"
       - "./test_audio:/app/test_audio"
       - stt-venv:/app/.venv
     environment:
@@ -19,7 +19,7 @@ services:
       - SPEAKER_SIMILARITY=0.75
       - SPEAKER_MAX_N=10
     working_dir: /app
-    command: uv run python stress_test.py
+    command: uv run python stress_test_ws.py
     networks:
       - stt-network
     profiles:

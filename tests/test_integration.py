@@ -6,7 +6,7 @@ TEST_AUDIO_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "test_
 
 # API base URL - defaults to container name for docker-to-docker communication
 # Can be overridden with LOCAL_STT_API environment variable
-API_BASE_URL = os.environ.get("LOCAL_STT_API", "http://stt-api:9090")
+API_BASE_URL = os.environ.get("LOCAL_STT_API", "http://stt-api:9091")
 
 
 @pytest.fixture

@@ -6,7 +6,7 @@ Usage:
     docker compose run --rm stress-test
 
     # Or for direct testing:
-    STT_API_URL=http://localhost:9090 AUDIO_FILE=test_audio/masak.mp3 python stress_test.py
+    STT_API_URL=http://localhost:9091 AUDIO_FILE=test_audio/masak.mp3 python stress_test.py
 
     # Test with diarization:
     DIARIZATION_MODE=online SPEAKER_SIMILARITY=0.75 docker compose run --rm stress-test
@@ -14,7 +14,7 @@ Usage:
 Environment Variables:
     WARMUP_COUNT: Number of warmup requests (default: 3)
     CONCURRENCY: Number of concurrent requests (default: 50)
-    STT_API_URL: URL of the STT API (default: http://stt-api:9090)
+    STT_API_URL: URL of the STT API (default: http://stt-api:9091)
     AUDIO_FILE: Path to audio file for testing (default: /app/test_audio/masak.mp3)
     DIARIZATION_MODE: Diarization mode - none, online, offline (default: none)
     SPEAKER_SIMILARITY: Speaker clustering threshold for online mode (default: 0.75)
@@ -30,7 +30,7 @@ import librosa
 
 WARMUP_COUNT = int(os.environ.get("WARMUP_COUNT", "3"))
 CONCURRENCY = int(os.environ.get("CONCURRENCY", "50"))
-STT_API_URL = os.environ.get("STT_API_URL", "http://stt-api:9090")
+STT_API_URL = os.environ.get("STT_API_URL", "http://stt-api:9091")
 AUDIO_FILE = os.environ.get("AUDIO_FILE", "/app/test_audio/masak.mp3")
 DIARIZATION_MODE = os.environ.get("DIARIZATION_MODE", "none")
 SPEAKER_SIMILARITY = os.environ.get("SPEAKER_SIMILARITY", "0.75")
