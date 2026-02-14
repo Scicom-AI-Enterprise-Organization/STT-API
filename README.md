@@ -110,6 +110,8 @@ Long-form speech-to-text API that:
 |----------|--------|-------------|
 | `/` | GET | Health/version check |
 | `/audio/transcriptions` | POST | Long audio transcription with VAD chunking |
+| `/streaming` | GET | WebSocket streaming demo page |
+| `/ws` | WebSocket | Real-time streaming transcription with VAD |
 
 ---
 
@@ -143,7 +145,7 @@ HUGGING_FACE_HUB_TOKEN=
 ```
 
 ```bash
-STT_MODEL=openai/whisper-medium GPU_MEM_UTIL=0.7 \
+STT_MODEL=openai/whisper-large-v3-turbo GPU_MEM_UTIL=0.7 \
 docker compose -f vllm.yaml up --detach
 ```
 
@@ -165,11 +167,7 @@ VAD_WORKERS=8
 ### 4. Build and Run
 
 ```bash
-# Start the service
 docker compose up --build
-
-# Or run in detached mode
-docker compose up -d
 ```
 
 The API will be available at `http://localhost:9090`.
@@ -269,6 +267,113 @@ curl -X POST "http://localhost:9090/audio/transcriptions" \
 ```
 
 **`text`**: Plain text string
+
+---
+
+## WebSocket Streaming
+
+The `/ws` endpoint provides real-time streaming transcription. The client streams microphone audio over a WebSocket, the server runs VAD on incoming frames using the `ProcessPoolExecutor` workers, and when a speech segment is detected, it sends the audio to the upstream STT API and streams results back.
+
+### How It Works
+
+```
+┌──────────────┐     float32 bytes      ┌───────────────────────────────────────┐
+│   Browser     │ ─────────────────────► │  WebSocket /ws                        │
+│   (mic @16k)  │                        │                                       │
+│               │ ◄───────────────────── │  1. Buffer into numpy array           │
+│  JSON results │     JSON messages      │  2. Split into 512-sample frames      │
+└──────────────┘                        │  3. Batch frames → ProcessPoolExecutor │
+                                         │     (Silero VAD in worker process)     │
+                                         │  4. Track silence / speech state       │
+                                         │  5. On VAD trigger → transcribe_chunk  │
+                                         │     (POST to upstream STT API)         │
+                                         │  6. Send result back over WebSocket    │
+                                         └───────────────────────────────────────┘
+```
+
+### ConnectionManager
+
+Each connected client gets its own state tracked by `client_id`:
+
+| State | Type | Description |
+|-------|------|-------------|
+| `wav_data` | `np.ndarray (float32)` | Incoming audio buffer (partial frames not yet processed) |
+| `wav_queue` | `list[np.ndarray]` | Accumulated VAD-sized frames for current segment |
+| `total_silent` | `int` | Running count of silent samples |
+| `total_silent_frames` | `int` | Running count of silent frames |
+| `total_frames` | `int` | Running count of total frames |
+| `last_timestamp` | `float` | Cumulative timestamp offset (seconds) |
+
+All state is cleaned up on disconnect.
+
+### Query Parameters
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `language` | string | `null` | Language hint: `en`, `ms`, `zh`, `ta`, or `null` for auto-detect |
+| `minimum_silent_ms` | int | 200 | Minimum silence duration for VAD trigger (ms) |
+| `minimum_trigger_vad_ms` | int | 1500 | Minimum audio length to trigger VAD (ms) |
+| `reject_segment_vad_ratio` | float | 0.9 | Reject segments with this ratio of silence (0.0-1.0) |
+
+### Client Protocol
+
+1. Connect to `ws://<host>/ws?language=en`
+2. Send raw `Float32Array` audio bytes (16kHz, mono) from the microphone
+3. Receive JSON messages:
+
+**Transcription result:**
+```json
+{
+  "type": "transcription",
+  "language": "en",
+  "segments": [
+    {"id": 0, "start": 0.0, "end": 3.5, "text": "Hello world."}
+  ]
+}
+```
+
+**Silent segment (skipped):**
+```json
+{"type": "silent"}
+```
+
+**Error:**
+```json
+{"error": "error details"}
+```
+
+### Demo Page
+
+Visit `http://localhost:9090/streaming` for a browser-based demo with microphone capture, audio visualizer, and live transcription display.
+
+### JavaScript Example
+
+```javascript
+const ws = new WebSocket('ws://localhost:9090/ws?language=en');
+ws.binaryType = 'arraybuffer';
+
+const audioContext = new AudioContext({ sampleRate: 16000 });
+const stream = await navigator.mediaDevices.getUserMedia({ audio: { sampleRate: 16000, channelCount: 1 } });
+const source = audioContext.createMediaStreamSource(stream);
+const processor = audioContext.createScriptProcessor(4096, 1, 1);
+
+processor.onaudioprocess = (e) => {
+    if (ws.readyState === WebSocket.OPEN) {
+        const buffer = new Float32Array(e.inputBuffer.getChannelData(0));
+        ws.send(buffer.buffer);
+    }
+};
+
+source.connect(processor);
+processor.connect(audioContext.destination);
+
+ws.onmessage = (event) => {
+    const data = JSON.parse(event.data);
+    if (data.type === 'transcription') {
+        console.log(data.segments);
+    }
+};
+```
 
 ---
 

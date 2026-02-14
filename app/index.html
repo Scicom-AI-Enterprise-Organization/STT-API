@@ -1,0 +1,299 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Microphone WebSocket Stream</title>
+    <style>
+        body {
+            font-family: system-ui, -apple-system, sans-serif;
+            max-width: 600px;
+            margin: 50px auto;
+            padding: 20px;
+            background: #1a1a2e;
+            color: #eee;
+        }
+        button {
+            padding: 12px 24px;
+            font-size: 16px;
+            margin: 10px;
+            cursor: pointer;
+            border: none;
+            border-radius: 6px;
+            transition: all 0.2s;
+        }
+        #startBtn {
+            background: #4ade80;
+            color: #000;
+        }
+        #startBtn:hover { background: #22c55e; }
+        #stopBtn {
+            background: #f87171;
+            color: #000;
+        }
+        #stopBtn:hover { background: #ef4444; }
+        #stopBtn:disabled {
+            background: #666;
+            cursor: not-allowed;
+        }
+        #status {
+            margin: 20px 0;
+            padding: 10px;
+            border-radius: 4px;
+            background: #2a2a4a;
+        }
+        #transcription {
+            background: #0a0a1a;
+            padding: 15px;
+            border-radius: 6px;
+            min-height: 100px;
+            max-height: 300px;
+            overflow-y: auto;
+            font-size: 15px;
+            line-height: 1.6;
+            white-space: pre-wrap;
+        }
+        #log {
+            background: #0a0a1a;
+            padding: 15px;
+            border-radius: 6px;
+            height: 150px;
+            overflow-y: auto;
+            font-family: monospace;
+            font-size: 13px;
+        }
+        .log-entry { margin: 4px 0; }
+        #visualizer {
+            width: 100%;
+            height: 100px;
+            background: #0a0a1a;
+            border-radius: 6px;
+            margin: 20px 0;
+        }
+        .segment {
+            margin: 2px 0;
+        }
+        .timestamp {
+            color: #888;
+            font-size: 12px;
+        }
+    </style>
+</head>
+<body>
+    <h1>Microphone Stream</h1>
+
+    <div>
+        <button id="startBtn">Start Streaming</button>
+        <button id="stopBtn" disabled>Stop</button>
+    </div>
+
+    <div id="status">Status: Ready</div>
+
+    <canvas id="visualizer"></canvas>
+
+    <h3>Transcription</h3>
+    <div id="transcription"></div>
+
+    <h3>Log</h3>
+    <div id="log"></div>
+
+    <script>
+        const startBtn = document.getElementById('startBtn');
+        const stopBtn = document.getElementById('stopBtn');
+        const status = document.getElementById('status');
+        const transcription = document.getElementById('transcription');
+        const log = document.getElementById('log');
+        const canvas = document.getElementById('visualizer');
+        const ctx = canvas.getContext('2d');
+
+        let ws = null;
+        let audioContext = null;
+        let mediaStream = null;
+        let processor = null;
+        let analyser = null;
+        let animationId = null;
+
+        const BUFFER_SIZE = 4096;
+
+        function addLog(msg) {
+            const entry = document.createElement('div');
+            entry.className = 'log-entry';
+            entry.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+            log.appendChild(entry);
+            log.scrollTop = log.scrollHeight;
+        }
+
+        function addTranscription(data) {
+            if (data.type === 'transcription') {
+                if (data.segments && data.segments.length > 0) {
+                    for (const seg of data.segments) {
+                        const div = document.createElement('div');
+                        div.className = 'segment';
+                        const ts = document.createElement('span');
+                        ts.className = 'timestamp';
+                        ts.textContent = `[${seg.start.toFixed(1)}s - ${seg.end.toFixed(1)}s] `;
+                        div.appendChild(ts);
+                        div.appendChild(document.createTextNode(seg.text));
+                        transcription.appendChild(div);
+                    }
+                } else if (data.text) {
+                    const div = document.createElement('div');
+                    div.className = 'segment';
+                    div.textContent = data.text;
+                    transcription.appendChild(div);
+                }
+                transcription.scrollTop = transcription.scrollHeight;
+            }
+        }
+
+        function drawVisualizer() {
+            if (!analyser) return;
+
+            const bufferLength = analyser.frequencyBinCount;
+            const dataArray = new Uint8Array(bufferLength);
+            analyser.getByteFrequencyData(dataArray);
+
+            canvas.width = canvas.offsetWidth;
+            canvas.height = canvas.offsetHeight;
+
+            ctx.fillStyle = '#0a0a1a';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+            const barWidth = (canvas.width / bufferLength) * 2.5;
+            let x = 0;
+
+            for (let i = 0; i < bufferLength; i++) {
+                const barHeight = (dataArray[i] / 255) * canvas.height;
+                const hue = (i / bufferLength) * 120 + 120;
+                ctx.fillStyle = `hsl(${hue}, 70%, 50%)`;
+                ctx.fillRect(x, canvas.height - barHeight, barWidth, barHeight);
+                x += barWidth + 1;
+            }
+
+            animationId = requestAnimationFrame(drawVisualizer);
+        }
+
+        async function startStreaming() {
+            try {
+                const wsUrl = `ws://${window.location.host}/ws?language=null`;
+                ws = new WebSocket(wsUrl);
+                ws.binaryType = 'arraybuffer';
+
+                ws.onopen = () => {
+                    status.textContent = 'Status: Connected to server';
+                    addLog('WebSocket connected');
+                };
+
+                ws.onmessage = (event) => {
+                    try {
+                        const data = JSON.parse(event.data);
+                        if (data.error) {
+                            addLog(`Error: ${data.error}`);
+                        } else if (data.type === 'silent') {
+                            addLog('Silent segment skipped');
+                        } else if (data.type === 'transcription') {
+                            addTranscription(data);
+                            if (data.language) {
+                                addLog(`Transcription received (lang: ${data.language})`);
+                            } else {
+                                addLog('Transcription received');
+                            }
+                        }
+                    } catch (e) {
+                        addLog(`Raw: ${event.data}`);
+                    }
+                };
+
+                ws.onerror = (error) => {
+                    addLog('WebSocket error');
+                    console.error(error);
+                };
+
+                ws.onclose = () => {
+                    status.textContent = 'Status: Disconnected';
+                    addLog('WebSocket closed');
+                };
+
+                mediaStream = await navigator.mediaDevices.getUserMedia({
+                    audio: {
+                        sampleRate: 16000,
+                        channelCount: 1,
+                        echoCancellation: true,
+                        noiseSuppression: true
+                    }
+                });
+
+                audioContext = new AudioContext({ sampleRate: 16000 });
+                const source = audioContext.createMediaStreamSource(mediaStream);
+
+                analyser = audioContext.createAnalyser();
+                analyser.fftSize = 256;
+                source.connect(analyser);
+
+                processor = audioContext.createScriptProcessor(BUFFER_SIZE, 1, 1);
+
+                processor.onaudioprocess = (e) => {
+                    if (ws && ws.readyState === WebSocket.OPEN) {
+                        const inputData = e.inputBuffer.getChannelData(0);
+                        const buffer = new Float32Array(inputData);
+                        ws.send(buffer.buffer);
+                    }
+                };
+
+                source.connect(processor);
+                processor.connect(audioContext.destination);
+
+                status.textContent = 'Status: Streaming...';
+                addLog('Microphone streaming started');
+
+                startBtn.disabled = true;
+                stopBtn.disabled = false;
+
+                drawVisualizer();
+
+            } catch (error) {
+                status.textContent = `Status: Error - ${error.message}`;
+                addLog(`Error: ${error.message}`);
+                console.error(error);
+            }
+        }
+
+        function stopStreaming() {
+            if (animationId) {
+                cancelAnimationFrame(animationId);
+            }
+
+            if (processor) {
+                processor.disconnect();
+                processor = null;
+            }
+
+            if (audioContext) {
+                audioContext.close();
+                audioContext = null;
+            }
+
+            if (mediaStream) {
+                mediaStream.getTracks().forEach(track => track.stop());
+                mediaStream = null;
+            }
+
+            if (ws) {
+                ws.close();
+                ws = null;
+            }
+
+            analyser = null;
+
+            status.textContent = 'Status: Stopped';
+            addLog('Streaming stopped');
+
+            startBtn.disabled = false;
+            stopBtn.disabled = true;
+        }
+
+        startBtn.addEventListener('click', startStreaming);
+        stopBtn.addEventListener('click', stopStreaming);
+    </script>
+</body>
+</html>

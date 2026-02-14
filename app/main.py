@@ -14,13 +14,12 @@ import torch
 import aiohttp
 from aiohttp import FormData
 import urllib.parse
-from fastapi import FastAPI, File, Form, HTTPException
+from fastapi import FastAPI, File, Form, HTTPException, WebSocket, WebSocketDisconnect, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 import librosa
 import soundfile as sf
-from concurrent.futures import ProcessPoolExecutor
 from app.diarization import load_speaker_model, run_online_diarization
-
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -233,6 +232,8 @@ async def transcribe_chunk(
     language: str,
     timestamp_granularities: str,
     last_timestamp: float,
+    response_format: str = "verbose_json",
+    stream: str = "false",
 ) -> Tuple[str, Optional[str]]:
     """
     Transcribe a single audio chunk using upstream STT API.
@@ -271,8 +272,8 @@ async def transcribe_chunk(
     if timestamp_granularities:
         form_data.add_field("timestamp_granularities[]", timestamp_granularities)
 
-    form_data.add_field("response_format", "verbose_json")
-    form_data.add_field("stream", "false")
+    form_data.add_field("response_format", response_format)
+    form_data.add_field("stream", stream)
 
     texts = ""
     detected_language = None
@@ -884,3 +885,197 @@ async def _process_transcription(
         return {"text": final_text}
     else:
         return final_text
+
+def process_vad_frames(args: Tuple) -> List[Tuple[bool, float]]:
+    """
+    Process a batch of audio frames through VAD in a worker process.
+
+    Args:
+        args: Tuple of (frames_list, worker_sample_rate)
+              frames_list is a list of np.float32 arrays, each of frame_size length
+
+    Returns:
+        List of (is_speech, vad_score) for each frame
+    """
+    frames_list, worker_sample_rate = args
+
+    global _worker_silero
+    if _worker_silero is None:
+        from silero_vad import load_silero_vad
+        _worker_silero = load_silero_vad(onnx=True)
+
+    results = []
+    for frame in frames_list:
+        frame_pt = torch.from_numpy(frame).unsqueeze(0)
+        vad_score = _worker_silero(frame_pt, sr=worker_sample_rate).numpy()[0][0]
+        results.append((bool(vad_score > 0.5), float(vad_score)))
+
+    return results
+
+
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: Dict[str, WebSocket] = {}
+        self.wav_data: Dict[str, np.ndarray] = {}
+        self.wav_queue: Dict[str, list] = {}
+        self.total_silent: Dict[str, int] = {}
+        self.total_silent_frames: Dict[str, int] = {}
+        self.total_frames: Dict[str, int] = {}
+        self.last_timestamp: Dict[str, float] = {}
+
+    async def connect(self, websocket: WebSocket, client_id: str):
+        await websocket.accept()
+        self.active_connections[client_id] = websocket
+        self.wav_data[client_id] = np.array([], dtype=np.float32)
+        self.wav_queue[client_id] = []
+        self.total_silent[client_id] = 0
+        self.total_silent_frames[client_id] = 0
+        self.total_frames[client_id] = 0
+        self.last_timestamp[client_id] = 0.0
+
+    def disconnect(self, client_id: str):
+        self.active_connections.pop(client_id, None)
+        self.wav_data.pop(client_id, None)
+        self.wav_queue.pop(client_id, None)
+        self.total_silent.pop(client_id, None)
+        self.total_silent_frames.pop(client_id, None)
+        self.total_frames.pop(client_id, None)
+        self.last_timestamp.pop(client_id, None)
+
+    async def send_personal_message(self, message: str, websocket: WebSocket):
+        await websocket.send_text(message)
+
+
+manager = ConnectionManager()
+
+
+@app.get("/streaming")
+async def get():
+    html_path = os.path.join(os.path.dirname(__file__), "index.html")
+    with open(html_path, "r") as f:
+        return HTMLResponse(f.read())
+
+
+@app.websocket("/ws")
+async def websocket_stt(
+    websocket: WebSocket,
+    language: str = Query("null"),
+    minimum_silent_ms: int = Query(MINIMUM_SILENT_MS),
+    minimum_trigger_vad_ms: int = Query(MINIMUM_TRIGGER_VAD_MS),
+    reject_segment_vad_ratio: float = Query(REJECT_SEGMENT_VAD_RATIO),
+):
+    client_id = str(id(websocket))
+    await manager.connect(websocket, client_id=client_id)
+    logger.info(f"WebSocket client {client_id} connected")
+
+    loop = asyncio.get_event_loop()
+    executor = get_vad_executor()
+
+    try:
+        while True:
+            data = await websocket.receive_bytes()
+            try:
+                array = np.frombuffer(data, dtype=np.float32)
+            except Exception:
+                error = json.dumps({"error": "input must be float32 audio bytes"})
+                await manager.send_personal_message(error, websocket)
+                continue
+
+            manager.wav_data[client_id] = np.concatenate(
+                [manager.wav_data[client_id], array]
+            )
+
+            frames = []
+            while True:
+                buf = manager.wav_data[client_id][:frame_size]
+                if len(buf) == frame_size:
+                    manager.wav_data[client_id] = manager.wav_data[client_id][frame_size:]
+                    frames.append(buf)
+                else:
+                    break
+
+            if not frames:
+                continue
+
+            vad_results = await loop.run_in_executor(
+                executor,
+                process_vad_frames,
+                (frames, sample_rate),
+            )
+
+            for i, (vad, vad_score) in enumerate(vad_results):
+                manager.total_frames[client_id] += 1
+
+                if vad:
+                    manager.total_silent[client_id] = 0
+                else:
+                    manager.total_silent[client_id] += len(frames[i])
+                    manager.total_silent_frames[client_id] += 1
+
+                manager.wav_queue[client_id].append(frames[i])
+                audio_len = (len(manager.wav_queue[client_id]) * frame_size) / sample_rate
+                audio_len_ms = audio_len * 1000
+                silent_len = (manager.total_silent[client_id] / sample_rate) * 1000
+                negative_ratio = (
+                    manager.total_silent_frames[client_id] / manager.total_frames[client_id]
+                    if manager.total_frames[client_id] > 0
+                    else 0
+                )
+
+                vad_trigger = (
+                    audio_len_ms >= minimum_trigger_vad_ms
+                    and silent_len >= minimum_silent_ms
+                )
+
+                if vad_trigger or audio_len >= maxlen:
+                    if negative_ratio <= reject_segment_vad_ratio:
+                        wav_data = np.concatenate(manager.wav_queue[client_id])
+                        last_ts = manager.last_timestamp[client_id]
+
+                        try:
+                            texts, detected_language = await transcribe_chunk(
+                                wav_data=wav_data,
+                                language=language,
+                                timestamp_granularities="segment",
+                                last_timestamp=last_ts,
+                                response_format="text",
+                            )
+                        except HTTPException as e:
+                            error_msg = json.dumps({"error": e.detail})
+                            await manager.send_personal_message(error_msg, websocket)
+                            texts = ""
+
+                        if texts:
+                            segments = parse_segments(texts)
+                            if segments:
+                                result = json.dumps({
+                                    "type": "transcription",
+                                    "language": detected_language,
+                                    "segments": segments,
+                                })
+                            else:
+                                clean_text = re.sub(pattern, "", texts).strip()
+                                result = json.dumps({
+                                    "type": "transcription",
+                                    "language": detected_language,
+                                    "text": clean_text,
+                                })
+                            await manager.send_personal_message(result, websocket)
+                    else:
+                        silent_msg = json.dumps({"type": "silent"})
+                        await manager.send_personal_message(silent_msg, websocket)
+
+                    manager.last_timestamp[client_id] += audio_len
+                    manager.total_silent[client_id] = 0
+                    manager.total_silent_frames[client_id] = 0
+                    manager.total_frames[client_id] = 0
+                    manager.wav_queue[client_id] = []
+
+            await asyncio.sleep(0)
+
+    except WebSocketDisconnect:
+        logger.info(f"WebSocket client {client_id} disconnected")
+        manager.disconnect(client_id)
+    except Exception as e:
+        logger.error(f"WebSocket error for client {client_id}: {e}")
+        manager.disconnect(client_id)
