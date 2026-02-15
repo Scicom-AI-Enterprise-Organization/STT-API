@@ -14,7 +14,7 @@ import torch
 import aiohttp
 from aiohttp import FormData
 import urllib.parse
-from fastapi import FastAPI, File, Form, HTTPException, WebSocket, WebSocketDisconnect, Query
+from fastapi import FastAPI, File, Form, HTTPException, WebSocket, WebSocketDisconnect, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 import librosa
@@ -39,13 +39,16 @@ MAX_CONCURRENT_UPSTREAM = int(os.environ.get("MAX_CONCURRENT_UPSTREAM", "100"))
 upstream_semaphore = asyncio.Semaphore(MAX_CONCURRENT_UPSTREAM)
 logger.info(f"Upstream semaphore initialized with limit: {MAX_CONCURRENT_UPSTREAM}")
 
-MAX_CONCURRENT_REQUESTS = int(os.environ.get("MAX_CONCURRENT_REQUESTS", "20"))
+MAX_CONCURRENT_REQUESTS = int(os.environ.get("MAX_CONCURRENT_REQUESTS", "50"))
 request_semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
 logger.info(f"Request semaphore initialized with limit: {MAX_CONCURRENT_REQUESTS}")
 
 CHUNK_BATCH_SIZE = int(os.environ.get("CHUNK_BATCH_SIZE", "64"))
 
 VAD_WORKERS = int(os.environ.get("VAD_WORKERS", "8"))
+
+ENABLE_FORCE_ALIGNMENT = os.environ.get("ENABLE_FORCE_ALIGNMENT", "true").lower() == "true"
+
 _vad_executor = None
 _diarization_executor = None
 
@@ -623,6 +626,7 @@ async def read_root():
 
 @app.post("/audio/transcriptions")
 async def audio_transcriptions(
+    request: Request,
     file: bytes = File(),
     language: str = Form(None),
     response_format: str = Form("json"),
@@ -649,6 +653,7 @@ async def audio_transcriptions(
     """
     async with request_semaphore:
         return await _process_transcription(
+            request=request,
             file=file,
             language=language,
             response_format=response_format,
@@ -662,6 +667,7 @@ async def audio_transcriptions(
 
 
 async def _process_transcription(
+    request: Request,
     file: bytes,
     language: str,
     response_format: str,
@@ -790,6 +796,17 @@ async def _process_transcription(
         all_transcriptions = []
         detected_language = None
 
+        async def _disconnect_monitor(tasks_to_cancel: List[asyncio.Task]):
+            """Poll for client disconnect every 0.5s, cancel tasks if disconnected."""
+            while True:
+                await asyncio.sleep(0.5)
+                if await request.is_disconnected():
+                    logger.info("Client disconnected, cancelling all pending transcription tasks")
+                    for task in tasks_to_cancel:
+                        if not task.done():
+                            task.cancel()
+                    return
+
         for batch_start in range(0, total_chunks, CHUNK_BATCH_SIZE):
             batch_end = min(batch_start + CHUNK_BATCH_SIZE, total_chunks)
             batch = chunks_to_transcribe[batch_start:batch_end]
@@ -805,16 +822,25 @@ async def _process_transcription(
             t_batch_start = time.time()
 
             batch_tasks = [
-                transcribe_chunk(
+                asyncio.create_task(transcribe_chunk(
                     wav_data=wav_chunk,
                     language=language,
                     timestamp_granularities="segment",
                     last_timestamp=start_ts,
-                )
+                ))
                 for wav_chunk, start_ts, _ in batch
             ]
 
-            batch_results = await asyncio.gather(*batch_tasks)
+            monitor_task = asyncio.create_task(_disconnect_monitor(batch_tasks))
+
+            try:
+                batch_results = await asyncio.gather(*batch_tasks)
+            except asyncio.CancelledError:
+                logger.info(f"Batch {batch_num} cancelled due to client disconnect")
+                monitor_task.cancel()
+                raise
+            finally:
+                monitor_task.cancel()
 
             logger.info(
                 f"⏱️ Batch {batch_num} STT took: {time.time() - t_batch_start:.2f}s"
@@ -849,7 +875,14 @@ async def _process_transcription(
 
         combined_text = "".join(all_transcriptions)
 
+    except asyncio.CancelledError:
+        if diarize_task is not None and not diarize_task.done():
+            diarize_task.cancel()
+        logger.info("Request cancelled (client disconnected)")
+        return {"text": ""}
     except Exception as e:
+        if diarize_task is not None and not diarize_task.done():
+            diarize_task.cancel()
         logger.error(f"Error processing audio: {e}")
         raise HTTPException(status_code=500, detail=f"Error processing audio: {str(e)}")
 
@@ -922,6 +955,7 @@ class ConnectionManager:
         self.total_silent_frames: Dict[str, int] = {}
         self.total_frames: Dict[str, int] = {}
         self.last_timestamp: Dict[str, float] = {}
+        self.pending_tasks: Dict[str, List[asyncio.Task]] = {}
 
     async def connect(self, websocket: WebSocket, client_id: str):
         await websocket.accept()
@@ -932,8 +966,14 @@ class ConnectionManager:
         self.total_silent_frames[client_id] = 0
         self.total_frames[client_id] = 0
         self.last_timestamp[client_id] = 0.0
+        self.pending_tasks[client_id] = []
 
     def disconnect(self, client_id: str):
+        # Cancel all pending transcription tasks for this client
+        for task in self.pending_tasks.get(client_id, []):
+            if not task.done():
+                task.cancel()
+                logger.info(f"Cancelled pending task for client {client_id}")
         self.active_connections.pop(client_id, None)
         self.wav_data.pop(client_id, None)
         self.wav_queue.pop(client_id, None)
@@ -941,6 +981,7 @@ class ConnectionManager:
         self.total_silent_frames.pop(client_id, None)
         self.total_frames.pop(client_id, None)
         self.last_timestamp.pop(client_id, None)
+        self.pending_tasks.pop(client_id, None)
 
     async def send_personal_message(self, message: str, websocket: WebSocket):
         await websocket.send_text(message)
@@ -970,112 +1011,184 @@ async def websocket_stt(
 
     loop = asyncio.get_event_loop()
     executor = get_vad_executor()
+    disconnected = asyncio.Event()
 
-    try:
+    async def _transcribe_and_send(wav_data, last_ts):
+        """Run transcription and send result back. Runs as a background task."""
+        try:
+            texts, detected_language = await transcribe_chunk(
+                wav_data=wav_data,
+                language=language,
+                timestamp_granularities="segment",
+                last_timestamp=last_ts,
+                response_format="text",
+            )
+        except asyncio.CancelledError:
+            logger.info(f"Transcription cancelled for client {client_id}")
+            return
+        except HTTPException as e:
+            if not disconnected.is_set():
+                try:
+                    error_msg = json.dumps({"error": e.detail})
+                    await manager.send_personal_message(error_msg, websocket)
+                except Exception:
+                    pass
+            return
+
+        if disconnected.is_set():
+            return
+
+        try:
+            if texts:
+                segments = parse_segments(texts)
+                if segments:
+                    result = json.dumps({
+                        "type": "transcription",
+                        "language": detected_language,
+                        "segments": segments,
+                    })
+                else:
+                    clean_text = re.sub(pattern, "", texts).strip()
+                    result = json.dumps({
+                        "type": "transcription",
+                        "language": detected_language,
+                        "text": clean_text,
+                    })
+                await manager.send_personal_message(result, websocket)
+        except Exception:
+            pass
+
+    async def _process_audio_data(audio_bytes: bytes):
+        """Process incoming binary audio data through VAD pipeline."""
+        try:
+            array = np.frombuffer(audio_bytes, dtype=np.float32)
+        except Exception:
+            error = json.dumps({"error": "input must be float32 audio bytes"})
+            await manager.send_personal_message(error, websocket)
+            return
+
+        manager.wav_data[client_id] = np.concatenate(
+            [manager.wav_data[client_id], array]
+        )
+
+        frames = []
         while True:
-            data = await websocket.receive_bytes()
-            try:
-                array = np.frombuffer(data, dtype=np.float32)
-            except Exception:
-                error = json.dumps({"error": "input must be float32 audio bytes"})
-                await manager.send_personal_message(error, websocket)
-                continue
+            buf = manager.wav_data[client_id][:frame_size]
+            if len(buf) == frame_size:
+                manager.wav_data[client_id] = manager.wav_data[client_id][frame_size:]
+                frames.append(buf)
+            else:
+                break
 
-            manager.wav_data[client_id] = np.concatenate(
-                [manager.wav_data[client_id], array]
+        if not frames:
+            return
+
+        vad_results = await loop.run_in_executor(
+            executor,
+            process_vad_frames,
+            (frames, sample_rate),
+        )
+
+        for i, (vad, vad_score) in enumerate(vad_results):
+            manager.total_frames[client_id] += 1
+
+            if vad:
+                manager.total_silent[client_id] = 0
+            else:
+                manager.total_silent[client_id] += len(frames[i])
+                manager.total_silent_frames[client_id] += 1
+
+            manager.wav_queue[client_id].append(frames[i])
+            audio_len = (len(manager.wav_queue[client_id]) * frame_size) / sample_rate
+            audio_len_ms = audio_len * 1000
+            silent_len = (manager.total_silent[client_id] / sample_rate) * 1000
+            negative_ratio = (
+                manager.total_silent_frames[client_id] / manager.total_frames[client_id]
+                if manager.total_frames[client_id] > 0
+                else 0
             )
 
-            frames = []
-            while True:
-                buf = manager.wav_data[client_id][:frame_size]
-                if len(buf) == frame_size:
-                    manager.wav_data[client_id] = manager.wav_data[client_id][frame_size:]
-                    frames.append(buf)
-                else:
-                    break
-
-            if not frames:
-                continue
-
-            vad_results = await loop.run_in_executor(
-                executor,
-                process_vad_frames,
-                (frames, sample_rate),
+            vad_trigger = (
+                audio_len_ms >= minimum_trigger_vad_ms
+                and silent_len >= minimum_silent_ms
             )
 
-            for i, (vad, vad_score) in enumerate(vad_results):
-                manager.total_frames[client_id] += 1
+            if vad_trigger or audio_len >= maxlen:
+                if negative_ratio <= reject_segment_vad_ratio:
+                    wav_data = np.concatenate(manager.wav_queue[client_id])
+                    last_ts = manager.last_timestamp[client_id]
 
-                if vad:
-                    manager.total_silent[client_id] = 0
+                    task = asyncio.create_task(
+                        _transcribe_and_send(wav_data, last_ts)
+                    )
+                    manager.pending_tasks[client_id].append(task)
+                    # Clean up finished tasks
+                    manager.pending_tasks[client_id] = [
+                        t for t in manager.pending_tasks[client_id] if not t.done()
+                    ]
                 else:
-                    manager.total_silent[client_id] += len(frames[i])
-                    manager.total_silent_frames[client_id] += 1
+                    silent_msg = json.dumps({"type": "silent"})
+                    await manager.send_personal_message(silent_msg, websocket)
 
-                manager.wav_queue[client_id].append(frames[i])
-                audio_len = (len(manager.wav_queue[client_id]) * frame_size) / sample_rate
-                audio_len_ms = audio_len * 1000
-                silent_len = (manager.total_silent[client_id] / sample_rate) * 1000
+                manager.last_timestamp[client_id] += audio_len
+                manager.total_silent[client_id] = 0
+                manager.total_silent_frames[client_id] = 0
+                manager.total_frames[client_id] = 0
+                manager.wav_queue[client_id] = []
+
+        await asyncio.sleep(0)
+
+    async def _flush_remaining():
+        """Process any remaining audio in the queue after client signals done."""
+        if client_id not in manager.wav_queue:
+            return
+        remaining = manager.wav_queue[client_id]
+        if remaining:
+            wav_data = np.concatenate(remaining)
+            if len(wav_data) > 0:
                 negative_ratio = (
                     manager.total_silent_frames[client_id] / manager.total_frames[client_id]
                     if manager.total_frames[client_id] > 0
                     else 0
                 )
+                if negative_ratio <= reject_segment_vad_ratio:
+                    last_ts = manager.last_timestamp[client_id]
+                    task = asyncio.create_task(
+                        _transcribe_and_send(wav_data, last_ts)
+                    )
+                    manager.pending_tasks[client_id].append(task)
+                else:
+                    silent_msg = json.dumps({"type": "silent"})
+                    await manager.send_personal_message(silent_msg, websocket)
 
-                vad_trigger = (
-                    audio_len_ms >= minimum_trigger_vad_ms
-                    and silent_len >= minimum_silent_ms
-                )
+        # Wait for all pending transcription tasks to finish
+        pending = [t for t in manager.pending_tasks.get(client_id, []) if not t.done()]
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
 
-                if vad_trigger or audio_len >= maxlen:
-                    if negative_ratio <= reject_segment_vad_ratio:
-                        wav_data = np.concatenate(manager.wav_queue[client_id])
-                        last_ts = manager.last_timestamp[client_id]
-
-                        try:
-                            texts, detected_language = await transcribe_chunk(
-                                wav_data=wav_data,
-                                language=language,
-                                timestamp_granularities="segment",
-                                last_timestamp=last_ts,
-                                response_format="text",
-                            )
-                        except HTTPException as e:
-                            error_msg = json.dumps({"error": e.detail})
-                            await manager.send_personal_message(error_msg, websocket)
-                            texts = ""
-
-                        if texts:
-                            segments = parse_segments(texts)
-                            if segments:
-                                result = json.dumps({
-                                    "type": "transcription",
-                                    "language": detected_language,
-                                    "segments": segments,
-                                })
-                            else:
-                                clean_text = re.sub(pattern, "", texts).strip()
-                                result = json.dumps({
-                                    "type": "transcription",
-                                    "language": detected_language,
-                                    "text": clean_text,
-                                })
-                            await manager.send_personal_message(result, websocket)
-                    else:
-                        silent_msg = json.dumps({"type": "silent"})
-                        await manager.send_personal_message(silent_msg, websocket)
-
-                    manager.last_timestamp[client_id] += audio_len
-                    manager.total_silent[client_id] = 0
-                    manager.total_silent_frames[client_id] = 0
-                    manager.total_frames[client_id] = 0
-                    manager.wav_queue[client_id] = []
-
-            await asyncio.sleep(0)
+    try:
+        while True:
+            msg = await websocket.receive()
+            if msg["type"] == "websocket.receive":
+                if "bytes" in msg and msg["bytes"]:
+                    await _process_audio_data(msg["bytes"])
+                elif "text" in msg and msg["text"]:
+                    try:
+                        text_data = json.loads(msg["text"])
+                        if text_data.get("type") == "end":
+                            logger.info(f"WebSocket client {client_id} signalled end of audio")
+                            await _flush_remaining()
+                            await websocket.close()
+                            break
+                    except json.JSONDecodeError:
+                        pass
+            elif msg["type"] == "websocket.disconnect":
+                break
 
     except WebSocketDisconnect:
         logger.info(f"WebSocket client {client_id} disconnected")
-        manager.disconnect(client_id)
     except Exception as e:
         logger.error(f"WebSocket error for client {client_id}: {e}")
+    finally:
+        disconnected.set()
         manager.disconnect(client_id)

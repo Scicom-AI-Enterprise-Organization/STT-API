@@ -279,6 +279,9 @@
             }
 
             if (ws) {
+                if (ws.readyState === WebSocket.OPEN) {
+                    ws.send(JSON.stringify({type: 'end'}));
+                }
                 ws.close();
                 ws = null;
             }

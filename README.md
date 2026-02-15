@@ -524,11 +524,20 @@ The `stress_test.py` script benchmarks API performance under concurrent load.
 # Run with default settings (50 concurrent requests, no diarization)
 docker compose -f stress-test.yaml run --rm stress-test
 
+# Run with default settings with 100 concurrency
+docker compose -f stress-test.yaml run --rm -e CONCURRENCY=100 stress-test
+
 # Run with default settings for websocket (50 concurrent requests, no diarization)
 docker compose -f stress-test-ws.yaml run --rm stress-test-ws
 
 # Run with default settings for websocket with 100 concurrency
 docker compose -f stress-test-ws.yaml run --rm -e CONCURRENCY=100 stress-test-ws
+
+# Run with default settings for cancellation (50 concurrent requests, no diarization)
+docker compose -f stress-test-cancel.yaml run --rm stress-test-cancel
+
+# Run with default settings for websocket cancellation (50 concurrent requests, no diarization)
+docker compose -f stress-test-ws-cancel.yaml run --rm stress-test-ws-cancel
 
 # Run with online diarization
 docker compose run --rm -e DIARIZATION_MODE=online stress-test
@@ -565,6 +574,19 @@ docker compose run --rm -e AUDIO_FILE=/app/test_audio/custom.mp3 stress-test
 Based on single RTX 3090 Ti,
 
 ```
+Loading audio file: /app/test_audio/masak.mp3
+Audio duration: 144.94s
+API URL: http://stt-api:9091
+Diarization mode: none
+
+--- Warmup (3 requests) ---
+  Warmup 1: 1.276s ✓
+  Warmup 2: 1.245s ✓
+  Warmup 3: 1.325s ✓
+
+--- Running Stress Test (100 concurrent requests) ---
+Completed in 96.898s
+
 ==================================================
 STT-API STRESS TEST REPORT
 ==================================================
@@ -572,35 +594,36 @@ STT-API STRESS TEST REPORT
 --- Test Configuration ---
 Concurrency: 100
 Audio Duration: 144.94s
-Diarization: online
-  Speaker Similarity: 0.75
-  Max Speakers: 10
+Diarization: none
 Total Requests: 100
 Successful: 100
 Failed: 0
 Success Rate: 100.0%
 
 --- Latency Report ---
-Min Time: 7.320s
-Max Time: 192.346s
-Avg Time: 94.513s
-P50 (Median): 97.060s
-P90: 158.926s
-P95: 167.154s
-P99: 171.979s
+Min Time: 11.254s
+Max Time: 96.897s
+Avg Time: 54.397s
+P50 (Median): 54.369s
+P90: 91.091s
+P95: 95.709s
+P99: 96.852s
 
 --- Real-Time Factor (RTF) Report ---
 (RTF < 1.0 means faster than real-time)
-Min RTF: 0.051
-Max RTF: 1.327
-Avg RTF: 0.652
-P50 RTF: 0.670
-P90 RTF: 1.096
+Min RTF: 0.078
+Max RTF: 0.669
+Avg RTF: 0.375
+P50 RTF: 0.375
+P90 RTF: 0.628
+P95 RTF: 0.660
+P99 RTF: 0.668
 
 --- Throughput ---
-Total Wall Time: 192.346s
-Requests/second: 0.52
-Audio seconds processed/second: 75.36
+Total Wall Time: 96.897s
+Requests/second: 1.03
+Audio seconds processed/second: 149.58
+
 ==================================================
 ```
 
@@ -609,7 +632,6 @@ Audio seconds processed/second: 75.36
 Based on single RTX 3090 Ti,
 
 ```
-Using WebSocket library: websockets
 Loading audio file: /app/test_audio/masak.mp3
 Audio duration: 144.94s
 Audio samples: 2318976
@@ -617,12 +639,12 @@ API URL: http://stt-api:9091
 WebSocket URL: ws://stt-api:9091/ws?language=ms
 
 --- Warmup (3 clients) ---
-  Warmup 1: 2.745s, 9 segments, TTFT: 0.174s [ok]
-  Warmup 2: 2.790s, 10 segments, TTFT: 0.089s [ok]
-  Warmup 3: 2.773s, 10 segments, TTFT: 0.091s [ok]
+  Warmup 1: 1.312s, 9 segments, TTFT: 0.167s [ok]
+  Warmup 2: 1.273s, 9 segments, TTFT: 0.153s [ok]
+  Warmup 3: 1.289s, 9 segments, TTFT: 0.153s [ok]
 
 --- Running Stress Test (100 concurrent clients) ---
-Completed in 81.041s
+Completed in 66.398s
 
 ============================================================
 STT-API WEBSOCKET STRESS TEST REPORT
@@ -634,50 +656,42 @@ Audio Duration: 144.94s
 Language: ms
 Chunk Size: 100ms
 Total Clients: 100
-Successful: 91
-Failed: 9
-Success Rate: 91.0%
-
---- Failed Clients ---
-  Client 4: None
-  Client 5: None
-  Client 9: None
-  Client 12: None
-  Client 15: None
-  ... and 4 more
+Successful: 100
+Failed: 0
+Success Rate: 100.0%
 
 --- Total Session Time ---
-Min: 8.913s
-Max: 71.009s
-Avg: 36.843s
-P50: 37.112s
-P90: 70.640s
-P95: 70.698s
-P99: 71.009s
+Min: 49.259s
+Max: 66.308s
+Avg: 61.027s
+P50: 62.617s
+P90: 66.037s
+P95: 66.240s
+P99: 66.251s
 
 --- Time to First Transcription (TTFT) ---
-Min: 8.604s
-Max: 15.076s
-Avg: 10.903s
-P50: 10.772s
-P90: 12.962s
+Min: 8.576s
+Max: 27.832s
+Avg: 12.514s
+P50: 10.997s
+P90: 17.927s
 
 --- Segments ---
-Total Transcription Segments: 568
-Total Silent Segments: 728
-Avg Segments/Client: 6.2
+Total Transcription Segments: 1183
+Total Silent Segments: 802
+Avg Segments/Client: 11.8
 
 --- Real-Time Factor (RTF) ---
 (RTF < 1.0 means faster than real-time)
-Min RTF: 0.061
-Max RTF: 0.490
-Avg RTF: 0.254
-P50 RTF: 0.256
+Min RTF: 0.340
+Max RTF: 0.457
+Avg RTF: 0.421
+P50 RTF: 0.432
 
 --- Throughput ---
-Total Wall Time: 71.009s
-Clients/second: 1.28
-Audio seconds processed/second: 185.75
+Total Wall Time: 66.308s
+Clients/second: 1.51
+Audio seconds processed/second: 218.59
 
 ============================================================
 ```

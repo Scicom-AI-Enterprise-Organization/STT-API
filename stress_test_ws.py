@@ -70,47 +70,66 @@ async def stream_ws_websockets(audio_data: np.ndarray, client_id: int) -> dict:
     first_transcription_time = None
     last_message_time = None
 
-    try:
-        async with websockets.connect(ws_url) as ws:
-            receive_task = None
-            done_sending = asyncio.Event()
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            async with websockets.connect(
+                ws_url,
+                open_timeout=30,
+                close_timeout=10,
+                max_size=2**23,
+            ) as ws:
+                receive_task = None
+                done_sending = asyncio.Event()
 
-            async def receiver():
-                nonlocal segments_received, silent_count, first_transcription_time, last_message_time
-                try:
-                    while True:
-                        msg = await asyncio.wait_for(ws.recv(), timeout=10.0)
-                        last_message_time = time.time()
-                        data = json.loads(msg)
-                        if data.get("type") == "transcription":
-                            if first_transcription_time is None:
-                                first_transcription_time = time.time()
-                            segs = data.get("segments", [])
-                            segments_received += len(segs) if segs else 1
-                            results.append(data)
-                        elif data.get("type") == "silent":
-                            silent_count += 1
-                        elif data.get("error"):
-                            results.append(data)
-                except asyncio.TimeoutError:
-                    pass
-                except websockets.exceptions.ConnectionClosed:
-                    pass
+                async def receiver():
+                    nonlocal segments_received, silent_count, first_transcription_time, last_message_time
+                    try:
+                        while True:
+                            msg = await asyncio.wait_for(ws.recv(), timeout=60.0)
+                            last_message_time = time.time()
+                            data = json.loads(msg)
+                            if data.get("type") == "transcription":
+                                if first_transcription_time is None:
+                                    first_transcription_time = time.time()
+                                segs = data.get("segments", [])
+                                segments_received += len(segs) if segs else 1
+                                results.append(data)
+                            elif data.get("type") == "silent":
+                                silent_count += 1
+                            elif data.get("error"):
+                                results.append(data)
+                    except asyncio.TimeoutError:
+                        pass
+                    except websockets.exceptions.ConnectionClosed:
+                        pass
 
-            receive_task = asyncio.create_task(receiver())
+                receive_task = asyncio.create_task(receiver())
 
-            offset = 0
-            while offset < len(audio_data):
-                end = min(offset + chunk_samples, len(audio_data))
-                chunk = audio_data[offset:end]
-                await ws.send(chunk.tobytes())
-                offset = end
-                await asyncio.sleep(0.0)
+                offset = 0
+                while offset < len(audio_data):
+                    end = min(offset + chunk_samples, len(audio_data))
+                    chunk = audio_data[offset:end]
+                    await ws.send(chunk.tobytes())
+                    offset = end
+                    await asyncio.sleep(0.0)
 
-            await receive_task
+                # Signal end of audio so server flushes remaining and closes
+                await ws.send(json.dumps({"type": "end"}))
 
-    except Exception as e:
-        error_msg = str(e)
+                await receive_task
+
+            break  # success, exit retry loop
+
+        except (ConnectionRefusedError, OSError, websockets.exceptions.InvalidHandshake) as e:
+            if attempt < max_retries - 1:
+                wait = (attempt + 1) * 2
+                await asyncio.sleep(wait)
+            else:
+                error_msg = f"Failed after {max_retries} retries: {e}"
+        except Exception as e:
+            error_msg = str(e)
+            break
 
     end_time = last_message_time if last_message_time else time.time()
     total_time = end_time - start_time
@@ -227,14 +246,6 @@ def print_report(results: list, audio_duration: float, concurrency: int):
 
 
 async def main():
-    if websockets is None and aiohttp is None:
-        print("Error: Either 'websockets' or 'aiohttp' must be installed")
-        print("  pip install websockets  OR  pip install aiohttp")
-        return
-
-    lib = "websockets" if websockets is not None else "aiohttp"
-    print(f"Using WebSocket library: {lib}")
-
     print(f"Loading audio file: {AUDIO_FILE}")
     if not os.path.exists(AUDIO_FILE):
         print(f"Error: Audio file not found: {AUDIO_FILE}")
