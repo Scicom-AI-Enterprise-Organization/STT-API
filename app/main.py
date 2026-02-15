@@ -1192,3 +1192,36 @@ async def websocket_stt(
     finally:
         disconnected.set()
         manager.disconnect(client_id)
+
+if ENABLE_FORCE_ALIGNMENT:
+    from app.force_alignment.model import queue_force_align, load_global_alignment_model, step
+
+    load_global_alignment_model()
+
+    @app.post("/force_align")
+    async def force_align(
+        file: bytes = File(..., description="Audio 30 seconds chunk (WAV, mp3)"),
+        language: str = Form(..., description="Language code (e.g., 'en', 'es')"),
+        transcript: str = Form(..., description="Transcript text"),
+    ):
+        try:
+            result = await queue_force_align(file, transcript, language)
+            return result
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+
+    _step_task: asyncio.Task = None
+
+    @app.on_event("startup")
+    async def _start_force_alignment_step():
+        global _step_task
+        _step_task = asyncio.create_task(step())
+
+    @app.on_event("shutdown")
+    async def _stop_force_alignment_step():
+        if _step_task is not None:
+            _step_task.cancel()
+            try:
+                await _step_task
+            except asyncio.CancelledError:
+                pass
