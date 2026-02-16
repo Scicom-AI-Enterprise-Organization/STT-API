@@ -1,4 +1,4 @@
-# stt-api
+# STT-API
 
 Long-form speech-to-text API that:
 
@@ -6,6 +6,8 @@ Long-form speech-to-text API that:
 - **Keeps global timestamps** across all chunks
 - **Transcribes chunks concurrently** for improved performance
 - **Proxies to an upstream STT engine** via an OpenAI-compatible `/v1/audio/transcriptions` endpoint
+- **Real-time WebSocket streaming** with per-client VAD and live transcription
+- **Force alignment** for word-level timestamps using CTC alignment (MMS-300M) with dynamic batching
 - **Speaker diarization** with online (TitaNet + StreamingKMeans + CUDA Streams) or offline (pyannote) modes
 
 ---
