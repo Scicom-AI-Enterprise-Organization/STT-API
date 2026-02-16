@@ -1007,7 +1007,7 @@ async def websocket_stt(
 ):
     client_id = str(id(websocket))
     await manager.connect(websocket, client_id=client_id)
-    logger.info(f"WebSocket client {client_id} connected")
+    logger.debug(f"WebSocket client {client_id} connected")
 
     loop = asyncio.get_event_loop()
     executor = get_vad_executor()
@@ -1200,15 +1200,34 @@ if ENABLE_FORCE_ALIGNMENT:
 
     @app.post("/force_align")
     async def force_align(
+        request: Request,
         file: bytes = File(..., description="Audio 30 seconds chunk (WAV, mp3)"),
         language: str = Form(..., description="Language code (e.g., 'en', 'es')"),
         transcript: str = Form(..., description="Transcript text"),
     ):
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future = loop.create_future()
+        await queue_force_align(fut, file, transcript, language)
+
+        async def _monitor_disconnect():
+            while not fut.done():
+                await asyncio.sleep(0.5)
+                if await request.is_disconnected():
+                    logger.info("Force align client disconnected, cancelling request")
+                    fut.cancel()
+                    return
+
+        monitor = asyncio.create_task(_monitor_disconnect())
         try:
-            result = await queue_force_align(file, transcript, language)
+            result = await fut
             return result
+        except asyncio.CancelledError:
+            logger.info("Force align request cancelled (client disconnected)")
+            return {"words_alignment": [], "length": 0}
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
+        finally:
+            monitor.cancel()
 
     _step_task: asyncio.Task = None
 

@@ -21,13 +21,14 @@ from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 import numpy as np
 
 SAMPLING_FREQ = 16000
-DYNAMIC_BATCHING_BATCH_SIZE = 32
-DYNAMIC_BATCHING_MICROSLEEP = 1e-4
+
+DYNAMIC_BATCHING_BATCH_SIZE = int(os.environ.get('DYNAMIC_BATCHING_BATCH_SIZE', 8))
+DYNAMIC_BATCHING_MICROSLEEP = float(os.environ.get('DYNAMIC_BATCHING_MICROSLEEP', 1e-4))
 DEFAULT_CPU_COUNTS = 6
 MODEL_COUNTER = 0
 ALIGNMENT_MODEL = None
 DEVICE = None
-
+DTYPE = None
 
 step_queue = asyncio.Queue()
 _process_pool = None
@@ -42,15 +43,6 @@ def get_gpu_thread_pool():
     if _gpu_thread_pool is None:
         _gpu_thread_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="gpu-align")
     return _gpu_thread_pool
-
-def get_model_for_inference():
-    global ALIGNMENT_MODELS, MODEL_COUNTER
-    if ALIGNMENT_MODELS is None or len(ALIGNMENT_MODELS) == 0:
-        return ALIGNMENT_MODELS
-    model_idx = MODEL_COUNTER % len(ALIGNMENT_MODELS)
-    MODEL_COUNTER += 1
-    return ALIGNMENT_MODELS[model_idx]
-
 
 def get_process_pool():
     global _process_pool
@@ -82,7 +74,7 @@ class Segment:
         return self.end - self.start
 
 def load_global_alignment_model():
-    global ALIGNMENT_MODEL, ALIGNMENT_TOKENIZER, DICTIONARY, DEVICE, ALIGNMENT_MODELS, DEVICE_LIST
+    global ALIGNMENT_MODEL, ALIGNMENT_TOKENIZER, DICTIONARY, DEVICE, DTYPE
 
     if DEVICE is None:
         DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -90,30 +82,11 @@ def load_global_alignment_model():
     dev = DEVICE
     print(f"Force alignment device: {dev}")
 
-    d = torch.float16 if dev == "cuda" else torch.float32
+    DTYPE = torch.float16 if dev == "cuda" else torch.float32
 
-    if dev == "cuda" and torch.cuda.device_count() > 1:
-        device_list = list(range(torch.cuda.device_count()))
-        ALIGNMENT_MODELS = []
-
-        for gpu_idx in device_list:
-            model, tokenizer = load_alignment_model(
-                device=f"cuda:{gpu_idx}",
-                dtype=d
-            )
-            # model = torch.compile(model, mode="reduce-overhead")
-            ALIGNMENT_MODELS.append(model)
-
-        ALIGNMENT_MODEL = ALIGNMENT_MODELS[0]
-        ALIGNMENT_TOKENIZER = tokenizer
-        DEVICE_LIST = device_list
-        print(f"Loaded {len(ALIGNMENT_MODELS)} models on GPUs: {device_list}")
-    else:
-        ALIGNMENT_MODEL, ALIGNMENT_TOKENIZER = load_alignment_model(dev, dtype=d)
-        # if dev == "cuda":
-        #     ALIGNMENT_MODEL = torch.compile(ALIGNMENT_MODEL, mode="reduce-overhead")
-        ALIGNMENT_MODELS = [ALIGNMENT_MODEL]
-        DEVICE_LIST = [0] if dev == "cuda" else []
+    ALIGNMENT_MODEL, ALIGNMENT_TOKENIZER = load_alignment_model(dev, dtype=DTYPE)
+    # if dev == "cuda":
+    #     ALIGNMENT_MODEL = torch.compile(ALIGNMENT_MODEL, mode="reduce-overhead")
 
     vocab = ALIGNMENT_TOKENIZER.get_vocab()
     vocab = {k: v for k, v in vocab.items()}
@@ -206,6 +179,10 @@ def merge_words(segments, separator='<star>'):
             i2 += 1
     return words
 
+def wav2vec2_lengths(L):
+    for k, s in [(10,5),(3,2),(3,2),(3,2),(3,2),(2,2),(2,2)]:
+        L = (L - k) // s + 1
+    return L
 
 def load_alignment_model(
     device: str = "cuda",
@@ -235,7 +212,6 @@ def load_alignment_model(
         .eval()
     )
     tokenizer = AutoTokenizer.from_pretrained(model_path)
-
     return model, tokenizer
 
 def time_to_frame(time):
@@ -243,132 +219,39 @@ def time_to_frame(time):
     frames_per_sec = 1000 / stride_msec
     return int(time * frames_per_sec)
 
-def to_1d(w: torch.Tensor) -> torch.Tensor:
-    if w.dim() == 1:
-        return w
-    if w.dim() == 2:
-        if w.size(0) == 1:
-            return w.squeeze(0)
-        if w.size(1) == 1:
-            return w.squeeze(1)
-    raise ValueError(
-        f"Expected 1D waveform or 'fake batch' [1, T]/[T, 1], got {tuple(w.shape)}"
-    )
+def generate_emissions(audio_waveforms, batch_size: int = 4, context_length = 2, window_length = 30):
+    context = context_length * SAMPLING_FREQ
+    window = window_length * SAMPLING_FREQ
 
-def generate_emissions(
-    model,
-    audio_waveform,  # list[torch.Tensor] (multi)
-    window_length: float = 30,
-    context_length: float = 2,
-    batch_size: int = 4,
-):
-
-    waveforms_1d = []
-    for w in audio_waveform:
-        if not isinstance(w, torch.Tensor):
-            raise TypeError("audio_waveform list must contain torch.Tensor elements")
-        waveforms_1d.append(to_1d(w))
-    window = int(window_length * SAMPLING_FREQ)
-    context_samples = int(context_length * SAMPLING_FREQ)
-
-    all_chunks = []  # list[Tensor[chunk_len]]
-    utt_meta = []    # per utterance metadata
-
-    for utt_idx, audio_1d in enumerate(waveforms_1d):
-        T = audio_1d.size(0)
-
-        context = context_samples
-        extension = max(0, math.ceil(T / window) * window - T)
-
+    new_batch = []
+    extentions = []
+    for i in range(len(audio_waveforms)):
+        audio_waveform = audio_waveforms[i]
+        extention = math.ceil(
+            audio_waveform.size(0) / window
+        ) * window - audio_waveform.size(0)
         padded_waveform = torch.nn.functional.pad(
-            audio_1d, (context, context + extension)
+            audio_waveform, (context, context + extention)
         )
+        input_tensor = padded_waveform.unfold(0, window + 2 * context, window)
+        new_batch.append(input_tensor[0])
+        extentions.append(extention)
+        
+    lens = [new_batch[i].shape[0] for i in range(len(new_batch))]
+    padded = torch.stack(new_batch).cuda().to(DTYPE)
 
-        chunks = padded_waveform.unfold(
-            0,
-            window + 2 * context,
-            window,
-        )
-
-        start_chunk = len(all_chunks)
-        for c in chunks:
-            all_chunks.append(c)
-        end_chunk = len(all_chunks)
-
-        utt_meta.append(
-            {
-                "utt_idx": utt_idx,
-                "start_chunk": start_chunk,
-                "end_chunk": end_chunk,
-                "context": context,
-                "extension": extension,
-                "orig_len": T,
-            }
-        )
-
-    if not all_chunks:
-        return [], []
-
-    chunks_tensor = torch.stack(all_chunks, dim=0)
-    
-    model_dtype = next(model.parameters()).dtype
-    chunks_tensor = chunks_tensor.to(dtype=model_dtype)
-
-    batch_size = max(batch_size, 1)
-    emissions_chunk_list = []
     with torch.inference_mode():
-        for i in range(0, chunks_tensor.size(0), batch_size):
-            input_batch = chunks_tensor[i : i + batch_size]  # [b_chunk, chunk_len]
-            out = model(input_batch)
-            emissions_ = out.logits  # [b_chunk, frames, vocab]
-            emissions_chunk_list.append(emissions_)
+        emissions_ = ALIGNMENT_MODEL(padded).logits
+    emissions = []
+    for i in range(emissions_.shape[0]):
+        e = emissions_[i][time_to_frame(context_length) : -time_to_frame(context_length) + 1]
+        if time_to_frame(extentions[i] / SAMPLING_FREQ) > 0:
+            e = e[: -time_to_frame(extentions[i] / SAMPLING_FREQ), :]
+        e = torch.log_softmax(e, dim=-1)
+        e = torch.cat([e, torch.zeros(e.size(0), 1).to(e.device)], dim=1)
+        emissions.append(e)
 
-    all_emissions = torch.cat(emissions_chunk_list, dim=0)  # [N_chunks_total, frames, vocab]
-
-    emissions_list: list[torch.Tensor] = []
-    stride_list: list[int] = []
-
-    for meta in utt_meta:
-        start = meta["start_chunk"]
-        end = meta["end_chunk"]
-        context = meta["context"]
-        extension = meta["extension"]
-        orig_len = meta["orig_len"]
-
-        emissions_i = all_emissions[start:end]
-
-        if context > 0:
-            left = time_to_frame(context_length)
-            right = -time_to_frame(context_length) + 1
-            emissions_i = emissions_i[:, left:right]
-
-        emissions_i = emissions_i.flatten(0, 1)  # [total_frames_i, vocab]
-
-        if extension > 0:
-            trim = time_to_frame(extension / SAMPLING_FREQ)
-            if trim > 0:
-                emissions_i = emissions_i[:-trim]
-
-        emissions_i = torch.log_softmax(emissions_i, dim=-1)
-        emissions_i = torch.cat(
-            [
-                emissions_i,
-                torch.zeros(
-                    emissions_i.size(0),
-                    1,
-                    device=emissions_i.device,
-                ),
-            ],
-            dim=1,
-        )  # [frames_i, vocab+1]
-
-        stride_i = float(
-            orig_len * 1000 / emissions_i.size(0) / SAMPLING_FREQ
-        )
-        stride_list.append(math.ceil(stride_i))
-        emissions_list.append(emissions_i)
-
-    return emissions_list, stride_list
+    return emissions
 
 
 def preprocess_text(
@@ -470,9 +353,7 @@ class AlignBatchItem(NamedTuple):
     transcript: str
     language: str
 
-def batch_emission(
-    batch_payloads: list[tuple[bytes, str, str]]
-):
+def batch_emission(batch_payloads: list[tuple[bytes, str, str]]):
     assert ALIGNMENT_MODEL is not None and DICTIONARY is not None
 
     waveforms_1d = []   # list[torch.Tensor[T]]
@@ -486,7 +367,7 @@ def batch_emission(
         wav_np, sr = librosa.load(file_like, sr=SAMPLING_FREQ, mono=True)
         wav_np = wav_np.astype(np.float32)
 
-        w = torch.from_numpy(wav_np).to(device=DEVICE, dtype=torch.float32)
+        w = torch.from_numpy(wav_np)
 
         waveforms_1d.append(w)
         wav_nps.append(wav_np)
@@ -494,22 +375,10 @@ def batch_emission(
         transcripts.append(transcript)
         languages.append(language)
 
-    dtype = torch.float16 if DEVICE == "cuda" else torch.float32
-    
-    model_to_use = get_model_for_inference()
-    
-    model_device = next(model_to_use.parameters()).device
-    waveforms_for_model = [w.to(device=model_device, dtype=dtype) for w in waveforms_1d]
-
-    emissions_list, _stride_list = generate_emissions(
-        model_to_use,  # Use the selected model
-        waveforms_for_model,
-        window_length=30,
-        context_length=2,
-        batch_size=4,
+    emissions_list = generate_emissions(
+        waveforms_1d,
+        batch_size=DYNAMIC_BATCHING_BATCH_SIZE,
     )
-    
-    # emissions_list[i]: Tensor[frames_i, vocab+1]
 
     batch_items = []
     for i in range(len(batch_payloads)):
@@ -589,11 +458,9 @@ async def step():
                     fut.set_exception(e)
 
 async def queue_force_align(
+    fut: asyncio.Future,
     audio_bytes: bytes,
     transcript: str,
     language: str = "eng",
 ):
-    loop = asyncio.get_running_loop()
-    fut: asyncio.Future = loop.create_future()
     await step_queue.put((fut, audio_bytes, transcript, language))
-    return await fut 

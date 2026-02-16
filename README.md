@@ -112,6 +112,7 @@ Long-form speech-to-text API that:
 | `/audio/transcriptions` | POST | Long audio transcription with VAD chunking |
 | `/streaming` | GET | WebSocket streaming demo page |
 | `/ws` | WebSocket | Real-time streaming transcription with VAD |
+| `/force_align` | POST | Force alignment (word-level timestamps from audio + transcript) |
 
 ---
 
@@ -421,6 +422,108 @@ curl -X POST "http://localhost:9091/audio/transcriptions" \
 
 ---
 
+## Force Alignment
+
+The `/force_align` endpoint produces word-level timestamps by aligning a known transcript to audio using CTC forced alignment (MMS-300M model).
+
+### How It Works
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│                         POST /force_align                            │
+│                  (audio file + transcript + language)                 │
+└──────────────────────────────────────────────────────────────────────┘
+                                │
+                                ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│                      Dynamic Batching Queue                          │
+│                                                                      │
+│  Incoming requests are queued and batched together                    │
+│  (DYNAMIC_BATCHING_BATCH_SIZE, default: 8)                          │
+│                                                                      │
+│  step() loop:                                                        │
+│    1. await first request                                            │
+│    2. collect more within DYNAMIC_BATCHING_MICROSLEEP window         │
+│    3. process batch                                                  │
+└──────────────────────────────────────────────────────────────────────┘
+                                │
+                    ┌───────────┴───────────┐
+                    ▼                       ▼
+┌────────────────────────────┐  ┌──────────────────────────────────────┐
+│  GPU: Batch Emission       │  │  CPU: Postprocessing (parallel)      │
+│  (ThreadPoolExecutor)      │  │  (ProcessPoolExecutor)               │
+│                            │  │                                      │
+│  1. librosa.load → 16kHz   │  │  Per utterance:                      │
+│  2. Window + pad audio     │  │  1. Text normalization + romanization│
+│  3. Model forward pass     │  │  2. Viterbi trellis alignment        │
+│  4. log_softmax + star col │  │  3. Backtrack + merge segments       │
+│                            │  │  4. Word-level timestamps            │
+│                            │  │                                      │
+│                            │  │                                      │
+└────────────────────────────┘  └──────────────────────────────────────┘
+                                │
+                                ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│                          Response                                    │
+│  {                                                                   │
+│    "words_alignment": [                                              │
+│      {"text": "Yes", "start": 0.12, "end": 0.38, "score": 0.95},   │
+│      {"text": "sir", "start": 0.38, "end": 0.62, "score": 0.91},   │
+│      ...                                                             │
+│    ],                                                                │
+│    "length": 2.78                                                    │
+│  }                                                                   │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+### Request Parameters
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `file` | file | required | Audio file (WAV, mp3, etc.) - ideally 30s chunks |
+| `language` | string | required | Language code (e.g., `eng`, `ms`, `chi`, `ta`) |
+| `transcript` | string | required | Known transcript text to align |
+
+### Example
+
+```bash
+curl -X POST "http://localhost:9091/force_align" \
+  -F "file=@audio.mp3" \
+  -F "language=eng" \
+  -F "transcript=Yes sir, what can I help you?"
+```
+
+### Response
+
+```json
+{
+  "words_alignment": [
+    {"text": "Yes", "start": 0.12, "end": 0.38, "start_t": 6, "end_t": 19, "score": 0.95},
+    {"text": "sir,", "start": 0.38, "end": 0.62, "start_t": 19, "end_t": 31, "score": 0.91},
+    {"text": "what", "start": 0.7, "end": 0.88, "start_t": 35, "end_t": 44, "score": 0.88},
+    {"text": "can", "start": 0.88, "end": 1.06, "start_t": 44, "end_t": 53, "score": 0.92},
+    {"text": "I", "start": 1.06, "end": 1.14, "start_t": 53, "end_t": 57, "score": 0.97},
+    {"text": "help", "start": 1.14, "end": 1.36, "start_t": 57, "end_t": 68, "score": 0.94},
+    {"text": "you?", "start": 1.36, "end": 1.62, "start_t": 68, "end_t": 81, "score": 0.89}
+  ],
+  "length": 2.78
+}
+```
+
+### Configuration
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ENABLE_FORCE_ALIGNMENT` | true | Load alignment model at startup |
+| `DYNAMIC_BATCHING_BATCH_SIZE` | 8 | Max requests per GPU batch |
+| `DYNAMIC_BATCHING_MICROSLEEP` | 1e-4 | Collection window for batching (seconds) |
+
+### Client Disconnect Handling
+
+If a client disconnects while waiting for alignment results, the server cancels the pending future so the batching loop skips it, avoiding wasted GPU computation.
+
+---
+
 ## Testing
 
 ### Quick Reference
@@ -532,6 +635,12 @@ docker compose -f stress-test-ws.yaml run --rm stress-test-ws
 
 # Run with default settings for websocket with 100 concurrency
 docker compose -f stress-test-ws.yaml run --rm -e CONCURRENCY=100 stress-test-ws
+
+# Run with default settings for force alignment (50 concurrent requests)
+docker compose -f stress-test-force-alignment.yaml run --rm stress-test-force-alignment
+
+# Run with default settings for force alignment (50 concurrent requests)
+docker compose -f stress-test-force-alignment.yaml run --rm -e CONCURRENCY=100 stress-test-force-alignment
 
 # Run with default settings for cancellation (50 concurrent requests, no diarization)
 docker compose -f stress-test-cancel.yaml run --rm stress-test-cancel
@@ -696,6 +805,76 @@ Audio seconds processed/second: 218.59
 ============================================================
 ```
 
+### Sample Output Force Alignment
+
+Based on single RTX 3090 Ti,
+
+```
+API URL: http://stt-api:9091
+Loading audio files...
+Loaded 4 audio-transcript pairs:
+  husein-chinese.mp3: 2.68s [chi] "是的先生，我能帮您什么吗?"
+  husein-english.mp3: 2.78s [eng] "Yes sir, what can I help you?"
+  husein-tamil.mp3: 2.80s [ta] "ஆமா ஐயா, நான் உங்களுக்கு என்ன உதவி செய்ய வேண்டும்?"
+  husein-malay.mp3: 2.24s [ms] "Ya encik, apa yang saya boleh tolong?"
+
+--- Warmup (3 requests) ---
+  Warmup 1 (husein-chinese.mp3): 0.132s, 12 words [ok]
+  Warmup 2 (husein-english.mp3): 0.051s, 7 words [ok]
+  Warmup 3 (husein-tamil.mp3): 0.052s, 8 words [ok]
+
+--- Running Stress Test (100 concurrent requests) ---
+Completed in 4.041s
+
+============================================================
+FORCE ALIGNMENT STRESS TEST REPORT
+============================================================
+
+--- Test Configuration ---
+Concurrency: 100
+Audio Files: 4
+  husein-chinese.mp3: 2.68s (chi)
+  husein-english.mp3: 2.78s (eng)
+  husein-tamil.mp3: 2.80s (ta)
+  husein-malay.mp3: 2.24s (ms)
+Avg Audio Duration: 2.62s
+Total Requests: 100
+Successful: 100
+Failed: 0
+Success Rate: 100.0%
+
+--- Latency Report ---
+Min: 0.162s
+Max: 4.038s
+Avg: 2.178s
+P50: 2.220s
+P90: 3.719s
+P95: 4.031s
+P99: 4.036s
+
+--- Real-Time Factor (RTF) ---
+(RTF < 1.0 means faster than real-time)
+Min RTF: 0.062
+Max RTF: 1.538
+Avg RTF: 0.830
+P50 RTF: 0.846
+P90 RTF: 1.417
+P95 RTF: 1.536
+P99 RTF: 1.537
+
+--- Alignment Stats ---
+Total Words Aligned: 850
+Total Audio Aligned: 262.50s
+Avg Words/Request: 8.5
+
+--- Throughput ---
+Total Wall Time: 4.038s
+Requests/second: 24.76
+Audio seconds aligned/second: 65.00
+
+============================================================
+```
+
 ### Key Metrics
 
 | Metric | Description |
@@ -824,6 +1003,14 @@ VAD RTF (lower is better):
 | `OMP_NUM_THREADS` | 2 | OpenMP threads per process |
 | `OPENBLAS_NUM_THREADS` | 2 | OpenBLAS threads per process |
 | `MKL_NUM_THREADS` | 2 | Intel MKL threads per process |
+
+### Force Alignment Configuration
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ENABLE_FORCE_ALIGNMENT` | true | Load MMS alignment model at startup |
+| `DYNAMIC_BATCHING_BATCH_SIZE` | 8 | Max requests batched per GPU forward pass |
+| `DYNAMIC_BATCHING_MICROSLEEP` | 1e-4 | Time window to collect requests before processing (seconds) |
 
 ### Diarization Configuration
 

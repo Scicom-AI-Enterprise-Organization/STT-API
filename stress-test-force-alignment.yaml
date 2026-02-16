@@ -1,0 +1,33 @@
+services:
+  stress-test-force-alignment:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: stt-stress-test-force-alignment
+    volumes:
+      - "./stress_test_force_alignment.py:/app/stress_test_force_alignment.py"
+      - "./test_audio:/app/test_audio"
+      - stt-venv:/app/.venv
+    environment:
+      - PYTHONUNBUFFERED=1
+      - STT_API_URL=http://stt-api:9091
+      - AUDIO_FILE=/app/test_audio/masak.mp3
+      - CONCURRENCY=50
+      - WARMUP_COUNT=3
+      # Diarization config (none, online, offline)
+      - DIARIZATION_MODE=none
+      - SPEAKER_SIMILARITY=0.75
+      - SPEAKER_MAX_N=10
+    working_dir: /app
+    command: uv run python stress_test_force_alignment.py
+    networks:
+      - stt-network
+    profiles:
+      - test
+
+networks:
+  stt-network:
+    external: true
+
+volumes:
+  stt-venv:

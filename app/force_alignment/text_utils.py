@@ -189,7 +189,7 @@ def preprocess_text(
         "segment",
         "edges",
     ], "Star frequency must be segment or edges"
-    if language in ["jpn", "chi"]:
+    if language in ["jpn", "chi", "zh"]:
         split_size = "char"
     text_split = split_text(text, split_size)
     norm_text = [text_normalize(line.strip(), language) for line in text_split]
