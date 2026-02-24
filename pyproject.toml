@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "stt-api"
 version = "0.1.0"
@@ -18,7 +22,10 @@ dependencies = [
     "six",
     "uroman",
     "Unidecode",
-    "transformers>=4.57.6"
+    "transformers>=4.57.6",
+    "kaldiio==2.18.0",
+    "kaldi_native_fbank==1.15",
+    "setuptools==80.10.2"
 ]
 
 [project.optional-dependencies]
@@ -35,3 +42,6 @@ testpaths = ["tests"]
 python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
+
+[tool.setuptools]
+packages = ["stt_api"]

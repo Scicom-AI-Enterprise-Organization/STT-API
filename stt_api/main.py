@@ -51,6 +51,7 @@ ENABLE_FORCE_ALIGNMENT = os.environ.get("ENABLE_FORCE_ALIGNMENT", "true").lower(
 
 _vad_executor = None
 _diarization_executor = None
+_firered_vad_model = None
 
 sample_rate = SAMPLE_RATE
 maxlen = MAX_CHUNK_LENGTH
@@ -65,6 +66,108 @@ pattern = r"<\|\-?\d+\.?\d*\|>"
 pattern_unified = r"(?:<\|speaker:(\d+)\|>)?<\|(\d+\.\d+)\|>(.*?)<\|(\d+\.\d+)\|>"
 
 _worker_silero = None
+
+
+def float32_to_int16(audio: np.ndarray) -> np.ndarray:
+    audio = audio.astype(np.float32)
+    audio = np.clip(audio, -1.0, 1.0)
+    return (audio * 32767.0).astype(np.int16)
+
+
+def get_firered_vad():
+    global _firered_vad_model
+    if _firered_vad_model is None:
+        try:
+            from stt_api.vad.fireredvad import FireRedStreamVad, FireRedStreamVadConfig
+            vad_config = FireRedStreamVadConfig(
+                use_gpu=False,
+                smooth_window_size=5,
+                speech_threshold=0.4,
+                pad_start_frame=5,
+                min_speech_frame=8,
+                max_speech_frame=2000,
+                min_silence_frame=20,
+                chunk_max_frame=30000,
+            )
+            _firered_vad_model = FireRedStreamVad.from_pretrained(config=vad_config)
+            logger.info("FireRedVAD model loaded")
+        except Exception as e:
+            raise HTTPException(
+                status_code=503, detail=f"FireRedVAD unavailable: {str(e)}"
+            )
+    return _firered_vad_model
+
+
+def vad_firered(
+    audio_data: np.ndarray,
+    sample_rate: int,
+    maxlen: float,
+) -> List[Tuple]:
+    """
+    Process audio with FireRedVAD.
+
+    Args:
+        audio_data: Audio data as float32 numpy array
+        sample_rate: Sample rate (must be 16000)
+        maxlen: Maximum chunk length in seconds
+
+    Returns:
+        List of (wav_data, start_ts, end_ts, silence_ratio) tuples
+    """
+    from stt_api.vad.fireredvad import FireRedStreamVad
+    from stt_api.vad.fireredvad.stream_vad_postprocessor import StreamVadPostprocessor
+
+    model = get_firered_vad()
+    audio_int16 = float32_to_int16(audio_data)
+
+    feats, dur = model.audio_feat.extract(audio_int16)
+
+    with torch.no_grad():
+        probs, _ = model.vad_model.forward(feats.unsqueeze(0))
+    # probs: [1, num_frames, 1]
+    probs = probs[0, :, 0]
+
+    # Create a local postprocessor per call — model.postprocessor is shared
+    # mutable state and not safe to reuse across concurrent requests.
+    cfg = model.config
+    postprocessor = StreamVadPostprocessor(
+        cfg.smooth_window_size,
+        cfg.speech_threshold,
+        cfg.pad_start_frame,
+        cfg.min_speech_frame,
+        cfg.max_speech_frame,
+        cfg.min_silence_frame,
+    )
+    results = []
+    for i in range(len(probs)):
+        result = postprocessor.process_one_frame(float(probs[i]))
+        results.append(result)
+
+    timestamps = FireRedStreamVad.results_to_timestamps(results)
+    logger.info(f"FireRedVAD detected {len(timestamps)} speech segments in {dur:.2f}s audio")
+
+    if not timestamps:
+        return [(audio_data.copy(), 0.0, dur, 1.0)]
+
+    chunks = []
+    for start_t, end_t in timestamps:
+        start_sample = int(start_t * sample_rate)
+        end_sample = min(int(end_t * sample_rate), len(audio_data))
+        seg_dur = end_t - start_t
+
+        if seg_dur <= maxlen:
+            chunks.append((audio_data[start_sample:end_sample], start_t, end_t, 0.0))
+        else:
+            # Split long segment at maxlen boundaries
+            t = start_t
+            while t < end_t:
+                chunk_end_t = min(t + maxlen, end_t)
+                s = int(t * sample_rate)
+                e = min(int(chunk_end_t * sample_rate), len(audio_data))
+                chunks.append((audio_data[s:e], t, chunk_end_t, 0.0))
+                t = chunk_end_t
+
+    return chunks
 
 
 def init_vad_worker():
@@ -636,6 +739,7 @@ async def audio_transcriptions(
     diarization: str = Form("none"),  # none | online | offline
     speaker_similarity: float = Form(0.5),
     speaker_max_n: int = Form(5),
+    vad: str = Form("silero"),  # silero | firered
 ):
     """
     Long audio transcription API with VAD chunking.
@@ -650,6 +754,7 @@ async def audio_transcriptions(
     - diarization: 'none', 'online', or 'offline'
     - speaker_similarity: Cosine similarity threshold for online diarization
     - speaker_max_n: Maximum speakers for online diarization
+    - vad: VAD backend to use: 'silero' (default) or 'firered'
     """
     async with request_semaphore:
         return await _process_transcription(
@@ -663,6 +768,7 @@ async def audio_transcriptions(
             diarization=diarization,
             speaker_similarity=speaker_similarity,
             speaker_max_n=speaker_max_n,
+            vad=vad,
         )
 
 
@@ -677,10 +783,11 @@ async def _process_transcription(
     diarization: str = "none",
     speaker_similarity: float = 0.3,
     speaker_max_n: int = 10,
+    vad: str = "silero",
 ):
     """Internal transcription processing (wrapped by request semaphore)."""
     t_total_start = time.time()
-    logger.info(f"Request: language={language}, diarization={diarization}")
+    logger.info(f"Request: language={language}, diarization={diarization}, vad={vad}")
 
     if language is None:
         language = "null"
@@ -703,6 +810,12 @@ async def _process_transcription(
     if diarization not in {"none", "online", "offline"}:
         raise HTTPException(
             status_code=400, detail="diarization only supports: none, online, offline"
+        )
+
+    vad = vad.lower().strip()
+    if vad not in {"silero", "firered"}:
+        raise HTTPException(
+            status_code=400, detail="vad only supports: silero, firered"
         )
 
     if diarization == "online":
@@ -734,15 +847,18 @@ async def _process_transcription(
     try:
         # Phase 2: VAD chunking
         t_vad_start = time.time()
-        logger.info(f"Phase 1: VAD chunking (parallel, {VAD_WORKERS} workers)...")
-        chunks = vad_parallel(
-            audio_data=audio_data,
-            sample_rate=sample_rate,
-            frame_size=frame_size,
-            maxlen=maxlen,
-            minimum_silent_ms=minimum_silent_ms,
-            minimum_trigger_vad_ms=minimum_trigger_vad_ms,
-        )
+        if vad == "firered":
+            logger.info("Phase 1: VAD chunking (FireRedVAD)...")
+            chunks = await asyncio.to_thread(
+                vad_firered, audio_data, sample_rate, maxlen
+            )
+        else:
+            logger.info(f"Phase 1: VAD chunking (Silero parallel, {VAD_WORKERS} workers)...")
+            chunks = await asyncio.to_thread(
+                vad_parallel,
+                audio_data, sample_rate, frame_size, maxlen,
+                minimum_silent_ms, minimum_trigger_vad_ms,
+            )
         logger.info(
             f"⏱️ Phase 1 complete: {len(chunks)} chunks created in {time.time() - t_vad_start:.2f}s"
         )
@@ -946,6 +1062,75 @@ def process_vad_frames(args: Tuple) -> List[Tuple[bool, float]]:
     return results
 
 
+class FireRedStreamState:
+    """Per-client streaming VAD state for FireRed VAD in WebSocket mode."""
+
+    def __init__(self, model):
+        import kaldi_native_fbank as knf
+        from stt_api.vad.fireredvad.stream_vad_postprocessor import StreamVadPostprocessor
+
+        cfg = model.config
+        self.postprocessor = StreamVadPostprocessor(
+            cfg.smooth_window_size,
+            cfg.speech_threshold,
+            cfg.pad_start_frame,
+            cfg.min_speech_frame,
+            cfg.max_speech_frame,
+            cfg.min_silence_frame,
+        )
+        self.vad_model = model.vad_model
+        self.cmvn = model.audio_feat.cmvn
+        self.caches = None
+
+        opts = knf.FbankOptions()
+        opts.frame_opts.samp_freq = 16000
+        opts.frame_opts.frame_length_ms = 25
+        opts.frame_opts.frame_shift_ms = 10
+        opts.frame_opts.dither = 0
+        opts.frame_opts.snip_edges = True
+        opts.mel_opts.num_bins = 80
+        opts.mel_opts.debug_mel = False
+        self.online_fbank = knf.OnlineFbank(opts)
+
+        # Float32 audio buffer — trimmed after each completed speech segment
+        self.audio_buffer = np.array([], dtype=np.float32)
+        # Number of samples removed from the front of audio_buffer
+        self.buffer_offset = 0
+        # Next fbank frame index to process (0-based)
+        self.fbank_frame_idx = 0
+        # Frame shift: 10 ms at 16 kHz = 160 samples
+        self.frame_shift_samples = 160
+        # Cumulative timestamp offset for transcription (seconds)
+        self.last_timestamp = 0.0
+
+    def feed_and_process(self, samples_f32: np.ndarray):
+        """Feed float32 samples, extract fbank features, run VAD model.
+
+        Returns a list of StreamVadFrameResult for each newly processed frame.
+        """
+        samples_i16 = float32_to_int16(samples_f32)
+        self.online_fbank.accept_waveform(16000, samples_i16.tolist())
+
+        results = []
+        n_ready = self.online_fbank.num_frames_ready
+        while self.fbank_frame_idx < n_ready:
+            feat = np.array(self.online_fbank.get_frame(self.fbank_frame_idx))
+            self.fbank_frame_idx += 1
+
+            if self.cmvn is not None:
+                feat = (feat - self.cmvn.means) * self.cmvn.inverse_std_variances
+
+            feat_t = torch.from_numpy(feat).float().unsqueeze(0).unsqueeze(0)
+            with torch.no_grad():
+                probs, self.caches = self.vad_model.forward(feat_t, self.caches)
+            prob = float(probs[0, 0, 0])
+
+            result = self.postprocessor.process_one_frame(prob)
+            results.append(result)
+
+        return results
+
+
 class ConnectionManager:
     def __init__(self):
         self.active_connections: Dict[str, WebSocket] = {}
@@ -955,7 +1140,6 @@ class ConnectionManager:
         self.total_silent_frames: Dict[str, int] = {}
         self.total_frames: Dict[str, int] = {}
         self.last_timestamp: Dict[str, float] = {}
-        self.pending_tasks: Dict[str, List[asyncio.Task]] = {}
 
     async def connect(self, websocket: WebSocket, client_id: str):
         await websocket.accept()
@@ -966,14 +1150,8 @@ class ConnectionManager:
         self.total_silent_frames[client_id] = 0
         self.total_frames[client_id] = 0
         self.last_timestamp[client_id] = 0.0
-        self.pending_tasks[client_id] = []
 
     def disconnect(self, client_id: str):
-        # Cancel all pending transcription tasks for this client
-        for task in self.pending_tasks.get(client_id, []):
-            if not task.done():
-                task.cancel()
-                logger.info(f"Cancelled pending task for client {client_id}")
         self.active_connections.pop(client_id, None)
         self.wav_data.pop(client_id, None)
         self.wav_queue.pop(client_id, None)
@@ -981,7 +1159,6 @@ class ConnectionManager:
         self.total_silent_frames.pop(client_id, None)
         self.total_frames.pop(client_id, None)
         self.last_timestamp.pop(client_id, None)
-        self.pending_tasks.pop(client_id, None)
 
     async def send_personal_message(self, message: str, websocket: WebSocket):
         await websocket.send_text(message)
@@ -1004,17 +1181,23 @@ async def websocket_stt(
     minimum_silent_ms: int = Query(MINIMUM_SILENT_MS),
     minimum_trigger_vad_ms: int = Query(MINIMUM_TRIGGER_VAD_MS),
     reject_segment_vad_ratio: float = Query(REJECT_SEGMENT_VAD_RATIO),
+    vad: str = Query("silero"),
 ):
     client_id = str(id(websocket))
     await manager.connect(websocket, client_id=client_id)
-    logger.debug(f"WebSocket client {client_id} connected")
+    logger.info(f"WebSocket client {client_id} connected with vad={vad}")
 
     loop = asyncio.get_event_loop()
     executor = get_vad_executor()
-    disconnected = asyncio.Event()
+
+    # Initialise FireRed per-client state if requested
+    firered_state = None
+    if vad == "firered":
+        firered_model = get_firered_vad()
+        firered_state = FireRedStreamState(firered_model)
 
     async def _transcribe_and_send(wav_data, last_ts):
-        """Run transcription and send result back. Runs as a background task."""
+        """Transcribe audio and send result. Awaited inline for backpressure."""
         try:
             texts, detected_language = await transcribe_chunk(
                 wav_data=wav_data,
@@ -1023,19 +1206,12 @@ async def websocket_stt(
                 last_timestamp=last_ts,
                 response_format="text",
             )
-        except asyncio.CancelledError:
-            logger.info(f"Transcription cancelled for client {client_id}")
-            return
         except HTTPException as e:
-            if not disconnected.is_set():
-                try:
-                    error_msg = json.dumps({"error": e.detail})
-                    await manager.send_personal_message(error_msg, websocket)
-                except Exception:
-                    pass
-            return
-
-        if disconnected.is_set():
+            try:
+                error_msg = json.dumps({"error": e.detail})
+                await manager.send_personal_message(error_msg, websocket)
+            except Exception:
+                pass
             return
 
         try:
@@ -1058,8 +1234,7 @@ async def websocket_stt(
         except Exception:
             pass
 
-    async def _process_audio_data(audio_bytes: bytes):
-        """Process incoming binary audio data through VAD pipeline."""
+    async def _process_audio_data_silero(audio_bytes: bytes):
         try:
             array = np.frombuffer(audio_bytes, dtype=np.float32)
         except Exception:
@@ -1089,10 +1264,10 @@ async def websocket_stt(
             (frames, sample_rate),
         )
 
-        for i, (vad, vad_score) in enumerate(vad_results):
+        for i, (is_speech, vad_score) in enumerate(vad_results):
             manager.total_frames[client_id] += 1
 
-            if vad:
+            if is_speech:
                 manager.total_silent[client_id] = 0
             else:
                 manager.total_silent[client_id] += len(frames[i])
@@ -1117,15 +1292,7 @@ async def websocket_stt(
                 if negative_ratio <= reject_segment_vad_ratio:
                     wav_data = np.concatenate(manager.wav_queue[client_id])
                     last_ts = manager.last_timestamp[client_id]
-
-                    task = asyncio.create_task(
-                        _transcribe_and_send(wav_data, last_ts)
-                    )
-                    manager.pending_tasks[client_id].append(task)
-                    # Clean up finished tasks
-                    manager.pending_tasks[client_id] = [
-                        t for t in manager.pending_tasks[client_id] if not t.done()
-                    ]
+                    await _transcribe_and_send(wav_data, last_ts)
                 else:
                     silent_msg = json.dumps({"type": "silent"})
                     await manager.send_personal_message(silent_msg, websocket)
@@ -1138,40 +1305,79 @@ async def websocket_stt(
 
         await asyncio.sleep(0)
 
-    async def _flush_remaining():
-        """Process any remaining audio in the queue after client signals done."""
-        if client_id not in manager.wav_queue:
+    async def _process_audio_data_firered(audio_bytes: bytes):
+        try:
+            array = np.frombuffer(audio_bytes, dtype=np.float32)
+        except Exception:
+            error = json.dumps({"error": "input must be float32 audio bytes"})
+            await manager.send_personal_message(error, websocket)
             return
-        remaining = manager.wav_queue[client_id]
-        if remaining:
-            wav_data = np.concatenate(remaining)
-            if len(wav_data) > 0:
-                negative_ratio = (
-                    manager.total_silent_frames[client_id] / manager.total_frames[client_id]
-                    if manager.total_frames[client_id] > 0
-                    else 0
-                )
-                if negative_ratio <= reject_segment_vad_ratio:
-                    last_ts = manager.last_timestamp[client_id]
-                    task = asyncio.create_task(
-                        _transcribe_and_send(wav_data, last_ts)
-                    )
-                    manager.pending_tasks[client_id].append(task)
-                else:
-                    silent_msg = json.dumps({"type": "silent"})
-                    await manager.send_personal_message(silent_msg, websocket)
 
-        # Wait for all pending transcription tasks to finish
-        pending = [t for t in manager.pending_tasks.get(client_id, []) if not t.done()]
-        if pending:
-            await asyncio.gather(*pending, return_exceptions=True)
+        firered_state.audio_buffer = np.concatenate([firered_state.audio_buffer, array])
+
+        results = await loop.run_in_executor(None, firered_state.feed_and_process, array)
+
+        for result in results:
+            if result.is_speech_end:
+                start_sample = (
+                    (result.speech_start_frame - 1) * firered_state.frame_shift_samples
+                    - firered_state.buffer_offset
+                )
+                end_sample = (
+                    result.speech_end_frame * firered_state.frame_shift_samples
+                    - firered_state.buffer_offset
+                )
+                start_sample = max(0, start_sample)
+                end_sample = min(len(firered_state.audio_buffer), end_sample)
+
+                if start_sample < end_sample:
+                    wav_data = firered_state.audio_buffer[start_sample:end_sample].copy()
+                    last_ts = firered_state.last_timestamp
+                    firered_state.last_timestamp += len(wav_data) / sample_rate
+                    await _transcribe_and_send(wav_data, last_ts)
+
+                # Trim the audio buffer up to the end of this speech segment
+                trim_to = (
+                    result.speech_end_frame * firered_state.frame_shift_samples
+                    - firered_state.buffer_offset
+                )
+                trim_to = max(0, min(trim_to, len(firered_state.audio_buffer)))
+                firered_state.buffer_offset += trim_to
+                firered_state.audio_buffer = firered_state.audio_buffer[trim_to:]
+
+        await asyncio.sleep(0)
+
+    async def _flush_remaining():
+        """Transcribe any buffered audio after the client signals done."""
+        if vad == "firered":
+            remaining = firered_state.audio_buffer
+            if len(remaining) > 0:
+                await _transcribe_and_send(remaining.copy(), firered_state.last_timestamp)
+        else:
+            remaining = manager.wav_queue.get(client_id, [])
+            if remaining:
+                wav_data = np.concatenate(remaining)
+                if len(wav_data) > 0:
+                    negative_ratio = (
+                        manager.total_silent_frames[client_id] / manager.total_frames[client_id]
+                        if manager.total_frames[client_id] > 0
+                        else 0
+                    )
+                    if negative_ratio <= reject_segment_vad_ratio:
+                        await _transcribe_and_send(wav_data, manager.last_timestamp[client_id])
+                    else:
+                        silent_msg = json.dumps({"type": "silent"})
+                        await manager.send_personal_message(silent_msg, websocket)
 
     try:
         while True:
             msg = await websocket.receive()
             if msg["type"] == "websocket.receive":
                 if "bytes" in msg and msg["bytes"]:
-                    await _process_audio_data(msg["bytes"])
+                    if vad == "firered":
+                        await _process_audio_data_firered(msg["bytes"])
+                    else:
+                        await _process_audio_data_silero(msg["bytes"])
                 elif "text" in msg and msg["text"]:
                     try:
                         text_data = json.loads(msg["text"])
@@ -1190,7 +1396,6 @@ async def websocket_stt(
     except Exception as e:
         logger.error(f"WebSocket error for client {client_id}: {e}")
     finally:
-        disconnected.set()
         manager.disconnect(client_id)
 
 if ENABLE_FORCE_ALIGNMENT:

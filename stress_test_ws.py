@@ -89,6 +89,7 @@ async def stream_ws_websockets(audio_data: np.ndarray, client_id: int) -> dict:
                             msg = await asyncio.wait_for(ws.recv(), timeout=60.0)
                             last_message_time = time.time()
                             data = json.loads(msg)
+                            print(data)
                             if data.get("type") == "transcription":
                                 if first_transcription_time is None:
                                     first_transcription_time = time.time()

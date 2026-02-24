@@ -7,7 +7,7 @@ services:
       dockerfile: Dockerfile
     container_name: stt-api-test
     volumes:
-      - "./app:/app/app"
+      - "./stt_api:/app/stt_api"
       - "./tests:/app/tests"
       - "./test_audio:/app/test_audio"
     environment:

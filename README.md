@@ -182,7 +182,7 @@ The API will be available at `http://localhost:9091`.
 uv sync
 
 # Run the server
-uv run uvicorn app.main:app --host 0.0.0.0 --port 9091
+uv run uvicorn stt_api.main:app --host 0.0.0.0 --port 9091
 ```
 
 ---
@@ -348,6 +348,8 @@ All state is cleaned up on disconnect.
 ### Demo Page
 
 Visit `http://localhost:9091/streaming` for a browser-based demo with microphone capture, audio visualizer, and live transcription display.
+
+<img src="streaming.png" width="50%">
 
 ### JavaScript Example
 

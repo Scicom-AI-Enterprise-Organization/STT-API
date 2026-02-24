@@ -77,14 +77,40 @@
             color: #888;
             font-size: 12px;
         }
+        .controls {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            flex-wrap: wrap;
+            margin: 10px 0;
+        }
+        label {
+            font-size: 14px;
+            color: #aaa;
+        }
+        select {
+            padding: 8px 12px;
+            font-size: 14px;
+            background: #2a2a4a;
+            color: #eee;
+            border: 1px solid #444;
+            border-radius: 6px;
+            cursor: pointer;
+        }
+        select:focus { outline: none; border-color: #4ade80; }
     </style>
 </head>
 <body>
     <h1>Microphone Stream</h1>
 
-    <div>
+    <div class="controls">
         <button id="startBtn">Start Streaming</button>
         <button id="stopBtn" disabled>Stop</button>
+        <label for="vadSelect">VAD:</label>
+        <select id="vadSelect">
+            <option value="silero">Silero</option>
+            <option value="firered">FireRed</option>
+        </select>
     </div>
 
     <div id="status">Status: Ready</div>
@@ -100,6 +126,7 @@
     <script>
         const startBtn = document.getElementById('startBtn');
         const stopBtn = document.getElementById('stopBtn');
+        const vadSelect = document.getElementById('vadSelect');
         const status = document.getElementById('status');
         const transcription = document.getElementById('transcription');
         const log = document.getElementById('log');
@@ -175,7 +202,8 @@
 
         async function startStreaming() {
             try {
-                const wsUrl = `ws://${window.location.host}/ws?language=null`;
+                const selectedVad = vadSelect.value;
+                const wsUrl = `ws://${window.location.host}/ws?language=null&vad=${selectedVad}`;
                 ws = new WebSocket(wsUrl);
                 ws.binaryType = 'arraybuffer';
 
@@ -248,6 +276,7 @@
 
                 startBtn.disabled = true;
                 stopBtn.disabled = false;
+                vadSelect.disabled = true;
 
                 drawVisualizer();
 
@@ -293,6 +322,7 @@
 
             startBtn.disabled = false;
             stopBtn.disabled = true;
+            vadSelect.disabled = false;
         }
 
         startBtn.addEventListener('click', startStreaming);
