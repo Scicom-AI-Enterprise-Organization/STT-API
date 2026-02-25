@@ -27,9 +27,11 @@ logger = logging.getLogger(__name__)
 STT_API_URL = os.environ.get("STT_API_URL", "https://stt-engine-rtx.aies.scicom.dev")
 SAMPLE_RATE = int(os.environ.get("SAMPLE_RATE", "16000"))
 MAX_CHUNK_LENGTH = float(os.environ.get("MAX_CHUNK_LENGTH", "25"))
-MINIMUM_SILENT_MS = int(os.environ.get("MINIMUM_SILENT_MS", "200"))
+MINIMUM_SILENT_MS = int(os.environ.get("MINIMUM_SILENT_MS", "400"))
 MINIMUM_TRIGGER_VAD_MS = int(os.environ.get("MINIMUM_TRIGGER_VAD_MS", "1500"))
-REJECT_SEGMENT_VAD_RATIO = float(os.environ.get("REJECT_SEGMENT_VAD_RATIO", "0.9"))
+REJECT_SEGMENT_VAD_RATIO = float(os.environ.get("REJECT_SEGMENT_VAD_RATIO", "0.7"))
+VAD_THRESHOLD = float(os.environ.get("VAD_THRESHOLD", "0.5"))
+MINIMUM_SPEECH_MS = int(os.environ.get("MINIMUM_SPEECH_MS", "250"))
 ENABLE_ONLINE_DIARIZATION = (
     os.environ.get("ENABLE_ONLINE_DIARIZATION", "true").lower() == "true"
 )
@@ -81,12 +83,12 @@ def get_firered_vad():
             from stt_api.vad.fireredvad import FireRedStreamVad, FireRedStreamVadConfig
             vad_config = FireRedStreamVadConfig(
                 use_gpu=False,
-                smooth_window_size=5,
-                speech_threshold=0.4,
-                pad_start_frame=5,
-                min_speech_frame=8,
-                max_speech_frame=2000,
-                min_silence_frame=20,
+                smooth_window_size=5,   # 50ms smoothing window — keeps stability
+                speech_threshold=0.5,   # balanced; 0.4 was slightly too sensitive
+                pad_start_frame=8,      # 80ms pre-roll so first word isn't clipped
+                min_speech_frame=6,     # 60ms to confirm speech — faster detection
+                max_speech_frame=1500,  # 15s hard cut — safer for Whisper
+                min_silence_frame=40,   # 400ms silence to end segment (was 500 = 5s!)
                 chunk_max_frame=30000,
             )
             _firered_vad_model = FireRedStreamVad.from_pretrained(config=vad_config)
@@ -245,6 +247,8 @@ def process_audio_segment(args: Tuple) -> List[Tuple]:
         worker_maxlen,
         worker_minimum_silent_ms,
         worker_minimum_trigger_vad_ms,
+        worker_vad_threshold,
+        worker_minimum_speech_ms,
     ) = args
 
     global _worker_silero
@@ -255,12 +259,22 @@ def process_audio_segment(args: Tuple) -> List[Tuple]:
 
     _worker_silero.reset_states()
 
+    # Number of frames needed to satisfy minimum_speech_ms
+    frames_per_ms = worker_sample_rate / (worker_frame_size * 1000)
+    min_speech_frames = max(1, int(worker_minimum_speech_ms * frames_per_ms))
+    # Pre-buffer: keep last N frames so we don't clip the start of speech
+    pre_buffer_size = 5
+    pre_buffer = []
+
     chunks = []
     wav_data = np.array([], dtype=np.float32)
     last_timestamp = start_offset
     total_silent = 0
     total_silent_frames = 0
     total_frames = 0
+    total_speech_frames = 0
+    consec_speech = 0
+    has_speech = False
 
     num_frames = len(audio_segment) // worker_frame_size
 
@@ -272,17 +286,41 @@ def process_audio_segment(args: Tuple) -> List[Tuple]:
         if len(frame) < worker_frame_size:
             frame = np.pad(frame, (0, worker_frame_size - len(frame)), mode="constant")
 
-        total_frames += 1
-
         frame_pt = torch.from_numpy(frame).unsqueeze(0)
         vad_score = _worker_silero(frame_pt, sr=worker_sample_rate).numpy()[0][0]
-        vad = vad_score > 0.5
+        is_speech = vad_score > worker_vad_threshold
 
-        if vad:
-            total_silent = 0
+        if is_speech:
+            consec_speech += 1
         else:
+            consec_speech = 0
+
+        # Skip leading silence — buffer frames until first speech detected
+        if not has_speech:
+            pre_buffer.append(frame)
+            if len(pre_buffer) > pre_buffer_size:
+                pre_buffer.pop(0)
+            if is_speech:
+                has_speech = True
+                for pb in pre_buffer:
+                    wav_data = np.concatenate([wav_data, pb])
+                    total_frames += 1
+                pre_buffer = []
+            else:
+                continue
+
+        total_frames += 1
+
+        # Require 2 consecutive speech frames before resetting silence counter
+        # (prevents a single noisy frame from breaking a real silence)
+        if consec_speech >= 2:
+            total_silent = 0
+        elif not is_speech:
             total_silent += len(frame)
             total_silent_frames += 1
+
+        if is_speech:
+            total_speech_frames += 1
 
         wav_data = np.concatenate([wav_data, frame])
         audio_len = len(wav_data) / worker_sample_rate
@@ -293,6 +331,7 @@ def process_audio_segment(args: Tuple) -> List[Tuple]:
         vad_trigger = (
             audio_len_ms >= worker_minimum_trigger_vad_ms
             and silent_len >= worker_minimum_silent_ms
+            and total_speech_frames >= min_speech_frames
         )
 
         if vad_trigger or audio_len >= worker_maxlen:
@@ -304,6 +343,10 @@ def process_audio_segment(args: Tuple) -> List[Tuple]:
             total_silent = 0
             total_silent_frames = 0
             total_frames = 0
+            total_speech_frames = 0
+            consec_speech = 0
+            has_speech = False
+            pre_buffer = []
             wav_data = np.array([], dtype=np.float32)
 
     # Handle remaining samples
@@ -674,6 +717,8 @@ def vad_parallel(
     maxlen: float,
     minimum_silent_ms: int,
     minimum_trigger_vad_ms: int,
+    vad_threshold: float = VAD_THRESHOLD,
+    minimum_speech_ms: int = MINIMUM_SPEECH_MS,
 ) -> List[Tuple]:
     """
     Process audio with VAD using multiple processes.
@@ -709,6 +754,8 @@ def vad_parallel(
                 maxlen,
                 minimum_silent_ms,
                 minimum_trigger_vad_ms,
+                vad_threshold,
+                minimum_speech_ms,
             )
         )
 
@@ -740,6 +787,8 @@ async def audio_transcriptions(
     speaker_similarity: float = Form(0.5),
     speaker_max_n: int = Form(5),
     vad: str = Form("silero"),  # silero | firered
+    vad_threshold: float = Form(VAD_THRESHOLD),
+    minimum_speech_ms: int = Form(MINIMUM_SPEECH_MS),
 ):
     """
     Long audio transcription API with VAD chunking.
@@ -769,6 +818,8 @@ async def audio_transcriptions(
             speaker_similarity=speaker_similarity,
             speaker_max_n=speaker_max_n,
             vad=vad,
+            vad_threshold=vad_threshold,
+            minimum_speech_ms=minimum_speech_ms,
         )
 
 
@@ -784,6 +835,8 @@ async def _process_transcription(
     speaker_similarity: float = 0.3,
     speaker_max_n: int = 10,
     vad: str = "silero",
+    vad_threshold: float = VAD_THRESHOLD,
+    minimum_speech_ms: int = MINIMUM_SPEECH_MS,
 ):
     """Internal transcription processing (wrapped by request semaphore)."""
     t_total_start = time.time()
@@ -858,6 +911,7 @@ async def _process_transcription(
                 vad_parallel,
                 audio_data, sample_rate, frame_size, maxlen,
                 minimum_silent_ms, minimum_trigger_vad_ms,
+                vad_threshold, minimum_speech_ms,
             )
         logger.info(
             f"⏱️ Phase 1 complete: {len(chunks)} chunks created in {time.time() - t_vad_start:.2f}s"
@@ -1046,7 +1100,7 @@ def process_vad_frames(args: Tuple) -> List[Tuple[bool, float]]:
     Returns:
         List of (is_speech, vad_score) for each frame
     """
-    frames_list, worker_sample_rate = args
+    frames_list, worker_sample_rate, threshold = args
 
     global _worker_silero
     if _worker_silero is None:
@@ -1057,7 +1111,7 @@ def process_vad_frames(args: Tuple) -> List[Tuple[bool, float]]:
     for frame in frames_list:
         frame_pt = torch.from_numpy(frame).unsqueeze(0)
         vad_score = _worker_silero(frame_pt, sr=worker_sample_rate).numpy()[0][0]
-        results.append((bool(vad_score > 0.5), float(vad_score)))
+        results.append((bool(vad_score > threshold), float(vad_score)))
 
     return results
 
@@ -1139,6 +1193,8 @@ class ConnectionManager:
         self.total_silent: Dict[str, int] = {}
         self.total_silent_frames: Dict[str, int] = {}
         self.total_frames: Dict[str, int] = {}
+        self.total_speech_frames: Dict[str, int] = {}
+        self.consec_speech: Dict[str, int] = {}
         self.last_timestamp: Dict[str, float] = {}
 
     async def connect(self, websocket: WebSocket, client_id: str):
@@ -1149,6 +1205,8 @@ class ConnectionManager:
         self.total_silent[client_id] = 0
         self.total_silent_frames[client_id] = 0
         self.total_frames[client_id] = 0
+        self.total_speech_frames[client_id] = 0
+        self.consec_speech[client_id] = 0
         self.last_timestamp[client_id] = 0.0
 
     def disconnect(self, client_id: str):
@@ -1158,6 +1216,8 @@ class ConnectionManager:
         self.total_silent.pop(client_id, None)
         self.total_silent_frames.pop(client_id, None)
         self.total_frames.pop(client_id, None)
+        self.total_speech_frames.pop(client_id, None)
+        self.consec_speech.pop(client_id, None)
         self.last_timestamp.pop(client_id, None)
 
     async def send_personal_message(self, message: str, websocket: WebSocket):
@@ -1169,7 +1229,14 @@ manager = ConnectionManager()
 
 @app.get("/streaming")
 async def get():
-    html_path = os.path.join(os.path.dirname(__file__), "index.html")
+    html_path = os.path.join(os.path.dirname(__file__), "streaming.html")
+    with open(html_path, "r") as f:
+        return HTMLResponse(f.read())
+
+
+@app.get("/transcribe")
+async def transcribe_page():
+    html_path = os.path.join(os.path.dirname(__file__), "transcribe.html")
     with open(html_path, "r") as f:
         return HTMLResponse(f.read())
 
@@ -1182,6 +1249,8 @@ async def websocket_stt(
     minimum_trigger_vad_ms: int = Query(MINIMUM_TRIGGER_VAD_MS),
     reject_segment_vad_ratio: float = Query(REJECT_SEGMENT_VAD_RATIO),
     vad: str = Query("silero"),
+    vad_threshold: float = Query(VAD_THRESHOLD),
+    minimum_speech_ms: int = Query(MINIMUM_SPEECH_MS),
 ):
     client_id = str(id(websocket))
     await manager.connect(websocket, client_id=client_id)
@@ -1261,18 +1330,28 @@ async def websocket_stt(
         vad_results = await loop.run_in_executor(
             executor,
             process_vad_frames,
-            (frames, sample_rate),
+            (frames, sample_rate, vad_threshold),
         )
 
-        for i, (is_speech, vad_score) in enumerate(vad_results):
-            manager.total_frames[client_id] += 1
+        min_speech_frames = max(1, int(minimum_speech_ms * sample_rate / (frame_size * 1000)))
 
+        for i, (is_speech, vad_score) in enumerate(vad_results):
             if is_speech:
-                manager.total_silent[client_id] = 0
+                manager.consec_speech[client_id] += 1
             else:
+                manager.consec_speech[client_id] = 0
+
+            # Require 2 consecutive speech frames to reset silence counter
+            if manager.consec_speech[client_id] >= 2:
+                manager.total_silent[client_id] = 0
+            elif not is_speech:
                 manager.total_silent[client_id] += len(frames[i])
                 manager.total_silent_frames[client_id] += 1
 
+            if is_speech:
+                manager.total_speech_frames[client_id] += 1
+
+            manager.total_frames[client_id] += 1
             manager.wav_queue[client_id].append(frames[i])
             audio_len = (len(manager.wav_queue[client_id]) * frame_size) / sample_rate
             audio_len_ms = audio_len * 1000
@@ -1286,6 +1365,7 @@ async def websocket_stt(
             vad_trigger = (
                 audio_len_ms >= minimum_trigger_vad_ms
                 and silent_len >= minimum_silent_ms
+                and manager.total_speech_frames[client_id] >= min_speech_frames
             )
 
             if vad_trigger or audio_len >= maxlen:
@@ -1301,6 +1381,8 @@ async def websocket_stt(
                 manager.total_silent[client_id] = 0
                 manager.total_silent_frames[client_id] = 0
                 manager.total_frames[client_id] = 0
+                manager.total_speech_frames[client_id] = 0
+                manager.consec_speech[client_id] = 0
                 manager.wav_queue[client_id] = []
 
         await asyncio.sleep(0)

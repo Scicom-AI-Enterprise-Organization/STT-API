@@ -12,13 +12,50 @@ import yaml
 import numpy as np
 import torch.nn as nn
 from typing import List, Tuple
-from references.malaya_speech.utils.padding import sequence_1d
 from app.nemo_featurization import AudioToMelSpectrogramPreprocessor
-from references.malaya_speech.nemo import conv_asr
-from references.malaya_speech.nemo.conv_asr import SpeakerDecoder
+from app.nemo import conv_asr
+from app.nemo.conv_asr import SpeakerDecoder
 from app.torch_utils import to_tensor_cuda, to_numpy
 from app.huggingface import download_files
 
+def sequence_1d(
+    seq, maxlen=None, padding: str = 'post', pad_int=0, return_len=False
+):
+    """
+    padding sequence of 1d to become 2d array.
+
+    Parameters
+    ----------
+    seq: List[List[int]]
+    maxlen: int, optional (default=None)
+        If None, will calculate max length in the function.
+    padding: str, optional (default='post')
+        If `pre`, will add 0 on the starting side, else add 0 on the end side.
+    pad_int, int, optional (default=0)
+        padding value.
+
+    Returns
+    --------
+    result: np.array
+    """
+    if padding not in ['post', 'pre']:
+        raise ValueError('padding only supported [`post`, `pre`]')
+
+    if not maxlen:
+        maxlen = max([len(s) for s in seq])
+
+    padded_seqs, length = [], []
+    for s in seq:
+        if isinstance(s, np.ndarray):
+            s = s.tolist()
+        if padding == 'post':
+            padded_seqs.append(s + [pad_int] * (maxlen - len(s)))
+        if padding == 'pre':
+            padded_seqs.append([pad_int] * (maxlen - len(s)) + s)
+        length.append(len(s))
+    if return_len:
+        return np.array(padded_seqs), length
+    return np.array(padded_seqs)
 
 class SpeakerVector(torch.nn.Module):
     """

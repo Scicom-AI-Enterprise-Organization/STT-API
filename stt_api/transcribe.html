@@ -1,0 +1,390 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Audio Transcription</title>
+    <style>
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+        body {
+            font-family: system-ui, -apple-system, sans-serif;
+            background: #1a1a2e;
+            color: #eee;
+            min-height: 100vh;
+            padding: 40px 20px;
+        }
+
+        .container {
+            max-width: 700px;
+            margin: 0 auto;
+        }
+
+        h1 { font-size: 24px; margin-bottom: 28px; color: #fff; }
+
+        .card {
+            background: #22223a;
+            border-radius: 10px;
+            padding: 24px;
+            margin-bottom: 20px;
+        }
+
+        .field { margin-bottom: 16px; }
+
+        label {
+            display: block;
+            font-size: 13px;
+            color: #aaa;
+            margin-bottom: 6px;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
+
+        select, input[type="file"], input[type="number"] {
+            width: 100%;
+            padding: 10px 12px;
+            background: #2a2a4a;
+            border: 1px solid #444;
+            border-radius: 6px;
+            color: #eee;
+            font-size: 14px;
+        }
+        select:focus, input:focus { outline: none; border-color: #4ade80; }
+
+        input[type="file"] { cursor: pointer; padding: 8px; }
+        input[type="file"]::file-selector-button {
+            background: #3a3a5a;
+            color: #eee;
+            border: none;
+            padding: 6px 14px;
+            border-radius: 4px;
+            cursor: pointer;
+            margin-right: 10px;
+            font-size: 13px;
+        }
+
+        .row { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+
+        button {
+            width: 100%;
+            padding: 13px;
+            font-size: 15px;
+            font-weight: 600;
+            background: #4ade80;
+            color: #000;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+        button:hover:not(:disabled) { background: #22c55e; }
+        button:disabled { background: #555; color: #888; cursor: not-allowed; }
+
+        #status {
+            font-size: 13px;
+            color: #aaa;
+            margin-top: 10px;
+            min-height: 18px;
+            text-align: center;
+        }
+        #status.error { color: #f87171; }
+        #status.ok { color: #4ade80; }
+
+        #results { display: none; }
+
+        .result-meta {
+            display: flex;
+            gap: 16px;
+            flex-wrap: wrap;
+            font-size: 13px;
+            color: #aaa;
+            margin-bottom: 14px;
+            padding-bottom: 14px;
+            border-bottom: 1px solid #333;
+        }
+        .result-meta span { background: #2a2a4a; padding: 3px 10px; border-radius: 20px; }
+
+        #segments-box {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            max-height: 420px;
+            overflow-y: auto;
+            padding-right: 4px;
+        }
+
+        .segment {
+            background: #2a2a4a;
+            border-radius: 6px;
+            padding: 10px 14px;
+            line-height: 1.5;
+        }
+        .segment .ts {
+            font-size: 11px;
+            color: #666;
+            margin-bottom: 4px;
+        }
+        .segment .speaker {
+            display: inline-block;
+            font-size: 11px;
+            background: #3a3a6a;
+            color: #93c5fd;
+            padding: 1px 8px;
+            border-radius: 10px;
+            margin-right: 6px;
+        }
+        .segment .text { font-size: 14px; }
+
+        .plain-text {
+            background: #2a2a4a;
+            border-radius: 6px;
+            padding: 14px;
+            font-size: 14px;
+            line-height: 1.6;
+            white-space: pre-wrap;
+        }
+
+        .spinner {
+            display: inline-block;
+            width: 14px; height: 14px;
+            border: 2px solid #555;
+            border-top-color: #4ade80;
+            border-radius: 50%;
+            animation: spin 0.7s linear infinite;
+            vertical-align: middle;
+            margin-right: 6px;
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+    </style>
+</head>
+<body>
+<div class="container">
+    <h1>Audio Transcription</h1>
+
+    <div class="card">
+        <div class="field">
+            <label>Audio File</label>
+            <input type="file" id="audioFile" accept="audio/*,video/*">
+        </div>
+
+        <div class="row">
+            <div class="field">
+                <label>Language</label>
+                <select id="language">
+                    <option value="null">Auto-detect</option>
+                    <option value="ms">Malay (ms)</option>
+                    <option value="en">English (en)</option>
+                    <option value="zh">Chinese (zh)</option>
+                    <option value="ta">Tamil (ta)</option>
+                </select>
+            </div>
+            <div class="field">
+                <label>Response Format</label>
+                <select id="responseFormat">
+                    <option value="verbose_json">Verbose JSON (segments)</option>
+                    <option value="json">JSON (text only)</option>
+                    <option value="text">Plain text</option>
+                </select>
+            </div>
+        </div>
+
+        <div class="row">
+            <div class="field">
+                <label>VAD Backend</label>
+                <select id="vad">
+                    <option value="silero">Silero</option>
+                    <option value="firered">FireRed</option>
+                </select>
+            </div>
+            <div class="field">
+                <label>Diarization</label>
+                <select id="diarization">
+                    <option value="none">None</option>
+                    <option value="online">Online</option>
+                    <option value="offline">Offline</option>
+                </select>
+            </div>
+        </div>
+
+        <div class="row" id="diarizationParams" style="display:none">
+            <div class="field">
+                <label>Speaker Similarity</label>
+                <input type="number" id="speakerSimilarity" value="0.5" min="0" max="1" step="0.05">
+            </div>
+            <div class="field" id="speakerMaxNField">
+                <label>Max Speakers</label>
+                <input type="number" id="speakerMaxN" value="5" min="1" max="20" step="1">
+            </div>
+        </div>
+
+        <button id="submitBtn" disabled>Transcribe</button>
+        <div id="status"></div>
+    </div>
+
+    <div class="card" id="results">
+        <div class="result-meta" id="resultMeta"></div>
+        <div id="segmentsBox" class="segments-box"></div>
+    </div>
+</div>
+
+<script>
+    const audioFile    = document.getElementById('audioFile');
+    const language     = document.getElementById('language');
+    const responseFormat = document.getElementById('responseFormat');
+    const vadSelect    = document.getElementById('vad');
+    const diarization       = document.getElementById('diarization');
+    const diarizationParams = document.getElementById('diarizationParams');
+    const speakerSimilarity = document.getElementById('speakerSimilarity');
+    const speakerMaxN       = document.getElementById('speakerMaxN');
+    const speakerMaxNField  = document.getElementById('speakerMaxNField');
+    const submitBtn         = document.getElementById('submitBtn');
+    const statusEl          = document.getElementById('status');
+    const resultsCard       = document.getElementById('results');
+    const resultMeta        = document.getElementById('resultMeta');
+    const segmentsBox       = document.getElementById('segmentsBox');
+
+    audioFile.addEventListener('change', () => {
+        submitBtn.disabled = !audioFile.files.length;
+    });
+
+    diarization.addEventListener('change', () => {
+        const val = diarization.value;
+        diarizationParams.style.display = val !== 'none' ? '' : 'none';
+        speakerMaxNField.style.display = val === 'online' ? '' : 'none';
+    });
+
+    function setStatus(msg, type = '') {
+        statusEl.className = type;
+        statusEl.innerHTML = msg;
+    }
+
+    function formatTime(s) {
+        if (s === undefined || s === null) return '';
+        const m = Math.floor(s / 60);
+        const sec = (s % 60).toFixed(1).padStart(4, '0');
+        return m > 0 ? `${m}:${sec}` : `${sec}s`;
+    }
+
+    submitBtn.addEventListener('click', async () => {
+        const file = audioFile.files[0];
+        if (!file) return;
+
+        submitBtn.disabled = true;
+        resultsCard.style.display = 'none';
+        setStatus('<span class="spinner"></span>Uploading & transcribing…');
+
+        const form = new FormData();
+        form.append('file', file);
+        form.append('language', language.value);
+        form.append('response_format', responseFormat.value);
+        form.append('vad', vadSelect.value);
+        form.append('diarization', diarization.value);
+        if (diarization.value !== 'none') {
+            form.append('speaker_similarity', speakerSimilarity.value);
+            if (diarization.value === 'online') {
+                form.append('speaker_max_n', speakerMaxN.value);
+            }
+        }
+
+        const start = Date.now();
+
+        try {
+            const res = await fetch('/audio/transcriptions', {
+                method: 'POST',
+                body: form,
+            });
+
+            const elapsed = ((Date.now() - start) / 1000).toFixed(1);
+
+            if (!res.ok) {
+                let detail = res.statusText;
+                try { detail = (await res.json()).detail || detail; } catch {}
+                throw new Error(detail);
+            }
+
+            const fmt = responseFormat.value;
+            let data;
+            if (fmt === 'text') {
+                data = await res.text();
+            } else {
+                data = await res.json();
+            }
+
+            renderResult(data, fmt, elapsed);
+            setStatus(`Done in ${elapsed}s`, 'ok');
+        } catch (err) {
+            setStatus(`Error: ${err.message}`, 'error');
+        } finally {
+            submitBtn.disabled = false;
+        }
+    });
+
+    function renderResult(data, fmt, elapsed) {
+        resultMeta.innerHTML = '';
+        segmentsBox.innerHTML = '';
+
+        if (fmt === 'text') {
+            addMeta('Time', elapsed + 's');
+            const div = document.createElement('div');
+            div.className = 'plain-text';
+            div.textContent = data;
+            segmentsBox.appendChild(div);
+        } else if (fmt === 'json') {
+            addMeta('Time', elapsed + 's');
+            const div = document.createElement('div');
+            div.className = 'plain-text';
+            div.textContent = data.text || '(empty)';
+            segmentsBox.appendChild(div);
+        } else {
+            // verbose_json
+            if (data.language) addMeta('Language', data.language);
+            if (data.duration) addMeta('Duration', formatTime(data.duration));
+            addMeta('Time', elapsed + 's');
+            if (data.segments && data.segments.length) {
+                addMeta('Segments', data.segments.length);
+                for (const seg of data.segments) {
+                    segmentsBox.appendChild(makeSegment(seg));
+                }
+            } else {
+                const div = document.createElement('div');
+                div.className = 'plain-text';
+                div.textContent = data.text || '(no segments)';
+                segmentsBox.appendChild(div);
+            }
+        }
+
+        resultsCard.style.display = 'block';
+    }
+
+    function addMeta(label, value) {
+        const sp = document.createElement('span');
+        sp.textContent = `${label}: ${value}`;
+        resultMeta.appendChild(sp);
+    }
+
+    function makeSegment(seg) {
+        const div = document.createElement('div');
+        div.className = 'segment';
+
+        const ts = document.createElement('div');
+        ts.className = 'ts';
+        ts.textContent = `${formatTime(seg.start)} → ${formatTime(seg.end)}`;
+        div.appendChild(ts);
+
+        const body = document.createElement('div');
+        body.className = 'text';
+
+        if (seg.speaker !== undefined) {
+            const sp = document.createElement('span');
+            sp.className = 'speaker';
+            sp.textContent = `S${seg.speaker}`;
+            body.appendChild(sp);
+        }
+
+        body.appendChild(document.createTextNode(seg.text));
+        div.appendChild(body);
+        return div;
+    }
+</script>
+</body>
+</html>
