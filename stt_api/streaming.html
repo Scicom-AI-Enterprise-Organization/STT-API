@@ -203,7 +203,8 @@
         async function startStreaming() {
             try {
                 const selectedVad = vadSelect.value;
-                const wsUrl = `ws://${window.location.host}/ws?language=null&vad=${selectedVad}`;
+                const wsProto = window.location.protocol === 'https:' ? 'wss' : 'ws';
+                const wsUrl = `${wsProto}://${window.location.host}/ws?language=null&vad=${selectedVad}`;
                 ws = new WebSocket(wsUrl);
                 ws.binaryType = 'arraybuffer';
 
