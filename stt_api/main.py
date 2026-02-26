@@ -50,7 +50,7 @@ CHUNK_BATCH_SIZE = int(os.environ.get("CHUNK_BATCH_SIZE", "64"))
 
 VAD_WORKERS = int(os.environ.get("VAD_WORKERS", "8"))
 
-ENABLE_FORCE_ALIGNMENT = os.environ.get("ENABLE_FORCE_ALIGNMENT", "true").lower() == "true"
+ENABLE_FORCE_ALIGNMENT = os.environ.get("ENABLE_FORCE_ALIGNMENT", "false").lower() == "true"
 
 _vad_executor = None
 _diarization_executor = None
