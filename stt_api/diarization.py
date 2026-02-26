@@ -180,6 +180,7 @@ def run_online_diarization(
     audio_chunks: List[np.ndarray],
     speaker_similarity: float = 0.3,
     speaker_max_n: int = 10,
+    clustering_method: str = "kmeans",
 ) -> Dict[int, int]:
     """
     Run full online diarization pipeline.
@@ -191,11 +192,13 @@ def run_online_diarization(
         audio_chunks: List of audio numpy arrays (float32, 16kHz)
         speaker_similarity: Cosine similarity threshold for same speaker (0.0-1.0)
         speaker_max_n: Maximum number of speakers to detect
+        clustering_method: "kmeans" (StreamingKMeansMaxClusterTorch) or
+                           "birch" (StreamingBIRCHTorch)
 
     Returns:
         Dictionary mapping chunk_index -> speaker_id (0-indexed)
     """
-    from app.clustering_torch import StreamingKMeansMaxClusterTorch
+    from app.clustering_torch import StreamingKMeansMaxClusterTorch, StreamingBIRCHTorch
     import torch
     import time
 
@@ -203,7 +206,10 @@ def run_online_diarization(
         return {}
 
     t_start = time.time()
-    logger.info(f"Starting online diarization for {len(audio_chunks)} chunks...")
+    logger.info(
+        f"Starting online diarization for {len(audio_chunks)} chunks "
+        f"(method={clustering_method})..."
+    )
 
     # 1. Filter valid chunks (long enough for embedding)
     valid_chunks = []
@@ -232,13 +238,16 @@ def run_online_diarization(
     embeddings = extract_embeddings_batched(valid_chunks)
     logger.info(f"⏱️ Embedding extraction took: {time.time() - t_embed:.2f}s")
 
-    # 3. Cluster incrementally using StreamingKMeans (PyTorch version)
+    # 3. Cluster incrementally
     t_cluster = time.time()
-    cluster = StreamingKMeansMaxClusterTorch(
-        threshold=speaker_similarity, max_clusters=speaker_max_n
-    )
-
-    # Embeddings are already torch tensors from the updated extract_embeddings_batched
+    if clustering_method == "birch":
+        cluster = StreamingBIRCHTorch(
+            threshold=speaker_similarity, max_clusters=speaker_max_n
+        )
+    else:
+        cluster = StreamingKMeansMaxClusterTorch(
+            threshold=speaker_similarity, max_clusters=speaker_max_n
+        )
 
     speaker_assignments = {}
     for i, embedding in enumerate(embeddings):

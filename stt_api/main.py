@@ -7,6 +7,7 @@ import tempfile
 import asyncio
 import time
 import multiprocessing
+import functools
 from typing import List, Optional, Tuple, Dict
 from concurrent.futures import ProcessPoolExecutor
 import numpy as np
@@ -783,7 +784,7 @@ async def audio_transcriptions(
     minimum_silent_ms: int = Form(MINIMUM_SILENT_MS),
     minimum_trigger_vad_ms: int = Form(MINIMUM_TRIGGER_VAD_MS),
     reject_segment_vad_ratio: float = Form(REJECT_SEGMENT_VAD_RATIO),
-    diarization: str = Form("none"),  # none | online | offline
+    diarization: str = Form("none"),  # none | kmeans | birch | pyannote
     speaker_similarity: float = Form(0.5),
     speaker_max_n: int = Form(5),
     vad: str = Form("silero"),  # silero | firered
@@ -800,7 +801,7 @@ async def audio_transcriptions(
     - minimum_silent_ms: Minimum silence duration for VAD trigger (ms)
     - minimum_trigger_vad_ms: Minimum audio length to trigger VAD (ms)
     - reject_segment_vad_ratio: Reject segments with this ratio of silence (0.0-1.0)
-    - diarization: 'none', 'online', or 'offline'
+    - diarization: 'none', 'kmeans', 'birch', or 'pyannote'
     - speaker_similarity: Cosine similarity threshold for online diarization
     - speaker_max_n: Maximum speakers for online diarization
     - vad: VAD backend to use: 'silero' (default) or 'firered'
@@ -855,9 +856,9 @@ async def _process_transcription(
         )
 
     diarization = diarization.lower().strip()
-    if diarization not in {"none", "online", "offline"}:
+    if diarization not in {"none", "kmeans", "birch", "pyannote"}:
         raise HTTPException(
-            status_code=400, detail="diarization only supports: none, online, offline"
+            status_code=400, detail="diarization only supports: none, kmeans, birch, pyannote"
         )
 
     vad = vad.lower().strip()
@@ -866,7 +867,7 @@ async def _process_transcription(
             status_code=400, detail="vad only supports: silero, firered"
         )
 
-    if diarization == "online":
+    if diarization in {"kmeans", "birch"}:
         try:
             get_diarization_executor()
         except Exception as e:
@@ -934,13 +935,12 @@ async def _process_transcription(
         diarize_task = None
         audio_chunks_for_diarization = None
 
-        if diarization == "offline":
+        if diarization == "pyannote":
             logger.info("Starting offline diarization in background...")
             diarize_task = asyncio.create_task(offline_diarize(file))
 
-        elif diarization == "online":
-            logger.info("Starting online diarization in background...")
-            # Extract audio data for diarization
+        elif diarization in {"kmeans", "birch"}:
+            logger.info(f"Starting online diarization ({diarization}) in background...")
             audio_chunks_for_diarization = [
                 wav_chunk for wav_chunk, _, _ in chunks_to_transcribe
             ]
@@ -948,10 +948,13 @@ async def _process_transcription(
             loop = asyncio.get_event_loop()
             diarize_task = loop.run_in_executor(
                 get_diarization_executor(),
-                run_online_diarization,
-                audio_chunks_for_diarization,
-                speaker_similarity,
-                speaker_max_n,
+                functools.partial(
+                    run_online_diarization,
+                    audio_chunks_for_diarization,
+                    speaker_similarity,
+                    speaker_max_n,
+                    diarization,
+                ),
             )
 
         # Phase 4: Transcription (runs in parallel with diarization)
@@ -1026,13 +1029,13 @@ async def _process_transcription(
             t_diar_wait = time.time()
             try:
                 speaker_assignments = await diarize_task
-                if diarization == "offline":
+                if diarization == "pyannote":
                     logger.info(
-                        f"⏱️ Offline diarization complete: {len(speaker_assignments)} segments (waited {time.time() - t_diar_wait:.2f}s)"
+                        f"⏱️ Pyannote diarization complete: {len(speaker_assignments)} segments (waited {time.time() - t_diar_wait:.2f}s)"
                     )
                 else:
                     logger.info(
-                        f"⏱️ Online diarization complete: {len(speaker_assignments)} assignments (waited {time.time() - t_diar_wait:.2f}s)"
+                        f"⏱️ Online diarization ({diarization}) complete: {len(speaker_assignments)} assignments (waited {time.time() - t_diar_wait:.2f}s)"
                     )
             except Exception as e:
                 logger.error(f"Diarization failed: {e}")
@@ -1058,9 +1061,9 @@ async def _process_transcription(
         segments = merge_speakers_with_segments(
             segments=segments,
             speaker_data=speaker_assignments,
-            mode=diarization,
+            mode="online" if diarization in {"kmeans", "birch"} else diarization,
             chunks_to_transcribe=chunks_to_transcribe
-            if diarization == "online"
+            if diarization in {"kmeans", "birch"}
             else None,
         )
 

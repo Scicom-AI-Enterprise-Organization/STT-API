@@ -200,8 +200,9 @@
                 <label>Diarization</label>
                 <select id="diarization">
                     <option value="none">None</option>
-                    <option value="online">Online</option>
-                    <option value="offline">Offline</option>
+                    <option value="kmeans">Online (K-Means)</option>
+                    <option value="birch">Online (BIRCH)</option>
+                    <option value="pyannote">Pyannote (Offline)</option>
                 </select>
             </div>
         </div>
@@ -249,8 +250,9 @@
 
     diarization.addEventListener('change', () => {
         const val = diarization.value;
+        const isOnline = val === 'kmeans' || val === 'birch';
         diarizationParams.style.display = val !== 'none' ? '' : 'none';
-        speakerMaxNField.style.display = val === 'online' ? '' : 'none';
+        speakerMaxNField.style.display = isOnline ? '' : 'none';
     });
 
     function setStatus(msg, type = '') {
@@ -281,7 +283,7 @@
         form.append('diarization', diarization.value);
         if (diarization.value !== 'none') {
             form.append('speaker_similarity', speakerSimilarity.value);
-            if (diarization.value === 'online') {
+            if (diarization.value === 'kmeans' || diarization.value === 'birch') {
                 form.append('speaker_max_n', speakerMaxN.value);
             }
         }
