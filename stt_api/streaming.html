@@ -98,6 +98,46 @@
             cursor: pointer;
         }
         select:focus { outline: none; border-color: #4ade80; }
+        .vad-params {
+            background: #2a2a4a;
+            border-radius: 6px;
+            margin: 10px 0;
+        }
+        .vad-params summary {
+            padding: 10px 14px;
+            cursor: pointer;
+            font-size: 14px;
+            color: #aaa;
+            user-select: none;
+        }
+        .vad-params summary:hover { color: #eee; }
+        .vad-params-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 10px;
+            padding: 10px 14px 14px;
+        }
+        .vad-param {
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+        }
+        .vad-param label {
+            font-size: 12px;
+            color: #888;
+        }
+        .vad-param input {
+            padding: 6px 10px;
+            font-size: 14px;
+            background: #1a1a2e;
+            color: #eee;
+            border: 1px solid #444;
+            border-radius: 4px;
+            width: 100%;
+            box-sizing: border-box;
+        }
+        .vad-param input:focus { outline: none; border-color: #4ade80; }
+        .vad-param input:disabled { opacity: 0.5; cursor: not-allowed; }
     </style>
 </head>
 <body>
@@ -106,6 +146,16 @@
     <div class="controls">
         <button id="startBtn">Start Streaming</button>
         <button id="stopBtn" disabled>Stop</button>
+    </div>
+    <div class="controls">
+        <label for="languageSelect">Language:</label>
+        <select id="languageSelect">
+            <option value="null">Auto-detect</option>
+            <option value="ms">Malay (ms)</option>
+            <option value="en">English (en)</option>
+            <option value="zh">Chinese (zh)</option>
+            <option value="ta">Tamil (ta)</option>
+        </select>
         <label for="vadSelect">VAD:</label>
         <select id="vadSelect">
             <option value="silero">Silero</option>
@@ -113,7 +163,34 @@
         </select>
     </div>
 
+    <details class="vad-params" id="vadParams">
+        <summary>VAD Parameters</summary>
+        <div class="vad-params-grid">
+            <div class="vad-param">
+                <label for="vadThreshold">vad_threshold (0–1)</label>
+                <input type="number" id="vadThreshold" min="0" max="1" step="0.05" value="0.5">
+            </div>
+            <div class="vad-param">
+                <label for="minSilentMs">minimum_silent_ms</label>
+                <input type="number" id="minSilentMs" min="0" step="50" value="400">
+            </div>
+            <div class="vad-param">
+                <label for="minSpeechMs">minimum_speech_ms</label>
+                <input type="number" id="minSpeechMs" min="0" step="50" value="250">
+            </div>
+            <div class="vad-param">
+                <label for="minTriggerVadMs">minimum_trigger_vad_ms</label>
+                <input type="number" id="minTriggerVadMs" min="0" step="100" value="1500">
+            </div>
+            <div class="vad-param">
+                <label for="rejectSegmentVadRatio">reject_segment_vad_ratio (0–1)</label>
+                <input type="number" id="rejectSegmentVadRatio" min="0" max="1" step="0.05" value="0.7">
+            </div>
+        </div>
+    </details>
+
     <div id="status">Status: Ready</div>
+    <div id="rtfDisplay" style="font-size:13px;color:#aaa;margin:4px 0;min-height:18px;"></div>
 
     <canvas id="visualizer"></canvas>
 
@@ -126,7 +203,15 @@
     <script>
         const startBtn = document.getElementById('startBtn');
         const stopBtn = document.getElementById('stopBtn');
+        const languageSelect = document.getElementById('languageSelect');
         const vadSelect = document.getElementById('vadSelect');
+        const rtfDisplay = document.getElementById('rtfDisplay');
+        const vadThresholdInput = document.getElementById('vadThreshold');
+        const minSilentMsInput = document.getElementById('minSilentMs');
+        const minSpeechMsInput = document.getElementById('minSpeechMs');
+        const minTriggerVadMsInput = document.getElementById('minTriggerVadMs');
+        const rejectSegmentInput = document.getElementById('rejectSegmentVadRatio');
+        const vadParamInputs = [vadThresholdInput, minSilentMsInput, minSpeechMsInput, minTriggerVadMsInput, rejectSegmentInput];
         const status = document.getElementById('status');
         const transcription = document.getElementById('transcription');
         const log = document.getElementById('log');
@@ -139,6 +224,8 @@
         let processor = null;
         let analyser = null;
         let animationId = null;
+        let lastTranscriptionTime = null;
+        let lastSegEnd = null;
 
         const BUFFER_SIZE = 4096;
 
@@ -152,7 +239,17 @@
 
         function addTranscription(data) {
             if (data.type === 'transcription') {
+                const now = Date.now();
                 if (data.segments && data.segments.length > 0) {
+                    const segStart = data.segments[0].start;
+                    const segEnd = data.segments[data.segments.length - 1].end;
+                    const audioDur = segEnd - (lastSegEnd !== null ? lastSegEnd : segStart);
+                    if (lastTranscriptionTime !== null && audioDur > 0) {
+                        const procTime = (now - lastTranscriptionTime) / 1000;
+                        const rtf = (procTime / audioDur).toFixed(3);
+                        rtfDisplay.textContent = `RTF: ${rtf}  (proc ${procTime.toFixed(2)}s / audio ${audioDur.toFixed(2)}s)`;
+                    }
+                    lastSegEnd = segEnd;
                     for (const seg of data.segments) {
                         const div = document.createElement('div');
                         div.className = 'segment';
@@ -169,6 +266,7 @@
                     div.textContent = data.text;
                     transcription.appendChild(div);
                 }
+                lastTranscriptionTime = now;
                 transcription.scrollTop = transcription.scrollHeight;
             }
         }
@@ -204,7 +302,16 @@
             try {
                 const selectedVad = vadSelect.value;
                 const wsProto = window.location.protocol === 'https:' ? 'wss' : 'ws';
-                const wsUrl = `${wsProto}://${window.location.host}/ws?language=null&vad=${selectedVad}`;
+                const params = new URLSearchParams({
+                    language: languageSelect.value,
+                    vad: selectedVad,
+                    vad_threshold: vadThresholdInput.value,
+                    minimum_silent_ms: minSilentMsInput.value,
+                    minimum_speech_ms: minSpeechMsInput.value,
+                    minimum_trigger_vad_ms: minTriggerVadMsInput.value,
+                    reject_segment_vad_ratio: rejectSegmentInput.value,
+                });
+                const wsUrl = `${wsProto}://${window.location.host}/ws?${params}`;
                 ws = new WebSocket(wsUrl);
                 ws.binaryType = 'arraybuffer';
 
@@ -275,9 +382,14 @@
                 status.textContent = 'Status: Streaming...';
                 addLog('Microphone streaming started');
 
+                lastTranscriptionTime = null;
+                lastSegEnd = null;
+                rtfDisplay.textContent = '';
                 startBtn.disabled = true;
                 stopBtn.disabled = false;
+                languageSelect.disabled = true;
                 vadSelect.disabled = true;
+                vadParamInputs.forEach(i => i.disabled = true);
 
                 drawVisualizer();
 
@@ -323,7 +435,9 @@
 
             startBtn.disabled = false;
             stopBtn.disabled = true;
+            languageSelect.disabled = false;
             vadSelect.disabled = false;
+            vadParamInputs.forEach(i => i.disabled = false);
         }
 
         startBtn.addEventListener('click', startStreaming);

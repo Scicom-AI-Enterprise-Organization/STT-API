@@ -340,6 +340,7 @@
             if (data.language) addMeta('Language', data.language);
             if (data.duration) addMeta('Duration', formatTime(data.duration));
             addMeta('Time', elapsed + 's');
+            if (data.duration) addMeta('RTF', (parseFloat(elapsed) / data.duration).toFixed(3));
             if (data.segments && data.segments.length) {
                 addMeta('Segments', data.segments.length);
                 for (const seg of data.segments) {

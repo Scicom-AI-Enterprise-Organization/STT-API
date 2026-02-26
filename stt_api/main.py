@@ -842,15 +842,10 @@ async def _process_transcription(
     t_total_start = time.time()
     logger.info(f"Request: language={language}, diarization={diarization}, vad={vad}")
 
-    if language is None:
-        language = "null"
+    if isinstance(language, str) and language.lower() in {"none", "null"}:
+        language = None
     else:
         language = language.lower().strip()
-
-    if language not in {"none", "null", "en", "ms", "zh", "ta"}:
-        raise HTTPException(
-            status_code=400, detail="language only supports: none, null, en, ms, zh, ta"
-        )
 
     response_format = response_format.lower().strip()
     if response_format not in {"text", "json", "verbose_json"}:
@@ -1273,7 +1268,6 @@ async def websocket_stt(
                 language=language,
                 timestamp_granularities="segment",
                 last_timestamp=last_ts,
-                response_format="text",
             )
         except HTTPException as e:
             try:

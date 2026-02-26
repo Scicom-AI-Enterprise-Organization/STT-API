@@ -137,14 +137,14 @@ docker network create stt-network
 ### 2. Run vLLM
 
 ```bash
-docker compose -f vllm.yaml up --detach
+docker compose -f vllm.yaml up --build --detach
 ```
 
 Or with a private model (create `.env_vllm` with `HUGGING_FACE_HUB_TOKEN=`):
 
 ```bash
 STT_MODEL=openai/whisper-large-v3-turbo GPU_MEM_UTIL=0.7 \
-docker compose -f vllm.yaml up --detach
+docker compose -f vllm.yaml up --build --detach
 ```
 
 ### 3. Configure Environment (Optional)
