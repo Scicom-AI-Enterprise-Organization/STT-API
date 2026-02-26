@@ -23,6 +23,8 @@ services:
     command:
       - --model
       - ${STT_MODEL:-openai/whisper-large-v3-turbo}
+      - --served-model-name
+      - ${STT_SERVE_MODEL_NAME:-openai/whisper-large-v3-turbo}
       - --port
       - "9089"
       - --gpu-memory-utilization 
