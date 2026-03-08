@@ -8,7 +8,7 @@ Long-form speech-to-text API that:
 - **Proxies to an upstream STT engine** via an OpenAI-compatible `/v1/audio/transcriptions` endpoint
 - **Real-time WebSocket streaming** with per-client VAD and live transcription
 - **Force alignment** for word-level timestamps using CTC alignment (MMS-300M) with dynamic batching
-- **Speaker diarization** with online (TitaNet + StreamingKMeans) or offline (pyannote) modes
+- **Speaker diarization** with online clustering (TitaNet + StreamingKMeans or BIRCH) or offline (pyannote) modes
 
 ---
 
@@ -69,7 +69,7 @@ Long-form speech-to-text API that:
 │   │   max 100 concurrent)    │  │                                     │ │
 │   │                          │  │  • Extract embeddings (batched)     │ │
 │   │  transcribe_chunk() ──►  │  │  • Assign speakers incrementally   │ │
-│   │  POST to STT_API_URL     │  │  • Reuse StreamingKMeansMaxCluster  │ │
+│   │  POST to STT_API_URL     │  │  • StreamingKMeans or BIRCH cluster  │ │
 │   │  (with timestamp adj.)   │  │                                     │ │
 │   └──────────────────────────┘  └─────────────────────────────────────┘ │
 └─────────────────────────────────────────────────────────────────────────┘
@@ -91,7 +91,7 @@ Long-form speech-to-text API that:
 3. **Concurrent Transcription**: Chunks are sent concurrently to upstream STT API with timestamp adjustment
 4. **Online Diarization** (if enabled): Processes chunks incrementally during transcription:
    - Extracts speaker embeddings in small batches (default: 4 chunks)
-   - Assigns speakers incrementally using StreamingKMeansMaxCluster
+   - Assigns speakers incrementally using StreamingKMeans or BIRCH clustering
    - Maintains GPU batching efficiency while enabling true incremental processing
 5. **Merge & Respond**: All transcriptions are merged with global timestamps and speaker assignments (if diarization enabled), then returned
 
@@ -209,7 +209,7 @@ Or use the browser UI at `http://localhost:9091/transcribe`.
 | `minimum_speech_ms` | int | 250 | Minimum speech detected before triggering transcription (ms) |
 | `minimum_trigger_vad_ms` | int | 1500 | Minimum audio length before VAD can trigger (ms) |
 | `reject_segment_vad_ratio` | float | 0.7 | Discard chunks where silence exceeds this ratio (0.0–1.0) |
-| `diarization` | string | none | Diarization mode: `none`, `online`, or `offline` |
+| `diarization` | string | none | Diarization mode: `none`, `kmeans`, `birch`, or `pyannote` |
 | `speaker_similarity` | float | 0.5 | Online mode: speaker clustering threshold (0.0–1.0) |
 | `speaker_max_n` | int | 5 | Online mode: maximum number of speakers |
 
@@ -341,12 +341,18 @@ Optional speaker diarization to identify who is speaking in each segment.
 | Mode | Description | Speed | Accuracy |
 |------|-------------|-------|----------|
 | `none` | No speaker labels (default) | Fastest | N/A |
-| `online` | TitaNet + StreamingKMeans (incremental during transcription) | Fast | Good |
-| `offline` | External OSD service (pyannote) | Slow | Best |
+| `kmeans` | TitaNet + StreamingKMeans (incremental, centroid-based) | Fast | Good |
+| `birch` | TitaNet + StreamingBIRCH (incremental, tree-based, better for many speakers) | Fast | Good+ |
+| `pyannote` | External OSD service (pyannote/speaker-diarization-3.1) | Slow | Best |
 
 ### Online Diarization
 
-Uses TitaNet Large for speaker embeddings with batched GPU inference and StreamingKMeansMaxCluster for incremental speaker assignment. Processes chunks during transcription (not after) for lower latency.
+Uses TitaNet Large for speaker embeddings with batched GPU inference and an incremental clustering algorithm. Processes chunks during transcription (not after) for lower latency.
+
+Two clustering methods are available:
+
+- **`kmeans`**: StreamingKMeansMaxCluster — centroid-based, fast, works well for a known small number of speakers.
+- **`birch`**: StreamingBIRCH — tree-based online clustering, handles more speakers and uneven distributions better.
 
 **Parameters:**
 - `speaker_similarity`: Cosine similarity threshold (0.0–1.0). Higher = stricter matching, fewer speakers. Default: `0.5`
@@ -356,16 +362,26 @@ Uses TitaNet Large for speaker embeddings with batched GPU inference and Streami
 
 Calls an external OSD service running pyannote/speaker-diarization-3.1. More accurate but requires the OSD service to be running.
 
-### Example
+### Examples
 
 ```bash
+# KMeans online diarization
 curl -X POST "http://localhost:9091/audio/transcriptions" \
   -F "file=@meeting.mp3" \
   -F "language=en" \
   -F "response_format=verbose_json" \
-  -F "diarization=online" \
+  -F "diarization=kmeans" \
   -F "speaker_similarity=0.7" \
   -F "speaker_max_n=5"
+
+# BIRCH online diarization (better for many speakers)
+curl -X POST "http://localhost:9091/audio/transcriptions" \
+  -F "file=@meeting.mp3" \
+  -F "language=en" \
+  -F "response_format=verbose_json" \
+  -F "diarization=birch" \
+  -F "speaker_similarity=0.5" \
+  -F "speaker_max_n=10"
 ```
 
 ---
@@ -557,12 +573,20 @@ docker compose -f stress-test-force-alignment.yaml run --rm -e CONCURRENCY=100 s
 docker compose -f stress-test-cancel.yaml run --rm stress-test-cancel
 docker compose -f stress-test-ws-cancel.yaml run --rm stress-test-ws-cancel
 
-# With diarization
+# With diarization (kmeans)
 docker compose -f stress-test.yaml run --rm \
   -e CONCURRENCY=100 \
-  -e DIARIZATION_MODE=online \
+  -e DIARIZATION_MODE=kmeans \
   -e SPEAKER_SIMILARITY=0.7 \
   -e SPEAKER_MAX_N=5 \
+  stress-test
+
+# With diarization (birch)
+docker compose -f stress-test.yaml run --rm \
+  -e CONCURRENCY=100 \
+  -e DIARIZATION_MODE=birch \
+  -e SPEAKER_SIMILARITY=0.5 \
+  -e SPEAKER_MAX_N=10 \
   stress-test
 ```
 
@@ -574,7 +598,7 @@ docker compose -f stress-test.yaml run --rm \
 | `WARMUP_COUNT` | 3 | Warmup requests before test |
 | `STT_API_URL` | http://stt-api:9091 | API URL |
 | `AUDIO_FILE` | /app/test_audio/masak.mp3 | Audio file to use |
-| `DIARIZATION_MODE` | none | `none`, `online`, or `offline` |
+| `DIARIZATION_MODE` | none | `none`, `kmeans`, `birch`, or `pyannote` |
 | `SPEAKER_SIMILARITY` | 0.5 | Speaker clustering threshold (online) |
 | `SPEAKER_MAX_N` | 5 | Max speakers (online) |
 
