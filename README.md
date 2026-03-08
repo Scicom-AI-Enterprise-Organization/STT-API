@@ -602,52 +602,294 @@ docker compose -f stress-test.yaml run --rm \
 | `SPEAKER_SIMILARITY` | 0.5 | Speaker clustering threshold (online) |
 | `SPEAKER_MAX_N` | 5 | Max speakers (online) |
 
-### Sample Output — POST (RTX 3090 Ti, 100 concurrent)
+### Sample Output
+
+Based on single RTX 3090 Ti,
 
 ```
+Loading audio file: /app/test_audio/masak.mp3
+Audio duration: 144.94s
+API URL: http://stt-api:9091
+Diarization mode: none
+
+--- Warmup (3 requests) ---
+  Warmup 1: 1.276s ✓
+  Warmup 2: 1.245s ✓
+  Warmup 3: 1.325s ✓
+
 --- Running Stress Test (100 concurrent requests) ---
 Completed in 96.898s
 
+==================================================
 STT-API STRESS TEST REPORT
-Concurrency: 100  |  Audio: 144.94s  |  Success: 100/100
+==================================================
 
-Latency:  Min 11.3s  |  Avg 54.4s  |  P95 95.7s  |  Max 96.9s
-RTF:      Min 0.078  |  Avg 0.375  |  P95 0.660  |  Max 0.669
+--- Test Configuration ---
+Concurrency: 100
+Audio Duration: 144.94s
+Diarization: none
+Total Requests: 100
+Successful: 100
+Failed: 0
+Success Rate: 100.0%
 
-Throughput: 1.03 req/s  |  149.58 audio-sec/s
+--- Latency Report ---
+Min Time: 11.254s
+Max Time: 96.897s
+Avg Time: 54.397s
+P50 (Median): 54.369s
+P90: 91.091s
+P95: 95.709s
+P99: 96.852s
+
+--- Real-Time Factor (RTF) Report ---
+(RTF < 1.0 means faster than real-time)
+Min RTF: 0.078
+Max RTF: 0.669
+Avg RTF: 0.375
+P50 RTF: 0.375
+P90 RTF: 0.628
+P95 RTF: 0.660
+P99 RTF: 0.668
+
+--- Throughput ---
+Total Wall Time: 96.897s
+Requests/second: 1.03
+Audio seconds processed/second: 149.58
+
+==================================================
 ```
 
-### Sample Output — WebSocket (RTX 3090 Ti, 100 concurrent)
+### Sample Output WS
+
+Based on single RTX 3090 Ti,
 
 ```
+Loading audio file: /app/test_audio/masak.mp3
+Audio duration: 144.94s
+Audio samples: 2318976
+API URL: http://stt-api:9091
+WebSocket URL: ws://stt-api:9091/ws?language=ms
+
+--- Warmup (3 clients) ---
+  Warmup 1: 1.312s, 9 segments, TTFT: 0.167s [ok]
+  Warmup 2: 1.273s, 9 segments, TTFT: 0.153s [ok]
+  Warmup 3: 1.289s, 9 segments, TTFT: 0.153s [ok]
+
 --- Running Stress Test (100 concurrent clients) ---
 Completed in 66.398s
 
+============================================================
 STT-API WEBSOCKET STRESS TEST REPORT
-Concurrency: 100  |  Audio: 144.94s  |  Success: 100/100
+============================================================
 
-Session time:  Min 49.3s  |  Avg 61.0s  |  P95 66.2s
-TTFT:          Min 8.6s   |  Avg 12.5s  |  P90 17.9s
-Segments:      Total 1183  |  Avg 11.8/client
-RTF:           Min 0.340  |  Avg 0.421  |  P50 0.432
+--- Test Configuration ---
+Concurrency: 100
+Audio Duration: 144.94s
+Language: ms
+Chunk Size: 100ms
+Total Clients: 100
+Successful: 100
+Failed: 0
+Success Rate: 100.0%
 
-Throughput: 1.51 clients/s  |  218.59 audio-sec/s
+--- Total Session Time ---
+Min: 49.259s
+Max: 66.308s
+Avg: 61.027s
+P50: 62.617s
+P90: 66.037s
+P95: 66.240s
+P99: 66.251s
+
+--- Time to First Transcription (TTFT) ---
+Min: 8.576s
+Max: 27.832s
+Avg: 12.514s
+P50: 10.997s
+P90: 17.927s
+
+--- Segments ---
+Total Transcription Segments: 1183
+Total Silent Segments: 802
+Avg Segments/Client: 11.8
+
+--- Real-Time Factor (RTF) ---
+(RTF < 1.0 means faster than real-time)
+Min RTF: 0.340
+Max RTF: 0.457
+Avg RTF: 0.421
+P50 RTF: 0.432
+
+--- Throughput ---
+Total Wall Time: 66.308s
+Clients/second: 1.51
+Audio seconds processed/second: 218.59
+
+============================================================
 ```
 
-### Sample Output — Force Alignment (RTX 3090 Ti, 100 concurrent)
+### Sample Output Force Alignment
+
+Based on single RTX 3090 Ti,
 
 ```
+API URL: http://stt-api:9091
+Loading audio files...
+Loaded 4 audio-transcript pairs:
+  husein-chinese.mp3: 2.68s [chi] "是的先生，我能帮您什么吗?"
+  husein-english.mp3: 2.78s [eng] "Yes sir, what can I help you?"
+  husein-tamil.mp3: 2.80s [ta] "ஆமா ஐயா, நான் உங்களுக்கு என்ன உதவி செய்ய வேண்டும்?"
+  husein-malay.mp3: 2.24s [ms] "Ya encik, apa yang saya boleh tolong?"
+
+--- Warmup (3 requests) ---
+  Warmup 1 (husein-chinese.mp3): 0.132s, 12 words [ok]
+  Warmup 2 (husein-english.mp3): 0.051s, 7 words [ok]
+  Warmup 3 (husein-tamil.mp3): 0.052s, 8 words [ok]
+
 --- Running Stress Test (100 concurrent requests) ---
 Completed in 4.041s
 
+============================================================
 FORCE ALIGNMENT STRESS TEST REPORT
-Concurrency: 100  |  Avg audio: 2.62s  |  Success: 100/100
+============================================================
 
-Latency:  Min 0.16s  |  Avg 2.18s  |  P95 4.03s
-RTF:      Min 0.062  |  Avg 0.830  |  P95 1.536
+--- Test Configuration ---
+Concurrency: 100
+Audio Files: 4
+  husein-chinese.mp3: 2.68s (chi)
+  husein-english.mp3: 2.78s (eng)
+  husein-tamil.mp3: 2.80s (ta)
+  husein-malay.mp3: 2.24s (ms)
+Avg Audio Duration: 2.62s
+Total Requests: 100
+Successful: 100
+Failed: 0
+Success Rate: 100.0%
 
-Throughput: 24.76 req/s  |  65.00 audio-sec/s
+--- Latency Report ---
+Min: 0.162s
+Max: 4.038s
+Avg: 2.178s
+P50: 2.220s
+P90: 3.719s
+P95: 4.031s
+P99: 4.036s
+
+--- Real-Time Factor (RTF) ---
+(RTF < 1.0 means faster than real-time)
+Min RTF: 0.062
+Max RTF: 1.538
+Avg RTF: 0.830
+P50 RTF: 0.846
+P90 RTF: 1.417
+P95 RTF: 1.536
+P99 RTF: 1.537
+
+--- Alignment Stats ---
+Total Words Aligned: 850
+Total Audio Aligned: 262.50s
+Avg Words/Request: 8.5
+
+--- Throughput ---
+Total Wall Time: 4.038s
+Requests/second: 24.76
+Audio seconds aligned/second: 65.00
+
+============================================================
 ```
+
+### Key Metrics
+
+| Metric | Description |
+|--------|-------------|
+| **RTF** | Real-Time Factor - < 1.0 means faster than real-time playback |
+| **P50/P90/P95/P99** | Latency percentiles |
+| **Throughput** | Audio seconds processed per wall-clock second |
+
+---
+
+## VAD Benchmarking
+
+The `benchmark_vad.py` script compares sequential vs parallel VAD processing.
+
+### Running VAD Benchmark
+
+```bash
+# Run with default settings
+python benchmark_vad.py
+
+# Run with specific audio file
+python benchmark_vad.py --audio test_audio/masak.mp3
+
+# Run with specific number of workers
+python benchmark_vad.py --workers 8
+
+# Run with more iterations
+python benchmark_vad.py --runs 5
+```
+
+### Benchmark Configuration
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--audio` | test_audio/masak.mp3 | Path to audio file |
+| `--workers` | 4 | Number of worker processes for parallel mode |
+| `--runs` | 3 | Number of benchmark iterations |
+
+### Environment Variables (for parallel mode)
+
+Set these to limit per-process threading and avoid CPU oversubscription:
+
+```bash
+OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 python benchmark_vad.py
+```
+
+### Sample Output
+
+```
+============================================================
+VAD BENCHMARK: Sequential vs Parallel
+============================================================
+
+Loading audio: test_audio/masak.mp3
+Audio duration: 144.94s (2319040 samples)
+Number of workers for parallel: 4
+
+--- Sequential VAD ---
+  Run 1: 2.345s (42 chunks)
+  Run 2: 2.312s (42 chunks)
+  Run 3: 2.298s (42 chunks)
+  Average: 2.318s, Min: 2.298s
+
+--- Parallel VAD (4 workers) ---
+  Run 1: 0.892s (45 chunks)
+  Run 2: 0.876s (45 chunks)
+  Run 3: 0.881s (45 chunks)
+  Average: 0.883s, Min: 0.876s
+
+============================================================
+RESULTS SUMMARY
+============================================================
+
+| Method     | Avg Time | Min Time | Chunks | Speedup |
+|------------|----------|----------|--------|---------|
+| Sequential |   2.318s |   2.298s |     42 | 1.00x   |
+| Parallel   |   0.883s |   0.876s |     45 | 2.62x   |
+
+✅ Parallel is 2.62x FASTER than sequential
+
+VAD RTF (lower is better):
+  Sequential: 0.0160 (62.5x faster than real-time)
+  Parallel:   0.0061 (164.1x faster than real-time)
+============================================================
+```
+
+### Understanding Results
+
+- **Chunks difference**: Parallel may produce slightly more chunks due to VAD state not being shared across segment boundaries
+- **Speedup**: Parallel speedup depends on CPU cores and audio length
+- **RTF**: Both are much faster than real-time; the bottleneck is upstream transcription, not VAD
 
 ---
 
