@@ -119,6 +119,45 @@ Long-form speech-to-text API that:
 
 ---
 
+## LiveKit Turn Detector Plugin
+
+A custom fork of `livekit-plugins-turn-detector` with vLLM backend support for end-of-turn detection.
+
+### Installation
+
+```bash
+# Core STT-API (includes turn detector base deps)
+pip install .
+
+# With full LiveKit agent stack
+pip install ".[livekit]"
+```
+
+### Usage
+
+```python
+from stt_api.livekit_plugin.turn_detector import MultilingualModel
+
+session = AgentSession(
+    stt=groq.STT(model="whisper-large-v3-turbo", language="en"),
+    llm=openai.LLM(model="gpt-4o-mini"),
+    tts=openai.TTS(model="gpt-4o-mini-tts", voice="ash"),
+    turn_detection=MultilingualModel(),
+)
+```
+
+### Configuration
+
+Set the vLLM endpoint via environment variable:
+
+```bash
+export LIVEKIT_REMOTE_EOT_URL="https://your-vllm-endpoint.example.com"
+```
+
+When `LIVEKIT_REMOTE_EOT_URL` is unset, the plugin falls back to local inference using the HuggingFace model `livekit/turn-detector`.
+
+---
+
 ## Prerequisites
 
 - Docker and Docker Compose
