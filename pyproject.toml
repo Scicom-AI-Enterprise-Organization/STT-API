@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "stt-api"
-version = "0.1.0"
+version = "0.1.1"
 description = "Long audio transcription API with VAD"
 readme = "README.md"
 requires-python = ">=3.10"
