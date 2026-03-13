@@ -24,7 +24,7 @@ dependencies = [
     "Unidecode",
     "transformers>=4.57.6",
     "kaldiio==2.18.0",
-    "kaldi_native_fbank==1.15",
+    "kaldi_native_fbank>=1.15",
     "setuptools==80.10.2"
 ]
 
