@@ -1,19 +1,12 @@
-"""LiveKit VAD plugin using FireRedVAD with ProcessPoolExecutor.
-
-Each worker process loads its own FireRedVAD model. Since FireRedVAD is stateful
-(model caches), we pass caches back and forth via IPC. This trades IPC overhead
-for true parallelism (bypasses GIL).
-"""
+"""LiveKit VAD plugin using FireRedVAD (DFSMN-based)."""
 
 from __future__ import annotations
 
 import asyncio
-import multiprocessing
-import os
+import logging
 import statistics
 import time
 import weakref
-from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -25,77 +18,12 @@ from livekit.agents import utils
 from livekit.agents.types import NOT_GIVEN, NotGivenOr
 from livekit.agents.utils import is_given
 
-from stt_api.vad.fireredvad import FireRedStreamVadConfig
-from stt_api.vad.fireredvad.constants import FRAME_SHIFT_SAMPLE, SAMPLE_RATE
+from .fireredvad import FireRedStreamVad, FireRedStreamVadConfig
+from .constants import FRAME_SHIFT_SAMPLE, SAMPLE_RATE
 
-from .log import logger
+logger = logging.getLogger(__name__)
 
 SLOW_INFERENCE_THRESHOLD = 0.2
-
-VAD_WORKERS = int(os.environ.get("VAD_WORKERS", "4"))
-
-# --- Worker process globals ---
-_worker_firered = None
-_worker_feat_extractor = None
-_worker_vad_model = None
-
-
-def _init_worker(use_gpu: bool):
-    """Initialize FireRedVAD in each worker process."""
-    global _worker_feat_extractor, _worker_vad_model
-
-    from stt_api.vad.fireredvad import FireRedStreamVad, FireRedStreamVadConfig
-    from stt_api.vad.fireredvad.audio_feat import AudioFeat
-    from stt_api.vad.fireredvad.detect_model import DetectModel
-    from huggingface_hub import snapshot_download
-
-    folder_name = snapshot_download(repo_id="FireRedTeam/FireRedVAD")
-    model_dir = os.path.join(folder_name, "Stream-VAD")
-    cmvn_path = os.path.join(model_dir, "cmvn.ark")
-
-    _worker_feat_extractor = AudioFeat(cmvn_path)
-    _worker_vad_model = DetectModel.from_pretrained(model_dir)
-    if use_gpu:
-        _worker_vad_model.cuda()
-    else:
-        _worker_vad_model.cpu()
-
-    logger.info(f"FireRedVAD worker {os.getpid()} initialized")
-
-
-def _run_inference(chunk: np.ndarray, caches) -> tuple[float, list]:
-    """Run fbank extraction + DFSMN inference in worker process."""
-    global _worker_feat_extractor, _worker_vad_model
-
-    feats, _ = _worker_feat_extractor.extract(chunk)
-    p = 0.0
-    new_caches = caches
-
-    if feats.size(0) > 0:
-        with torch.no_grad():
-            probs, new_caches = _worker_vad_model.forward(
-                feats.unsqueeze(0), caches=caches
-            )
-            p = probs[0, -1, 0].item()
-
-    return p, new_caches
-
-
-_vad_executor: ProcessPoolExecutor | None = None
-
-
-def _get_vad_executor(use_gpu: bool = False) -> ProcessPoolExecutor:
-    global _vad_executor
-    if _vad_executor is None:
-        ctx = multiprocessing.get_context("spawn")
-        _vad_executor = ProcessPoolExecutor(
-            max_workers=VAD_WORKERS,
-            initializer=_init_worker,
-            initargs=(use_gpu,),
-            mp_context=ctx,
-        )
-        logger.info(f"FireRedVAD ProcessPool initialized with {VAD_WORKERS} workers")
-    return _vad_executor
 
 
 @dataclass
@@ -127,9 +55,8 @@ class ProfilingStats:
         p99_ms = sorted_lat[min(p99_idx, len(sorted_lat) - 1)] * 1000
         lines = [
             "=" * 50,
-            "FIRERED VAD (MP) PROFILING RESULTS",
+            "FIRERED VAD PROFILING RESULTS",
             "=" * 50,
-            f"  Workers:     {VAD_WORKERS}",
             f"  Inferences:  {self.inference_count}",
             f"  Total time:  {self.total_time:.4f}s",
             f"  Mean:        {mean_ms:.3f}ms",
@@ -144,9 +71,14 @@ class ProfilingStats:
 
 
 class VAD(agents.vad.VAD):
-    """LiveKit VAD using FireRedVAD with ProcessPoolExecutor."""
+    """LiveKit VAD plugin using FireRedVAD (Deep FSMN architecture)."""
 
-    FRAME_SHIFT_S = FRAME_SHIFT_SAMPLE / SAMPLE_RATE
+    # FireRedVAD operates at 10ms frame shift (100 frames/s)
+    # update_interval matches this
+    FRAME_SHIFT_S = FRAME_SHIFT_SAMPLE / SAMPLE_RATE  # 0.01s
+
+    PROFILING_WARMUP = 10
+    PROFILING_ITERATIONS = 200
 
     @classmethod
     def load(
@@ -161,13 +93,23 @@ class VAD(agents.vad.VAD):
         use_gpu: bool = False,
         profiling: bool = False,
     ) -> VAD:
+        """Load FireRedVAD model.
+
+        Args:
+            min_speech_duration: Min speech to trigger START_OF_SPEECH (seconds).
+            min_silence_duration: Silence duration to trigger END_OF_SPEECH (seconds).
+            prefix_padding_duration: Padding before speech start (seconds).
+            max_buffered_speech: Max speech buffer (seconds).
+            activation_threshold: Speech probability threshold.
+            sample_rate: Only 16kHz supported by FireRedVAD.
+            use_gpu: Use GPU for inference.
+            profiling: Run profiling on load and track live inference.
+        """
         if sample_rate != 16000:
             raise ValueError("FireRedVAD only supports 16kHz sample rate")
 
-        # Start process pool
-        _get_vad_executor(use_gpu=use_gpu)
-
-        fps = 100
+        # Convert seconds to frame counts (10ms per frame)
+        fps = 100  # frames per second
         config = FireRedStreamVadConfig(
             use_gpu=use_gpu,
             smooth_window_size=5,
@@ -178,8 +120,6 @@ class VAD(agents.vad.VAD):
             min_silence_frame=max(1, int(min_silence_duration * fps)),
         )
 
-        # Also load in main process for profiling
-        from stt_api.vad.fireredvad import FireRedStreamVad
         firered = FireRedStreamVad.from_pretrained(config=config)
 
         opts = _FireRedVADOptions(
@@ -196,23 +136,29 @@ class VAD(agents.vad.VAD):
 
         if profiling:
             stats = vad.run_profiling()
-            logger.info("FireRedVAD (MP) profiling on load:\n%s", stats.summary())
+            logger.info("FireRedVAD profiling on load:\n%s", stats.summary())
 
         return vad
 
-    def __init__(self, *, firered, config, opts) -> None:
+    def __init__(
+        self,
+        *,
+        firered: FireRedStreamVad,
+        config: FireRedStreamVadConfig,
+        opts: _FireRedVADOptions,
+    ) -> None:
         super().__init__(
             capabilities=agents.vad.VADCapabilities(update_interval=self.FRAME_SHIFT_S)
         )
         self._firered = firered
         self._config = config
         self._opts = opts
-        self._streams = weakref.WeakSet[FireRedVADMPStream]()
+        self._streams = weakref.WeakSet[FireRedVADStream]()
         self._profiling_stats: ProfilingStats | None = None
 
     @property
     def model(self) -> str:
-        return "firered-mp"
+        return "firered"
 
     @property
     def provider(self) -> str:
@@ -222,26 +168,35 @@ class VAD(agents.vad.VAD):
     def profiling_stats(self) -> ProfilingStats | None:
         return self._profiling_stats
 
-    def run_profiling(self, iterations: int = 200) -> ProfilingStats:
-        """Profile by submitting inference to worker processes."""
+    def run_profiling(self, iterations: int | None = None) -> ProfilingStats:
+        """Run sample data through FireRedVAD and measure inference latency."""
+        n = iterations or self.PROFILING_ITERATIONS
         rng = np.random.default_rng(42)
-        chunk_size = FRAME_SHIFT_SAMPLE
-        executor = _get_vad_executor()
-        loop = asyncio.new_event_loop()
+
+        # FireRedVAD processes audio chunks → fbank features → model
+        # Simulate with random int16 audio chunks (160 samples = 10ms at 16kHz)
+        chunk_size = FRAME_SHIFT_SAMPLE  # 160 samples
 
         stats = ProfilingStats()
-        caches = None
+
+        # Create a fresh instance for profiling
+        self._firered.reset()
 
         # Warmup
-        for _ in range(10):
+        for _ in range(self.PROFILING_WARMUP):
             chunk = rng.integers(-3000, 3000, size=chunk_size, dtype=np.int16)
-            future = executor.submit(_run_inference, chunk, caches)
-            _, caches = future.result()
+            feats, _ = self._firered.audio_feat.extract(chunk)
+            if feats.size(0) > 0:
+                with torch.no_grad():
+                    self._firered.vad_model.forward(
+                        feats.unsqueeze(0), caches=self._firered.model_caches
+                    )
 
-        caches = None  # reset
+        self._firered.reset()
 
+        # Benchmark
         total_start = time.perf_counter()
-        for i in range(iterations):
+        for i in range(n):
             if i % 3 == 0:
                 chunk = np.zeros(chunk_size, dtype=np.int16)
             elif i % 3 == 1:
@@ -250,47 +205,77 @@ class VAD(agents.vad.VAD):
                 chunk = rng.integers(-20000, 20000, size=chunk_size, dtype=np.int16)
 
             t0 = time.perf_counter()
-            future = executor.submit(_run_inference, chunk, caches)
-            _, caches = future.result()
+            feats, _ = self._firered.audio_feat.extract(chunk)
+            if feats.size(0) > 0:
+                with torch.no_grad():
+                    probs, self._firered.model_caches = self._firered.vad_model.forward(
+                        feats.unsqueeze(0), caches=self._firered.model_caches
+                    )
             elapsed = time.perf_counter() - t0
             stats.latencies.append(elapsed)
             stats.inference_count += 1
 
         stats.total_time = time.perf_counter() - total_start
+        self._firered.reset()
         self._profiling_stats = stats
-        loop.close()
         return stats
 
-    def stream(self) -> FireRedVADMPStream:
-        stream = FireRedVADMPStream(self, self._opts, self._firered, self._config)
+    def stream(self) -> FireRedVADStream:
+        stream = FireRedVADStream(self, self._opts, self._firered, self._config)
         self._streams.add(stream)
         return stream
 
-    def update_options(self, **kwargs) -> None:
-        for key, val in kwargs.items():
-            if is_given(val) and hasattr(self._opts, key):
-                setattr(self._opts, key, val)
+    def update_options(
+        self,
+        *,
+        min_speech_duration: NotGivenOr[float] = NOT_GIVEN,
+        min_silence_duration: NotGivenOr[float] = NOT_GIVEN,
+        prefix_padding_duration: NotGivenOr[float] = NOT_GIVEN,
+        max_buffered_speech: NotGivenOr[float] = NOT_GIVEN,
+        activation_threshold: NotGivenOr[float] = NOT_GIVEN,
+        deactivation_threshold: NotGivenOr[float] = NOT_GIVEN,
+    ) -> None:
+        if is_given(min_speech_duration):
+            self._opts.min_speech_duration = min_speech_duration
+        if is_given(min_silence_duration):
+            self._opts.min_silence_duration = min_silence_duration
+        if is_given(prefix_padding_duration):
+            self._opts.prefix_padding_duration = prefix_padding_duration
+        if is_given(max_buffered_speech):
+            self._opts.max_buffered_speech = max_buffered_speech
+        if is_given(activation_threshold):
+            self._opts.activation_threshold = activation_threshold
 
 
-class FireRedVADMPStream(agents.vad.VADStream):
-    def __init__(self, vad, opts, firered, config) -> None:
+class FireRedVADStream(agents.vad.VADStream):
+    def __init__(
+        self,
+        vad: VAD,
+        opts: _FireRedVADOptions,
+        firered: FireRedStreamVad,
+        config: FireRedStreamVadConfig,
+    ) -> None:
         super().__init__(vad)
         self._opts = opts
-        self._config = config
         self._firered = firered
+        self._config = config
         self._loop = asyncio.get_event_loop()
 
         self._input_sample_rate = 0
         self._speech_buffer: np.ndarray | None = None
         self._speech_buffer_max_reached = False
         self._prefix_padding_samples = 0
+
+        # Audio accumulation buffer (int16 samples at 16kHz)
         self._audio_buf = np.empty(0, dtype=np.int16)
 
-        # Per-stream stateful caches (passed to/from worker)
+        # FireRedVAD stateful objects (per-stream copy)
         self._model_caches = None
         self._postprocessor = firered.postprocessor
         self._postprocessor.reset()
+        self._firered_ref = firered
 
+        # Profiling
         self._profiling = opts.profiling
         self._stream_stats = ProfilingStats() if self._profiling else None
         self._stream_start_time: float | None = None
@@ -312,8 +297,8 @@ class FireRedVADMPStream(agents.vad.VADStream):
         pub_timestamp = 0.0
 
         resampler: rtc.AudioResampler | None = None
-        frame_shift = FRAME_SHIFT_SAMPLE
-        executor = _get_vad_executor()
+
+        frame_shift = FRAME_SHIFT_SAMPLE  # 160 samples at 16kHz = 10ms
 
         async for input_frame in self._input_ch:
             if not isinstance(input_frame, rtc.AudioFrame):
@@ -329,20 +314,24 @@ class FireRedVADMPStream(agents.vad.VADStream):
                     + self._prefix_padding_samples,
                     dtype=np.int16,
                 )
+
                 if self._input_sample_rate != SAMPLE_RATE:
                     resampler = rtc.AudioResampler(
                         input_rate=self._input_sample_rate,
                         output_rate=SAMPLE_RATE,
                         quality=rtc.AudioResamplerQuality.QUICK,
                     )
+
             elif self._input_sample_rate != input_frame.sample_rate:
                 logger.error("a frame with another sample rate was already pushed")
                 continue
 
             assert self._speech_buffer is not None
 
+            # Resample if needed, accumulate int16 samples
             if resampler is not None:
-                for rf in resampler.push(input_frame):
+                resampled = resampler.push(input_frame)
+                for rf in resampled:
                     self._audio_buf = np.append(
                         self._audio_buf, np.array(rf.data, dtype=np.int16)
                     )
@@ -351,6 +340,7 @@ class FireRedVADMPStream(agents.vad.VADStream):
                     self._audio_buf, np.array(input_frame.data, dtype=np.int16)
                 )
 
+            # Copy to speech buffer
             input_data = np.array(input_frame.data, dtype=np.int16)
             available_space = len(self._speech_buffer) - speech_buffer_index
             to_copy = min(len(input_data), available_space)
@@ -363,20 +353,31 @@ class FireRedVADMPStream(agents.vad.VADStream):
                 self._speech_buffer_max_reached = True
                 logger.warning("max_buffered_speech reached")
 
+            # Process complete 10ms frames
             while len(self._audio_buf) >= frame_shift:
                 start_time = time.perf_counter()
 
-                chunk = self._audio_buf[:frame_shift].copy()
+                chunk = self._audio_buf[:frame_shift]
                 self._audio_buf = self._audio_buf[frame_shift:]
 
-                # Run inference in worker process
-                p, self._model_caches = await self._loop.run_in_executor(
-                    executor, _run_inference, chunk, self._model_caches
-                )
+                # Extract fbank features
+                feats, _ = self._firered_ref.audio_feat.extract(chunk)
 
+                p = 0.0
+                if feats.size(0) > 0:
+                    with torch.no_grad():
+                        probs, self._model_caches = (
+                            self._firered_ref.vad_model.forward(
+                                feats.unsqueeze(0), caches=self._model_caches
+                            )
+                        )
+                        # probs shape: (1, T, 1) — take last frame probability
+                        p = probs[0, -1, 0].item()
+
+                # Run through postprocessor
                 frame_result = self._postprocessor.process_one_frame(p)
 
-                window_duration = FRAME_SHIFT_SAMPLE / SAMPLE_RATE
+                window_duration = FRAME_SHIFT_SAMPLE / SAMPLE_RATE  # 0.01s
                 pub_current_sample += frame_shift
                 pub_timestamp += window_duration
 
@@ -391,6 +392,7 @@ class FireRedVADMPStream(agents.vad.VADStream):
                 else:
                     pub_silence_duration += window_duration
 
+                # Emit INFERENCE_DONE
                 self._event_ch.send_nowait(
                     agents.vad.VADEvent(
                         type=agents.vad.VADEventType.INFERENCE_DONE,
@@ -414,11 +416,12 @@ class FireRedVADMPStream(agents.vad.VADStream):
 
                 def _copy_speech_buffer() -> rtc.AudioFrame:
                     assert self._speech_buffer is not None
+                    speech_data = self._speech_buffer[:speech_buffer_index].tobytes()
                     return rtc.AudioFrame(
                         sample_rate=self._input_sample_rate,
                         num_channels=1,
                         samples_per_channel=speech_buffer_index,
-                        data=self._speech_buffer[:speech_buffer_index].tobytes(),
+                        data=speech_data,
                     )
 
                 def _reset_write_cursor() -> None:
@@ -426,17 +429,19 @@ class FireRedVADMPStream(agents.vad.VADStream):
                     assert self._speech_buffer is not None
                     if speech_buffer_index <= self._prefix_padding_samples:
                         return
-                    padding = self._speech_buffer[
+                    padding_data = self._speech_buffer[
                         speech_buffer_index - self._prefix_padding_samples: speech_buffer_index
                     ]
                     self._speech_buffer_max_reached = False
-                    self._speech_buffer[: self._prefix_padding_samples] = padding
+                    self._speech_buffer[: self._prefix_padding_samples] = padding_data
                     speech_buffer_index = self._prefix_padding_samples
 
+                # Map FireRedVAD state transitions to LiveKit events
                 if frame_result.is_speech_start and not pub_speaking:
                     pub_speaking = True
                     pub_silence_duration = 0.0
                     pub_speech_duration = 0.0
+
                     self._event_ch.send_nowait(
                         agents.vad.VADEvent(
                             type=agents.vad.VADEventType.START_OF_SPEECH,
@@ -448,9 +453,11 @@ class FireRedVADMPStream(agents.vad.VADStream):
                             speaking=True,
                         )
                     )
+
                 elif frame_result.is_speech_end and pub_speaking:
                     pub_speaking = False
                     pub_silence_duration = 0.0
+
                     self._event_ch.send_nowait(
                         agents.vad.VADEvent(
                             type=agents.vad.VADEventType.END_OF_SPEECH,
@@ -462,15 +469,20 @@ class FireRedVADMPStream(agents.vad.VADStream):
                             speaking=False,
                         )
                     )
+
                     pub_speech_duration = 0.0
                     _reset_write_cursor()
+
                 elif not pub_speaking:
                     _reset_write_cursor()
 
+        # Log profiling stats when stream ends
         if (
             self._profiling
             and self._stream_stats is not None
             and self._stream_start_time is not None
         ):
             self._stream_stats.total_time = time.perf_counter() - self._stream_start_time
-            logger.info("FireRedVAD (MP) stream:\n%s", self._stream_stats.summary())
+            logger.info(
+                "FireRedVAD stream profiling:\n%s", self._stream_stats.summary()
+            )
