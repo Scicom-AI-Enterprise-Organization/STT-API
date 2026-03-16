@@ -22,7 +22,7 @@ dependencies = [
     "six",
     "uroman",
     "Unidecode",
-    "transformers>=4.57.6",
+    "transformers>=4.47.1",
     "kaldiio==2.18.0",
     "kaldi_native_fbank>=1.15",
     "setuptools==80.10.2"
