@@ -1,2 +1,2 @@
-FROM vllm/vllm-openai:nightly-8fae54faff485e446dc8d1a700417f07659ef89e
+FROM vllm/vllm-openai:v0.17.1
 RUN pip install librosa
