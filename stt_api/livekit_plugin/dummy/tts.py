@@ -17,9 +17,10 @@ class _DummyStream(tts.ChunkedStream):
         )
 
     async def _run(self, output_emitter: tts.AudioEmitter) -> None:
+        output_emitter.start_segment()
         silence = np.zeros(int(SAMPLE_RATE * 0.1), dtype=np.int16)
         output_emitter.push(silence.tobytes())
-        output_emitter.flush()
+        output_emitter.end_segment()
 
 
 class TTS(tts.TTS):
