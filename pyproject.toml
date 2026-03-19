@@ -43,5 +43,5 @@ python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
 
-[tool.setuptools]
-packages = ["stt_api"]
+[tool.setuptools.packages.find]
+include = ["stt_api*"]
