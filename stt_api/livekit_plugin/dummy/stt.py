@@ -26,7 +26,7 @@ class STT(stt.STT):
         *,
         language: str = "en",
     ) -> None:
-        super().__init__(capabilities=stt.STTCapabilities(streaming=True, interim_results=True))
+        super().__init__(capabilities=stt.STTCapabilities(streaming=False, interim_results=False))
         self._language = language
         self._transcript_index = 0
 
@@ -63,51 +63,3 @@ class STT(stt.STT):
                 )
             ],
         )
-
-    def stream(
-        self,
-        *,
-        language: NotGivenOr[str] = NOT_GIVEN,
-        conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS,
-    ) -> DummyRecognizeStream:
-        return DummyRecognizeStream(
-            stt=self,
-            conn_options=conn_options,
-            language=self._language,
-            get_transcript=self._next_transcript,
-        )
-
-
-class DummyRecognizeStream(stt.RecognizeStream):
-    """Dummy streaming STT that emits a canned transcript when audio is flushed."""
-
-    def __init__(
-        self,
-        *,
-        stt: STT,
-        conn_options: APIConnectOptions,
-        language: str,
-        get_transcript: callable,
-    ) -> None:
-        super().__init__(stt=stt, conn_options=conn_options)
-        self._language = language
-        self._get_transcript = get_transcript
-
-    async def _run(self) -> None:
-        async for data in self._input_ch:
-            if isinstance(data, self._FlushSentinel):
-                text = self._get_transcript()
-                logger.debug("dummy STT stream recognized: %s", text)
-                self._event_ch.send_nowait(
-                    stt.SpeechEvent(
-                        type=stt.SpeechEventType.FINAL_TRANSCRIPT,
-                        request_id=str(uuid.uuid4()),
-                        alternatives=[
-                            stt.SpeechData(
-                                language=self._language,
-                                text=text,
-                                confidence=1.0,
-                            )
-                        ],
-                    )
-                )
