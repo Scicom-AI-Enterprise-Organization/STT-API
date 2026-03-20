@@ -14,7 +14,7 @@ logger = logging.getLogger("dummy-tts")
 
 SAMPLE_RATE = 24000
 NUM_CHANNELS = 1
-AUDIO_FILE = os.path.join(os.path.dirname(__file__), "audio", "tawaran.mp3")
+AUDIO_FILE = os.path.join(os.path.dirname(__file__), "audio", "tawaran.wav")
 
 _cached_audio: bytes | None = None
 

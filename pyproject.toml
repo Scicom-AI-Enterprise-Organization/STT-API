@@ -43,5 +43,8 @@ python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
 
+[tool.setuptools.package-data]
+"stt_api.livekit_plugin.dummy" = ["audio/*.mp3", "audio/*.wav"]
+
 [tool.setuptools.packages.find]
 include = ["stt_api*"]
