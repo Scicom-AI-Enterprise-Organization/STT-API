@@ -1479,7 +1479,7 @@ async def websocket_stt(
 
 if ENABLE_FORCE_ALIGNMENT:
     from app.force_alignment.model import queue_force_align, load_global_alignment_model, step
-    
+
     load_global_alignment_model()
 
     @app.post("/force_align")

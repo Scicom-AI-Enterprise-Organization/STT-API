@@ -315,7 +315,7 @@ def process_chunks_batch_incremental(
 ) -> List[int]:
     """DEPRECATED: Use run_online_diarization() instead."""
     from app.clustering_torch import StreamingKMeansMaxClusterTorch
-    
+
     model = get_speaker_model()
     speaker_ids = []
 
