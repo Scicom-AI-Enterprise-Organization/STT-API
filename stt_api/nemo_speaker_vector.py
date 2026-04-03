@@ -12,11 +12,11 @@ import yaml
 import numpy as np
 import torch.nn as nn
 from typing import List, Tuple
-from app.nemo_featurization import AudioToMelSpectrogramPreprocessor
-from app.nemo import conv_asr
-from app.nemo.conv_asr import SpeakerDecoder
-from app.torch_utils import to_tensor_cuda, to_numpy
-from app.huggingface import download_files
+from stt_api.nemo_featurization import AudioToMelSpectrogramPreprocessor
+from stt_api.nemo import conv_asr
+from stt_api.nemo.conv_asr import SpeakerDecoder
+from stt_api.torch_utils import to_tensor_cuda, to_numpy
+from stt_api.huggingface import download_files
 
 def sequence_1d(
     seq, maxlen=None, padding: str = 'post', pad_int=0, return_len=False

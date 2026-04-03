@@ -959,3 +959,105 @@ Watch these metrics under load:
 - Memory usage (keep below 80%)
 - P95 latency (should stay below audio duration for real-time processing)
 - Success rate (should be 100%)
+
+---
+ 
+## Diarization Benchmark
+ 
+### Overview
+ 
+Benchmarks the diarization component of STT-API using the AMI dataset from HuggingFace. Evaluation measures how accurately the system identifies **who spoke when** in a multi-speaker recording.
+ 
+Two online diarization algorithms are benchmarked:
+- **kmeans** — TitaNet Large + StreamingKMeans clustering
+- **birch** — TitaNet Large + StreamingBIRCH clustering
+ 
+Each algorithm is tested across 7 `speaker_similarity` thresholds (0.2 → 0.8).
+ 
+### What is DER?
+ 
+**DER (Diarization Error Rate)** is the standard metric for evaluating speaker diarization. It measures the fraction of time incorrectly attributed to the wrong speaker or incorrectly labeled as speech/non-speech.
+ 
+```
+DER = (False Alarm + Missed Detection + Speaker Confusion) / Total Reference Speech Duration
+```
+ 
+| Component | Description |
+|---|---|
+| **False Alarm** | System labels non-speech regions as speech |
+| **Missed Detection** | System fails to detect actual speech |
+| **Speaker Confusion** | Speech is attributed to the wrong speaker |
+ 
+A lower DER means better performance. A DER of 0% means perfect diarization.
+ 
+### Datasets
+ 
+| Dataset | Description |
+|---|---|
+| [diarizers-community/ami](https://huggingface.co/datasets/diarizers-community/ami) | Meeting recordings with multiple speakers, challenging overlapping speech |
+| [diarizers-community/voxconverse](https://huggingface.co/datasets/diarizers-community/voxconverse) | Multispeaker audio dataset derived from YouTube videos |
+ 
+### Baseline Results (diarizers Test class)
+ 
+Evaluated using the `Test` class from [huggingface/diarizers](https://github.com/huggingface/diarizers/blob/main/src/diarizers/test.py) directly against the pyannote segmentation model.
+ 
+| Dataset | DER | False Alarm | Missed Detection | Confusion |
+|---|---|---|---|---|
+| AMI | 17.93% | 4.03% | 10.04% | 3.86% |
+| VoxConverse | 11.20% | 4.32% | 3.52% | 3.36% |
+ 
+### STT-API Diarization Results (AMI)
+ 
+Benchmarked kmeans and birch across `speaker_similarity` thresholds 0.2 → 0.8 on the AMI test set.
+ 
+Total benchmark time: **16.35 minutes**
+ 
+| Algorithm | Similarity | AMI DER (%) |
+|---|---|---|
+| kmeans | 0.2 | 87.77 |
+| kmeans | 0.3 | 86.20 |
+| kmeans | 0.4 | 82.71 |
+| kmeans | 0.5 | 80.17 |
+| kmeans | 0.6 | 78.19 |
+| kmeans | 0.7 | 76.64 |
+| kmeans | 0.8 | 75.41 |
+| birch | 0.2 | 83.98 |
+| birch | 0.3 | 85.49 |
+| birch | 0.4 | 82.22 |
+| birch | 0.5 | 79.52 |
+| birch | 0.6 | 77.68 |
+| birch | 0.7 | 77.70 |
+| **birch** | **0.8** | **75.38** ✅ best |
+ 
+### Key Findings
+ 
+- **Best: birch with `speaker_similarity=0.8`**, achieving DER of **75.38%** on AMI.
+- Both algorithms show a clear trend: higher similarity threshold → lower DER.
+- birch slightly outperforms kmeans across most similarity thresholds.
+- Lower similarity thresholds (0.2–0.3) produce higher DER (84–88%) due to over-segmentation.
+ 
+### How to Reproduce
+ 
+```bash
+# 1. Install dependencies
+pip install pyannote.metrics soundfile "datasets==2.21.0" aiohttp onnxruntime
+ 
+# 2. Start the local STT-API server (in a separate terminal)
+STT_API_URL=https://stt-engine-tm-l40.aies.scicom.dev uvicorn stt_api.main:app --host 0.0.0.0 --port 9091
+ 
+# 3. Run the benchmark
+python3.10 benchmark_diarization.py
+```
+ 
+ 
+### Environment
+ 
+| Component | Details |
+|---|---|
+| Dataset | [diarizers-community/ami](https://huggingface.co/datasets/diarizers-community/ami) IHM, test split |
+| Baseline evaluation | [huggingface/diarizers test.py](https://github.com/huggingface/diarizers/blob/main/src/diarizers/test.py) |
+| Speaker embedding model | TitaNet Large (`huseinzol05/nemo-titanet_large`) |
+| Online clustering | StreamingKMeans / StreamingBIRCH |
+| STT engine | `https://stt-engine-tm-l40.aies.scicom.dev` |
+| Evaluation metric | DER via `pyannote.metrics` |
+| Benchmark script | `benchmark_diarization.py` |

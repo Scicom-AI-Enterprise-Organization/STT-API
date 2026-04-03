@@ -41,7 +41,7 @@ def load_speaker_model():
     if _speaker_model is not None:
         return _speaker_model
 
-    from app.nemo_speaker_vector import nemo_speaker_vector
+    from stt_api.nemo_speaker_vector import nemo_speaker_vector
 
     logger.info("Loading TitaNet Large speaker embedding model...")
     _speaker_model = nemo_speaker_vector(model="huseinzol05/nemo-titanet_large")
@@ -198,7 +198,7 @@ def run_online_diarization(
     Returns:
         Dictionary mapping chunk_index -> speaker_id (0-indexed)
     """
-    from app.clustering_torch import StreamingKMeansMaxClusterTorch, StreamingBIRCHTorch
+    from stt_api.clustering_torch import StreamingKMeansMaxClusterTorch, StreamingBIRCHTorch
     import torch
     import time
 
@@ -293,7 +293,7 @@ def process_chunk_incremental(
     diarization_cluster,
 ) -> int:
     """DEPRECATED: Use run_online_diarization() instead."""
-    from app.clustering_torch import StreamingKMeansMaxClusterTorch
+    from stt_api.clustering_torch import StreamingKMeansMaxClusterTorch
 
     model = get_speaker_model()
     with torch.no_grad():
@@ -314,7 +314,7 @@ def process_chunks_batch_incremental(
     batch_size: int = SPEAKER_EMBEDDING_BATCH_SIZE,
 ) -> List[int]:
     """DEPRECATED: Use run_online_diarization() instead."""
-    from app.clustering_torch import StreamingKMeansMaxClusterTorch
+    from stt_api.clustering_torch import StreamingKMeansMaxClusterTorch
 
     model = get_speaker_model()
     speaker_ids = []

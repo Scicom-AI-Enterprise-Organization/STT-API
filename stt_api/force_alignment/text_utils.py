@@ -2,7 +2,7 @@ import re
 import unicodedata
 import numpy as np
 from uroman import Uroman
-from app.force_alignment.norm_config import norm_config
+from stt_api.force_alignment.norm_config import norm_config
 
 uroman_instance = Uroman()
 
