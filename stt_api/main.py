@@ -20,7 +20,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 import librosa
 import soundfile as sf
-from stt_api.diarization import load_speaker_model, run_online_diarization
+from app.diarization import load_speaker_model, run_online_diarization
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -184,7 +184,7 @@ def init_vad_worker():
 
 def init_diarization_worker():
     """Initialize diarization model in worker process."""
-    from stt_api.diarization import load_speaker_model
+    from app.diarization import load_speaker_model
 
     load_speaker_model()
     logger.info(f"Worker {os.getpid()} initialized with speaker model")
@@ -1478,8 +1478,8 @@ async def websocket_stt(
         manager.disconnect(client_id)
 
 if ENABLE_FORCE_ALIGNMENT:
-    from stt_api.force_alignment.model import queue_force_align, load_global_alignment_model, step
-
+    from app.force_alignment.model import queue_force_align, load_global_alignment_model, step
+    
     load_global_alignment_model()
 
     @app.post("/force_align")

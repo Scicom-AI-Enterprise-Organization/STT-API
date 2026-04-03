@@ -9,7 +9,7 @@ from packaging import version
 from transformers import AutoModelForCTC, AutoTokenizer
 from transformers import __version__ as transformers_version
 from transformers.utils import is_flash_attn_2_available
-from stt_api.force_alignment.text_utils import text_normalize, split_text, get_uroman_tokens
+from app.force_alignment.text_utils import text_normalize, split_text, get_uroman_tokens
 import asyncio
 import math
 import librosa
