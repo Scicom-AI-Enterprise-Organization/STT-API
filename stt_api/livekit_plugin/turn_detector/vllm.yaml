@@ -1,0 +1,37 @@
+version: '3.8'
+services:
+  turn-detector:
+    env_file:
+      - .env
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: turn-detector
+    ports:
+      - "9094:9094"
+    shm_size: 512mb
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0"]
+              capabilities: [gpu]
+    networks:
+      - turn-detector-network
+    command:
+      - --model
+      - ${TURN_DETECTOR_MODEL:-Scicom-intl/Malaysian-Turn-Detector-Qwen3-1.7B}
+      - --served-model-name
+      - ${TURN_DETECTOR_SERVE_MODEL_NAME:-livekit/turn-detector}
+      - --port
+      - "9094"
+      - --gpu-memory-utilization
+      - ${GPU_MEM_UTIL:-0.10}
+      - --max-model-len
+      - "2048"
+      - --no-enable-prefix-caching
+
+networks:
+  turn-detector-network:
+    external: true
