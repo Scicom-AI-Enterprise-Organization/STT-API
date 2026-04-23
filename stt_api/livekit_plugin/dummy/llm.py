@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import uuid
+from typing import List, Optional
 
 from livekit.agents import llm
 from livekit.agents.types import APIConnectOptions, DEFAULT_API_CONNECT_OPTIONS, NOT_GIVEN, NotGivenOr
@@ -41,7 +42,7 @@ class LLM(llm.LLM):
         self,
         *,
         chat_ctx: llm.ChatContext,
-        tools: list[llm.Tool] | None = None,
+        tools: Optional[List[llm.Tool]] = None,
         conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS,
         parallel_tool_calls: NotGivenOr[bool] = NOT_GIVEN,
         tool_choice: NotGivenOr[llm.ToolChoice] = NOT_GIVEN,
@@ -64,7 +65,7 @@ class DummyLLMStream(llm.LLMStream):
         *,
         llm: LLM,
         chat_ctx: llm.ChatContext,
-        tools: list[llm.Tool],
+        tools: List[llm.Tool],
         conn_options: APIConnectOptions,
         response_text: str,
     ) -> None:

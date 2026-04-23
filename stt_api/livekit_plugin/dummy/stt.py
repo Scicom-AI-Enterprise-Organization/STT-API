@@ -3,7 +3,6 @@ from __future__ import annotations
 import logging
 import uuid
 
-from livekit import rtc
 from livekit.agents import stt, utils
 from livekit.agents.types import APIConnectOptions, DEFAULT_API_CONNECT_OPTIONS, NOT_GIVEN, NotGivenOr
 

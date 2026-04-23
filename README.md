@@ -126,11 +126,17 @@ A custom fork of `livekit-plugins-turn-detector` with vLLM backend support for e
 ### Installation
 
 ```bash
-# Core STT-API (includes turn detector base deps)
+# Core package only
 pip install .
 
-# With full LiveKit agent stack
+# With the LiveKit turn detector plugin
 pip install ".[livekit]"
+
+# With the full STT API server stack
+pip install ".[server]"
+
+# With both server and LiveKit integrations
+pip install ".[server,livekit]"
 ```
 
 ### Usage
@@ -214,7 +220,7 @@ The API will be available at `http://localhost:9091`.
 ### Running Without Docker
 
 ```bash
-uv sync
+uv sync --extra server
 uv run uvicorn stt_api.main:app --host 0.0.0.0 --port 9091
 ```
 
