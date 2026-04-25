@@ -5,16 +5,16 @@ import os
 import re
 import unicodedata
 from time import perf_counter
+from typing import Any, Dict, List, Optional
 
 import aiohttp
 from transformers import AutoTokenizer
 
-from livekit.agents import LanguageCode, Plugin, llm, utils
+from livekit.agents import llm, utils
 from livekit.agents.inference_runner import _InferenceRunner
 
-from livekit.plugins.turn_detector.base import MAX_HISTORY_TURNS, EOUModelBase, EOUPlugin, _EUORunnerBase
+from livekit.plugins.turn_detector.base import MAX_HISTORY_TURNS, EOUModelBase, _EUORunnerBase
 from livekit.plugins.turn_detector.log import logger
-from livekit.plugins.turn_detector.models import EOUModelType
 
 REMOTE_INFERENCE_TIMEOUT = 2
 VLLM_MODEL = "livekit/turn-detector"
@@ -35,13 +35,12 @@ def _get_tokenizer():
 class _EUORunnerMultilingual(_EUORunnerBase):
     INFERENCE_METHOD = "lk_end_of_utterance_multilingual"
 
-    @classmethod
-    def model_type(cls) -> EOUModelType:
-        return "multilingual"
+    def __init__(self) -> None:
+        super().__init__("multilingual")
 
 
 class MultilingualModel(EOUModelBase):
-    def __init__(self, *, unlikely_threshold: float | None = None):
+    def __init__(self, *, unlikely_threshold: Optional[float] = None):
         super().__init__(
             model_type="multilingual",
             unlikely_threshold=unlikely_threshold,
@@ -51,14 +50,14 @@ class MultilingualModel(EOUModelBase):
     def _inference_method(self) -> str:
         return _EUORunnerMultilingual.INFERENCE_METHOD
 
-    async def unlikely_threshold(self, language: LanguageCode | None) -> float | None:
+    async def unlikely_threshold(self, language: Optional[str]) -> Optional[float]:
         if not language:
             return None
         if _remote_inference_url():
             return self._unlikely_threshold if self._unlikely_threshold is not None else 0.5
         return await super().unlikely_threshold(language)
 
-    async def supports_language(self, language: LanguageCode | None) -> bool:
+    async def supports_language(self, language: Optional[str]) -> bool:
         if _remote_inference_url():
             return True
         return await self.unlikely_threshold(language) is not None
@@ -67,7 +66,7 @@ class MultilingualModel(EOUModelBase):
         self,
         chat_ctx: llm.ChatContext,
         *,
-        timeout: float | None = 3,
+        timeout: Optional[float] = 3,
     ) -> float:
         url = _remote_inference_url()
         if not url:
@@ -119,16 +118,17 @@ def _normalize_text(text: str) -> str:
 
 
 def _build_chatml_prompt(chat_ctx: llm.ChatContext) -> str:
-    # Normalize and merge consecutive same-role messages
-    normalized: list[dict[str, str]] = []
-    last: dict[str, str] | None = None
-    for msg in chat_ctx.messages():
-        if msg.role not in ("user", "assistant"):
+    normalized: List[Dict[str, str]] = []
+    last: Optional[Dict[str, str]] = None
+    for item in chat_ctx.items:
+        if getattr(item, "type", None) != "message":
             continue
-        content = _normalize_text(msg.text_content or "")
+        if item.role not in ("user", "assistant"):
+            continue
+        content = _normalize_text(item.text_content or "")
         if not content:
             continue
-        role = msg.role
+        role = item.role
         if last and last["role"] == role:
             last["content"] += f" {content}"
         else:
@@ -139,7 +139,6 @@ def _build_chatml_prompt(chat_ctx: llm.ChatContext) -> str:
     text = _get_tokenizer().apply_chat_template(
         normalized, add_generation_prompt=False, add_special_tokens=False, tokenize=False
     )
-    # Remove the last <|im_end|> so the model predicts whether the turn is over
     ix = text.rfind("<|im_end|>")
     if ix != -1:
         text = text[:ix]
@@ -147,7 +146,7 @@ def _build_chatml_prompt(chat_ctx: llm.ChatContext) -> str:
     return text
 
 
-def _extract_eot_probability(data: dict) -> float:
+def _extract_eot_probability(data: Dict[str, Any]) -> float:
     try:
         token_logprob = data["choices"][0]["logprobs"]["token_logprobs"][0]
         probability = math.exp(token_logprob)
@@ -161,7 +160,7 @@ def _extract_eot_probability(data: dict) -> float:
         return 1.0
 
 
-def _remote_inference_url() -> str | None:
+def _remote_inference_url() -> Optional[str]:
     url_base = os.getenv("LIVEKIT_REMOTE_EOT_URL")
     if not url_base:
         return None
@@ -170,4 +169,3 @@ def _remote_inference_url() -> str | None:
 
 if not _remote_inference_url():
     _InferenceRunner.register_runner(_EUORunnerMultilingual)
-Plugin.register_plugin(EOUPlugin(_EUORunnerMultilingual))

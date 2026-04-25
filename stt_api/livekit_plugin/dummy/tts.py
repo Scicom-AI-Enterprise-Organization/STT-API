@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import uuid
+from typing import Optional
 
 import soundfile as sf
 
@@ -16,7 +17,7 @@ SAMPLE_RATE = 24000
 NUM_CHANNELS = 1
 AUDIO_FILE = os.path.join(os.path.dirname(__file__), "audio", "tawaran.wav")
 
-_cached_audio: bytes | None = None
+_cached_audio: Optional[bytes] = None
 
 
 def _load_audio() -> bytes:
