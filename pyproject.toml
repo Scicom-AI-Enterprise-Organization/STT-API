@@ -7,7 +7,7 @@ name = "stt-api"
 version = "0.1.0"
 description = "Long audio transcription API with VAD"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 dependencies = [
     "aiohttp",
     "transformers>=4.57.6",
