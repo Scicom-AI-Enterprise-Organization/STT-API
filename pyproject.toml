@@ -17,6 +17,11 @@ dependencies = [
 livekit = [
     "livekit-agents[turn-detector]~=1.2",
     "soundfile",
+    # Self-hosted noise cancellation (livekit_plugin/noise_cancellation). Both
+    # already come in with livekit-plugins-silero, so an agent that installs plain
+    # `stt-api` alongside the LiveKit plugins still has them.
+    "onnxruntime",
+    "numpy",
 ]
 server = [
     "fastapi==0.110.2",
@@ -53,6 +58,9 @@ python_functions = ["test_*"]
 
 [tool.setuptools.package-data]
 "stt_api.livekit_plugin.dummy" = ["audio/*.mp3", "audio/*.wav"]
+# The ONNX weights ship in the wheel; without this the plugin raises at session
+# start on an installed copy while working fine from a source checkout.
+"stt_api.livekit_plugin.noise_cancellation" = ["resources/*.onnx", "resources/LICENSE.*"]
 
 [tool.setuptools.packages.find]
 include = ["stt_api*"]
