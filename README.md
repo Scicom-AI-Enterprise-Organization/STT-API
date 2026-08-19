@@ -137,6 +137,10 @@ pip install ".[server]"
 
 # With both server and LiveKit integrations
 pip install ".[server,livekit]"
+
+# WER/CER scoring (stt_api.evaluation) works with the core install; this extra is
+# only needed by load_canonical, which reads dataset variant maps from HuggingFace
+pip install ".[evaluation]"
 ```
 
 ### Usage
@@ -161,6 +165,44 @@ export LIVEKIT_REMOTE_EOT_URL="https://your-vllm-endpoint.example.com"
 ```
 
 When `LIVEKIT_REMOTE_EOT_URL` is unset, the plugin falls back to local inference using the HuggingFace model `livekit/turn-detector`.
+
+---
+
+## Transcription Scoring (`stt_api.evaluation`)
+
+WER/CER for ASR output, reported twice: as an ordinary scorer charges it, and again with
+spelling conventions normalized away — so you can see how much of a WER is the model and
+how much is the reference and the hypothesis disagreeing about how to *write* the same
+words (`dua puluh tiga` vs `23`, `okay lah` vs `ok la`, `[laugh]` vs nothing).
+
+Standard library only; the default mode does no network I/O.
+
+```python
+from stt_api.evaluation import score
+
+r = score("saya bayar 23 ringgit", "saya bayar dua puluh tiga ringgit")
+r.wer                     # [0.5]   as scored
+r.normalized_wer          # [0.0]   the whole error was how a number was written
+r.normalized_hypothesis   # ['saya bayar 23 ringgit']
+r.normalized_reference    # ['saya bayar 23 ringgit']
+```
+
+Argument order is `(hypothesis, reference)` — ASR output first. Pass one string pair or
+two equal-length lists; the result is always lists, plus pooled `corpus_wer` /
+`corpus_cer`.
+
+```bash
+python -m stt_api.evaluation --input pairs.csv      # ref,hyp columns
+python -m stt_api.evaluation --self-test            # offline checks, no data needed
+```
+
+An optional LLM pass handles the residue the rules cannot settle — configure it by copying
+[`stt_api/evaluation/.env.example`](stt_api/evaluation/.env.example) to
+`stt_api/evaluation/.env` (`OPENAI_BASE_URL` / `OPENAI_API_KEY` / `MODEL_NAME`). Every edit
+it proposes is validated as convention-only and reverted otherwise.
+
+See [`stt_api/evaluation/README.md`](stt_api/evaluation/README.md) for the full API,
+`.env` setup, dataset variant maps, and how to read the numbers honestly.
 
 ---
 

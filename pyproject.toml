@@ -42,6 +42,14 @@ server = [
     "pyyaml",
     "huggingface_hub",
 ]
+# stt_api.evaluation (WER/CER scoring with spelling conventions normalized away) is
+# standard-library only — including its LLM pass, which speaks plain urllib. This
+# extra is needed ONLY by `load_canonical`, which pulls a dataset's declared
+# variant map out of HuggingFace parquet.
+evaluation = [
+    "huggingface_hub",
+    "pyarrow",
+]
 dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.23.0",
@@ -61,6 +69,9 @@ python_functions = ["test_*"]
 # The ONNX weights ship in the wheel; without this the plugin raises at session
 # start on an installed copy while working fine from a source checkout.
 "stt_api.livekit_plugin.noise_cancellation" = ["resources/*.onnx", "resources/LICENSE.*"]
+# The LLM-pass config template, so `cp .../.env.example .../.env` also works for
+# someone who pip-installed rather than cloned.
+"stt_api.evaluation" = [".env.example"]
 
 [tool.setuptools.packages.find]
 include = ["stt_api*"]
