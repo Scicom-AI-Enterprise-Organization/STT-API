@@ -167,52 +167,53 @@ Only needed for `mode="llm"`, `"both"`, or `"pair"`. Nothing about any endpoint 
 in — it speaks plain `POST {base_url}/chat/completions`, so vLLM, OpenRouter, the OpenAI
 API and any internal proxy all work.
 
-Three variables — copy [`.env.example`](.env.example) and fill it in:
+Three environment variables. **Set them in the environment and nothing else is needed** —
+no file, no client object. That is the normal path for a `pip install git+...` copy, which
+has nowhere sensible to put a `.env`:
 
 ```bash
-cp stt_api/evaluation/.env.example stt_api/evaluation/.env
+export OPENAI_BASE_URL=https://your-endpoint.example.com/v1   # must end in /v1
+export OPENAI_API_KEY=sk-...                                  # sent as Bearer; non-empty even for a local vLLM
+export MODEL_NAME=your-model-id                               # or OPENAI_MODEL
 ```
 
-```bash
-OPENAI_BASE_URL=https://your-endpoint.example.com/v1   # must end in /v1
-OPENAI_API_KEY=sk-...                                  # sent as Bearer; non-empty even for a local vLLM
-MODEL_NAME=your-model-id                               # or OPENAI_MODEL
+```python
+from stt_api.evaluation import score
+
+r = score(hyps, refs, mode="both")     # reads the environment on its own
 ```
 
-`.env` is git-ignored (including this one, inside the package); `.env.example` is
-tracked.
+These four names (`OPENAI_BASE_URL`, `OPENAI_API_KEY`, `MODEL_NAME`, `OPENAI_MODEL`) are
+the only ones this package ever reads — `stt_api.evaluation.ENV_KEYS` — and it never writes
+any of them back.
 
-**From the process environment** (nothing else to do):
+If you would rather be explicit, or the config lives somewhere the environment doesn't:
 
 ```python
 from stt_api.evaluation import LLMClient, score
 
-client = LLMClient.from_env()
+client = LLMClient.from_env()                                  # process environment
+client = LLMClient.from_env(env_file="path/to/.env")           # a file, if you have one
+client = LLMClient(base_url="https://your-endpoint.example.com/v1",
+                   api_key="sk-...", model="your-model-id",
+                   timeout=120, retries=3)                     # nothing implicit at all
+
+assert client.configured            # False when base_url or api_key is missing
 r = score(hyps, refs, mode="both", client=client)
 ```
 
-**From a `.env` file** — `load_dotenv` parses it and **never mutates `os.environ`**, so
-importing this package can't disturb the host application:
+Precedence is **`.env` file < process environment < explicit argument**. `load_dotenv`
+parses a file and **never mutates `os.environ`**, so importing this package can't disturb
+the host application.
 
-```python
-client = LLMClient.from_env(env_file="stt_api/evaluation/.env")
-```
+If an LLM mode is requested and no endpoint can be found, it **raises** — naming the
+variables to set — rather than silently falling back to the rules and reporting a number
+that was never normalized. A call that *reaches* the endpoint and fails there does fall
+back to the rules, and counts it in `report.errors`.
 
-**Explicitly**, when the config lives somewhere else entirely:
-
-```python
-client = LLMClient(
-    base_url="https://your-endpoint.example.com/v1",
-    api_key="sk-...",
-    model="your-model-id",
-    timeout=120, retries=3,
-)
-assert client.configured        # False when base_url or api_key is missing
-```
-
-Precedence is **`.env` file < process environment < explicit argument**. `score()` raises
-if an LLM mode is requested without a configured client, rather than silently falling back
-to the rules and reporting a number that was never normalized.
+Working from a source checkout, [`.env.example`](.env.example) is a template to copy to
+`.env` (git-ignored). It ships in the wheel too, but exported variables are simpler for an
+installed copy.
 
 `HF_TOKEN` is separate and only matters for `load_canonical` against a gated dataset.
 

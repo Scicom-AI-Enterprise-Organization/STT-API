@@ -64,11 +64,19 @@ class Normalizer:
     ):
         if mode not in MODES:
             raise ValueError(f"mode must be one of {MODES}, got {mode!r}")
-        if mode != "deterministic" and (client is None or not client.configured):
-            raise ValueError(
-                f"mode={mode!r} needs a configured LLMClient "
-                f"(base_url + api_key). Use LLMClient.from_env()."
-            )
+        if mode != "deterministic":
+            # No client passed: read the process environment. A pip-installed copy
+            # has nowhere sensible to put a `.env`, so env vars alone must be
+            # enough to turn the LLM pass on.
+            if client is None:
+                client = LLMClient.from_env()
+            if not client.configured:
+                raise ValueError(
+                    f"mode={mode!r} needs an LLM endpoint. Set OPENAI_BASE_URL and "
+                    f"OPENAI_API_KEY (and MODEL_NAME) in the environment, or pass "
+                    f"client=LLMClient(base_url=..., api_key=..., model=...). "
+                    f"mode='deterministic' needs neither and is the default."
+                )
         self.mode = mode
         self.client = client
         self.drop_fillers = drop_fillers

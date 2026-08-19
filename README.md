@@ -196,10 +196,21 @@ python -m stt_api.evaluation --input pairs.csv      # ref,hyp columns
 python -m stt_api.evaluation --self-test            # offline checks, no data needed
 ```
 
-An optional LLM pass handles the residue the rules cannot settle — configure it by copying
-[`stt_api/evaluation/.env.example`](stt_api/evaluation/.env.example) to
-`stt_api/evaluation/.env` (`OPENAI_BASE_URL` / `OPENAI_API_KEY` / `MODEL_NAME`). Every edit
-it proposes is validated as convention-only and reverted otherwise.
+An optional LLM pass handles the residue the rules cannot settle. Export three variables and
+it needs nothing else — no file, no client object:
+
+```bash
+export OPENAI_BASE_URL=https://your-endpoint.example.com/v1
+export OPENAI_API_KEY=sk-...
+export MODEL_NAME=your-model-id
+```
+
+```python
+r = score(hyps, refs, mode="llm")     # reads the environment on its own
+```
+
+Every edit the model proposes is validated as convention-only and reverted otherwise.
+(A `.env` works too — see [`stt_api/evaluation/.env.example`](stt_api/evaluation/.env.example).)
 
 See [`stt_api/evaluation/README.md`](stt_api/evaluation/README.md) for the full API,
 `.env` setup, dataset variant maps, and how to read the numbers honestly.

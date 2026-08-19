@@ -78,11 +78,23 @@ This is a library inside a serving package. A module that edits the process envi
 on import breaks the host application. Config precedence is `.env` file < process env <
 explicit argument, resolved in `LLMClient.from_env`.
 
+**The process environment is the primary source, and a `.env` file is a convenience.**
+This package gets installed with `pip install git+...`, where there is nowhere sensible to
+put a file — so `Normalizer` builds `LLMClient.from_env()` itself when no client is
+passed, and `score(hyps, refs, mode="llm")` works off exported variables alone. Don't
+regress that into requiring a client object or a file.
+
+When no endpoint can be found it **raises**, naming the variables. Never fall back to the
+deterministic layer there: the caller asked for a normalized number and would get an
+un-normalized one labelled as normalized. (A call that *reaches* the endpoint and fails
+does fall back, and counts it in `report.errors` — that is a different situation, and it
+is reported.)
+
 `.env.example` is the tracked template (`OPENAI_BASE_URL` / `OPENAI_API_KEY` /
 `MODEL_NAME`, plus `HF_TOKEN` for gated datasets); the real `.env` beside it is
 git-ignored by the root `.gitignore`'s bare `.env` pattern, which matches at any depth.
-Keep the template in sync with what `LLMClient.from_env` actually reads — a stale
-template is how someone ends up debugging an endpoint that was never configured.
+Keep the template and `ENV_KEYS` in sync with what `LLMClient.from_env` actually reads —
+a stale template is how someone ends up debugging an endpoint that was never configured.
 
 ### 6. Standard library only, except `canonical.py`
 

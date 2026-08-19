@@ -33,7 +33,11 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
-__all__ = ["LLMClient", "PAIR_SYSTEM", "SYSTEM", "load_dotenv"]
+__all__ = ["ENV_KEYS", "LLMClient", "PAIR_SYSTEM", "SYSTEM", "load_dotenv"]
+
+# Every environment variable this package reads. Nothing else is consulted, and
+# nothing is ever written back — see `load_dotenv`.
+ENV_KEYS = ("OPENAI_BASE_URL", "OPENAI_API_KEY", "MODEL_NAME", "OPENAI_MODEL")
 
 
 SYSTEM = """You normalise the SPELLING of a single Malay/English/Chinese speech transcript.
@@ -127,11 +131,19 @@ class LLMClient:
         """Build from `.env` file < process environment < explicit overrides.
 
         Reads `OPENAI_BASE_URL`, `OPENAI_API_KEY`, and `MODEL_NAME` (or
-        `OPENAI_MODEL`). Any of them can be passed directly instead.
+        `OPENAI_MODEL`). With no arguments it reads the process environment
+        alone, which is the normal case for a pip-installed copy where there is
+        nowhere sensible to put a `.env`:
+
+            export OPENAI_BASE_URL=https://your-endpoint.example.com/v1
+            export OPENAI_API_KEY=sk-...
+            export MODEL_NAME=your-model-id
+
+        Any of them can be passed directly instead — see `ENV_KEYS`.
         """
         src: dict[str, str] = {}
         src.update(load_dotenv(env_file))
-        src.update({k: v for k, v in os.environ.items() if v})
+        src.update({k: v for k in ENV_KEYS if (v := os.environ.get(k))})
         if env:
             src.update(env)
         cfg = {

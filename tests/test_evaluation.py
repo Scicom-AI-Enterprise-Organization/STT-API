@@ -183,11 +183,37 @@ def test_normalizer_cache_is_shared_across_arms(tmp_path):
     assert json.loads(cache.read_text()) == {}   # deterministic mode bills no LLM
 
 
-def test_normalizer_rejects_llm_mode_without_a_client():
-    with pytest.raises(ValueError):
+def test_llm_mode_reads_the_environment_when_no_client_is_passed(monkeypatch):
+    """`export OPENAI_*` then `score(..., mode="llm")` must just work.
+
+    This package gets installed with `pip install git+...`, where there is nowhere
+    sensible to put a .env — exported variables have to be enough on their own.
+    """
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://example.com/v1")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-x")
+    monkeypatch.setenv("MODEL_NAME", "my-model")
+    norm = Normalizer("llm")                     # no client argument anywhere
+    assert norm.client.base_url == "https://example.com/v1"
+    assert norm.client.model == "my-model"
+
+
+def test_llm_mode_raises_when_nothing_is_configured(monkeypatch):
+    """It must NOT quietly fall back to the rules and call the result normalized."""
+    for k in ("OPENAI_BASE_URL", "OPENAI_API_KEY", "MODEL_NAME", "OPENAI_MODEL"):
+        monkeypatch.delenv(k, raising=False)
+    with pytest.raises(ValueError, match="OPENAI_BASE_URL"):
         Normalizer("both")
     with pytest.raises(ValueError):
-        Normalizer("both", client=LLMClient())   # unconfigured
+        Normalizer("both", client=LLMClient())   # explicitly unconfigured
+    with pytest.raises(ValueError):
+        score("a", "b", mode="llm")
+
+
+def test_deterministic_mode_never_touches_the_environment(monkeypatch):
+    """The default must work with no endpoint configured at all."""
+    for k in ("OPENAI_BASE_URL", "OPENAI_API_KEY", "MODEL_NAME", "OPENAI_MODEL"):
+        monkeypatch.delenv(k, raising=False)
+    assert score("okay lah", "ok la").normalized_wer == [0.0]
 
 
 def test_normalizer_keeps_the_original_when_validation_fails():
