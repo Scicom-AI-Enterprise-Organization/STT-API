@@ -28,6 +28,17 @@ NORMALIZE_CASES = [
     ("Belum. [laugh] Bodoh.", "belum bodoh"),
     ("[inaudible] nak buat", "nak buat"),
     ("saya (clears throat) nak bayar", "saya nak bayar"),
+    # multiplier shorthand in digit read-back: pervasive in call-centre audio
+    # (IC / phone / application numbers) and previously unhandled, so `triple 0`
+    # against `000` scored as a pure mismatch on exactly the strings that matter.
+    ("nombor aplikasi ialah Triple 0", "nombor aplikasi ialah 000"),
+    ("double four one", "441"),
+    ("triple zero", "000"),
+    ("treble seven", "777"),
+    ("quadruple nine", "9999"),
+    ("double empat", "44"),
+    # ...and it must NOT fire when the multiplier is an ordinary word
+    ("i double checked the double room", "i double checked the double room"),
 ]
 
 # The validator must PASS these — they are convention edits, which is the point.
@@ -39,6 +50,10 @@ LEGAL_EDITS = [
     # edit on this corpus
     ("Baguslah. Itu saja", "bagus la itu saja"),
     ("okaylah", "ok la"),
+    # multiplier shorthand: the single commonest rejection on call-centre read-back
+    ("Triple 0. Triple 0.", "000 000"),
+    ("nombor saya double 4 triple 0", "nombor saya 44 000"),
+    ("triple zero", "000"),
 ]
 
 # ...and CATCH these, every one of which would corrupt the measurement.
@@ -47,6 +62,10 @@ CORRUPTING_EDITS = [
     ("saya nak bayar bil", "saya nak bayar"),        # deleted
     ("dua puluh tiga", "24"),                        # wrong value
     ("saya suka nasi", "saya suka mee"),             # swapped content
+    # a multiplier must not become a licence to emit any digit string
+    ("triple 0", "111"),                             # wrong digit
+    ("triple 0", "00"),                              # wrong repeat count
+    ("double room", "00"),                           # not a digit at all
 ]
 
 

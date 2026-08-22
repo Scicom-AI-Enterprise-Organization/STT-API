@@ -137,11 +137,60 @@ def compose(tokens: list[str]) -> str | None:
     return str(total + cur + (pending or 0)) if seen else None
 
 
+# A multiplier word before a digit is dictation shorthand for a repeat: `triple 0`
+# is 000, `double 4` is 44. These are everywhere in call-centre digit read-back (IC
+# numbers, phone numbers, application numbers) and nothing here handled them, so
+# `triple 0` on one side and `000` on the other scored as a pure mismatch on exactly
+# the strings this pass exists for.
+#
+# `treble` is the British form of `triple`. Malay `dua kali` / `tiga kali` are
+# deliberately NOT included: `kali` is also ordinary multiplication ("dua kali lima"
+# = two times five), so treating it as a repeat would corrupt real arithmetic.
+MULTIPLIER = {"double": 2, "triple": 3, "treble": 3, "quadruple": 4}
+
+
+def _repeat_digit(mult: str, tok: str) -> str | None:
+    """`('triple', '0') -> '000'`, `('double', 'four') -> '44'`; else None.
+
+    The digit may already be a numeral (`triple 0`) or still a word (`triple zero`),
+    because this runs both before and after other digit rewrites.
+    """
+    n = MULTIPLIER.get(mult)
+    if n is None:
+        return None
+    if len(tok) == 1 and tok.isdigit():
+        return tok * n
+    if tok in SINGLE_DIGIT:
+        return str(SINGLE_DIGIT[tok]) * n
+    return None
+
+
 def numbers_to_digits(tokens: list[str]) -> list[str]:
     """Rewrite spelled-out numbers as digits, leaving everything else untouched."""
     out: list[str] = []
     i = 0
     while i < len(tokens):
+        # Multipliers first: `double`/`triple` are not NUMWORDS, so the run-scanner
+        # below would step straight past them and leave the digit bare.
+        #
+        # Two shapes, deliberately handled differently:
+        #  - multiplier + digit WORD (`double four`): expand into repeated words and
+        #    reprocess, so an adjacent spelled run absorbs them and `double four one`
+        #    becomes `441` rather than `44 1`.
+        #  - multiplier + NUMERAL (`triple 0`): emit the repeat as its own token. Do
+        #    NOT merge across groups -- `Triple 0. Triple 0.` is two dictated groups
+        #    and must stay `000 000`, matching how both humans and the ASR write it.
+        #    Greedy merging would give `000000` on one side and `000 000` on the
+        #    other, i.e. a mismatch manufactured by the normalizer.
+        if i + 1 < len(tokens) and tokens[i] in MULTIPLIER:
+            n, nxt = MULTIPLIER[tokens[i]], tokens[i + 1]
+            if nxt in SINGLE_DIGIT:
+                tokens = tokens[:i] + [nxt] * n + tokens[i + 2:]
+                continue                      # reprocess at the same index
+            if len(nxt) == 1 and nxt.isdigit():
+                out.append(nxt * n)
+                i += 2
+                continue
         if tokens[i] not in NUMWORDS or tokens[i] == "and":
             out.append(tokens[i])
             i += 1

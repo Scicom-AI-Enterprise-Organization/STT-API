@@ -24,10 +24,44 @@ from __future__ import annotations
 
 from itertools import product
 
-from .deterministic import NUMWORDS, RESPELL, SINGLE_DIGIT, compose, strip_nonspeech
+from .deterministic import (
+    NUMWORDS,
+    RESPELL,
+    SINGLE_DIGIT,
+    _repeat_digit,
+    compose,
+    strip_nonspeech,
+)
 from .metrics import normalize
 
 __all__ = ["INVERSE", "validate"]
+
+
+def _digit_run(orig: list[str]) -> str | None:
+    """The read-out digit string for `orig`, expanding multiplier shorthand.
+
+    `['triple', '0'] -> '000'`, `['double', 'four', 'one'] -> '441'`. Returns None if
+    any token is neither a digit nor a multiplier+digit pair, so a non-numeric span
+    can never be waved through.
+    """
+    parts: list[str] = []
+    i = 0
+    while i < len(orig):
+        t = orig[i]
+        if i + 1 < len(orig):
+            rep = _repeat_digit(t, orig[i + 1])
+            if rep is not None:
+                parts.append(rep)
+                i += 2
+                continue
+        if len(t) == 1 and t.isdigit():
+            parts.append(t)
+        elif t in SINGLE_DIGIT:
+            parts.append(str(SINGLE_DIGIT[t]))
+        else:
+            return None
+        i += 1
+    return "".join(parts) if parts else None
 
 
 def _num_equiv(orig: list[str], new: str) -> bool:
@@ -37,6 +71,10 @@ def _num_equiv(orig: list[str], new: str) -> bool:
     if all(t in SINGLE_DIGIT for t in orig):
         if new == "".join(str(SINGLE_DIGIT[t]) for t in orig):
             return True
+    # Multiplier shorthand: `triple 0` -> `000`. Value-preserving in the same sense
+    # as a digit run, and the single most common rejection on call-centre read-back.
+    if _digit_run(orig) == new:
+        return True
     return len(orig) == 1 and orig[0] in NUMWORDS and compose(orig) == new
 
 
