@@ -50,6 +50,21 @@ evaluation = [
     "huggingface_hub",
     "pyarrow",
 ]
+benchmark = [
+    # Noise-cancellation shootout: stt_api.livekit_plugin.noise_cancellation.benchmark.
+    # A dev tool, not an agent dependency — none of this ships in the agent image.
+    "numpy",
+    "onnxruntime",
+    "soxr",
+    "soundfile",
+    "pyarrow",
+    "huggingface_hub",
+    "librosa",       # DNSMOS P.808 mel features only
+    "pesq",          # ITU-T P.862.2 wideband
+    "pystoi",        # STOI / ESTOI
+    "pyrnnoise",     # Xiph RNNoise via its real C library, not an ONNX re-export
+    "livekit-agents~=1.2",  # the GTCRN candidate runs through its production path
+]
 dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.23.0",
