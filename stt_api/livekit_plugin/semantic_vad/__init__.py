@@ -18,9 +18,9 @@ See README.md for how this plugs into LiveKit's audio EoT interface without
 implementing their protobuf websocket server, and for which backend to pick.
 """
 
-from .backends import Backend, RemoteEoT, SmartTurnV3
+from .backends import Backend, RemoteEoT, ScicomEoT, SmartTurnV3
 
-__all__ = ["Backend", "RemoteEoT", "SemanticVAD", "SmartTurnV3"]
+__all__ = ["Backend", "RemoteEoT", "ScicomEoT", "SemanticVAD", "SmartTurnV3"]
 
 
 def __getattr__(name: str):

@@ -20,7 +20,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 import librosa
 import soundfile as sf
-from app.diarization import load_speaker_model, run_online_diarization
+from app.diarization import (
+    MIN_CHUNK_SAMPLES,
+    embed_chunks_for_api,
+    load_speaker_model,
+    run_online_diarization,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -773,6 +778,85 @@ def vad_parallel(
 @app.get("/")
 async def read_root():
     return {"message": "STT API", "version": "1.0"}
+
+
+@app.post("/audio/speaker_vector")
+async def audio_speaker_vector(
+    request: Request,
+    file: List[bytes] = File(),
+    normalize: bool = Form(False),
+):
+    """
+    Speaker embeddings (TitaNet Large) for one or more audio files.
+
+    Parameters:
+    - file: one or more audio files (multipart/form-data). Repeat the field to
+      send several in one request — they are embedded as a **single GPU batch**,
+      which is the whole reason to batch a request rather than loop over calls.
+    - normalize: L2-normalise each vector so a dot product is cosine similarity.
+      Off by default: raw is what the model emits and what the diarization path
+      compares (it calls `cosine_similarity` explicitly), and quietly rescaling a
+      vector someone is about to compare against a stored one is a bad default.
+
+    Returns `{"vectors": [[...], ...], "dim": int, "count": int, "normalized": bool}`
+    with one vector per input file, in request order.
+    """
+    async with request_semaphore:
+        if not file:
+            raise HTTPException(status_code=400, detail="no audio file provided")
+
+        try:
+            get_diarization_executor()
+        except Exception as e:
+            raise HTTPException(
+                status_code=503, detail=f"Speaker model unavailable: {str(e)}"
+            )
+
+        chunks: List[np.ndarray] = []
+        for idx, blob in enumerate(file):
+            tmp_path = None
+            try:
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".tmp") as tmp_file:
+                    tmp_file.write(blob)
+                    tmp_path = tmp_file.name
+                audio, _ = librosa.load(tmp_path, sr=sample_rate, mono=True)
+            except Exception as e:
+                raise HTTPException(
+                    status_code=400, detail=f"file[{idx}]: cannot decode audio: {str(e)}"
+                )
+            finally:
+                if tmp_path and os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
+
+            # TitaNet needs enough frames for its mel spectrogram; a clip shorter
+            # than this produces a garbage vector rather than an error, so reject
+            # it here instead of returning something that looks like an embedding.
+            if len(audio) < MIN_CHUNK_SAMPLES:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"file[{idx}]: {len(audio) / sample_rate:.2f}s is too short; "
+                        f"need at least {MIN_CHUNK_SAMPLES / sample_rate:.2f}s"
+                    ),
+                )
+            chunks.append(audio.astype(np.float32))
+
+        loop = asyncio.get_event_loop()
+        try:
+            vectors = await loop.run_in_executor(
+                get_diarization_executor(),
+                functools.partial(embed_chunks_for_api, chunks, normalize),
+            )
+        except Exception as e:
+            logger.error(f"Speaker embedding failed: {e}")
+            raise HTTPException(status_code=500, detail=f"embedding failed: {str(e)}")
+
+        return {
+            "vectors": vectors,
+            "dim": len(vectors[0]) if vectors else 0,
+            "count": len(vectors),
+            "normalized": normalize,
+        }
 
 
 @app.post("/audio/transcriptions")

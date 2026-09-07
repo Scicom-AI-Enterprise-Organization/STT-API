@@ -333,3 +333,32 @@ def process_chunks_batch_incremental(
             speaker_ids.append(speaker_id)
 
     return speaker_ids
+
+
+def embed_chunks_for_api(
+    audio_chunks: List[np.ndarray],
+    normalize: bool = False,
+) -> List[List[float]]:
+    """
+    Speaker embeddings for the `/audio/speaker_vector` endpoint.
+
+    A thin wrapper over `extract_embeddings_batched` that exists for one reason:
+    it must run *inside the diarization worker process* and return something
+    picklable. `extract_embeddings_batched` hands back CUDA tensors, which cannot
+    cross a process boundary — so they are pulled to CPU and flattened to plain
+    lists here, on the far side, rather than in the request handler.
+
+    `normalize` L2-normalises each vector so a dot product is cosine similarity.
+    Off by default because that is what the model emits and what the diarization
+    path consumes (`clustering_torch` computes `cosine_similarity` explicitly on
+    raw vectors), and silently changing the scale of a vector someone is about to
+    compare against a stored one is a bad default.
+    """
+    embeddings = extract_embeddings_batched(audio_chunks)
+    out: List[List[float]] = []
+    for emb in embeddings:
+        vec = emb.detach().to(torch.float32).cpu()
+        if normalize:
+            vec = torch.nn.functional.normalize(vec, p=2, dim=-1)
+        out.append(vec.reshape(-1).tolist())
+    return out

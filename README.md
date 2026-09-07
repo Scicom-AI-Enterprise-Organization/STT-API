@@ -112,6 +112,7 @@ Long-form speech-to-text API that:
 |----------|--------|-------------|
 | `/` | GET | Health/version check |
 | `/audio/transcriptions` | POST | Long audio transcription with VAD chunking |
+| `/audio/speaker_vector` | POST | Speaker embeddings (TitaNet Large) for one or more files |
 | `/transcribe` | GET | Browser UI for POST transcription |
 | `/streaming` | GET | Browser UI for WebSocket streaming |
 | `/ws` | WebSocket | Real-time streaming transcription with VAD |
@@ -293,6 +294,83 @@ curl -X POST "http://localhost:9091/audio/transcriptions" \
 Or use the browser UI at `http://localhost:9091/transcribe`.
 
 <img src="transcribe.png" width="50%">
+
+### Speaker Vectors
+
+Speaker embeddings from TitaNet Large — the same model and the same batched GPU
+path the online diarization uses.
+
+```bash
+# one file -> one vector
+curl -X POST "http://localhost:9091/audio/speaker_vector" -F "file=@speaker.wav"
+```
+
+```json
+{"vectors": [[0.0123, -0.0456, ...]], "dim": 192, "count": 1, "normalized": false}
+```
+
+**Send several files in one request.** They are embedded as a single GPU batch,
+which is the reason to batch rather than loop over calls — one round trip and one
+kernel launch instead of N:
+
+```bash
+curl -X POST "http://localhost:9091/audio/speaker_vector" \
+  -F "file=@a.wav" -F "file=@b.wav" -F "file=@c.wav"
+```
+
+Vectors come back in request order, so `vectors[i]` belongs to the i-th file.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `file` | file | required | Audio file; repeat the field to batch several |
+| `normalize` | bool | `false` | L2-normalise each vector so a dot product *is* cosine similarity |
+
+`normalize` is off by default because raw is what the model emits and what the
+diarization path consumes — `clustering_torch` computes `cosine_similarity`
+explicitly on unnormalised vectors. Turn it on only if you are storing vectors to
+compare by dot product later, and be consistent: comparing a normalised vector
+against a raw one silently gives the wrong distance.
+
+Comparing two speakers:
+
+```python
+import numpy as np, requests
+
+r = requests.post("http://localhost:9091/audio/speaker_vector",
+                  files=[("file", open("a.wav","rb")), ("file", open("b.wav","rb"))])
+a, b = (np.array(v) for v in r.json()["vectors"])
+similarity = a @ b / (np.linalg.norm(a) * np.linalg.norm(b))
+```
+
+**Minimum length is 0.5 s** (`MIN_CHUNK_SAMPLES_FOR_EMBEDDING`, 8000 samples at
+16 kHz). Shorter clips are rejected with a 400 rather than embedded: TitaNet
+needs enough frames for its mel spectrogram and below that returns a plausible-
+looking vector that means nothing.
+
+Requires the speaker model, so it shares `ENABLE_ONLINE_DIARIZATION`'s worker; if
+that failed to load the endpoint returns 503.
+
+#### Measured speed
+
+One idle H20, via the same `extract_embeddings_batched` path the endpoint calls.
+Full tables, the 6x optimisation and caveats:
+[`SPEAKER_VECTOR_BENCH.md`](SPEAKER_VECTOR_BENCH.md).
+
+| | |
+|---|---|
+| single 3 s file, end to end | **11.5 ms** (4.7 ms GPU, 0.4 ms decode) |
+| 16 files in one request | 25.3 ms total, **1.58 ms per vector** |
+| sustained throughput | **~1760 vectors/s** |
+| RTF | ~0.0001, i.e. ~9000x faster than real time |
+
+- **Batching is worth ~8x and saturates at 16**, which is why
+  `SPEAKER_EMBEDDING_BATCH_SIZE` defaults to 16. Larger requests still work (they
+  chunk internally); past 16 you trade latency for throughput already collected.
+- **Cost tracks audio duration, not file count.** 16 half-second clips cost 6 ms;
+  one 30-second clip costs 51 ms. Decoding is negligible (0.4 ms p50).
+- **Ragged batches shift vectors slightly** (cosine 0.96-1.0 vs computing a clip
+  alone) because the model sees padding. Enroll and query the same way, or batch
+  clips of similar length.
 
 ### Request Parameters
 

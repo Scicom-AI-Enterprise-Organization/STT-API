@@ -61,14 +61,18 @@ Two numbers inherited from LiveKit that constrain any backend:
 ## Usage
 
 ```python
-from stt_api.livekit_plugin.semantic_vad import SemanticVAD, SmartTurnV3
+from stt_api.livekit_plugin.semantic_vad import SemanticVAD, ScicomEoT
 
 session = AgentSession(
     stt=..., llm=..., tts=...,
     vad=ctx.proc.userdata["vad"],          # still required
-    turn_detection=SemanticVAD(backend=SmartTurnV3()),
+    turn_detection=SemanticVAD(backend=ScicomEoT("base")),
 )
 ```
+
+`ScicomEoT("tiny" | "base" | "small")` is the in-house family, trained on
+Malaysian call-centre telephony. `SmartTurnV3()` is the open pipecat model —
+same architecture, 23 languages, no Malay.
 
 The VAD is not optional and not redundant: LiveKit's VAD decides *when* to ask
 (it only fires `inference_start` after ~200 ms of silence), and this model
@@ -87,12 +91,34 @@ SemanticVAD(backend=RemoteEoT("http://gpu-host:8080/eot", window_seconds=8.0))
 reads `{"probability": ...}`. Deliberately boring — once you own the transport
 you own the wire, so there is no reason to reimplement LiveKit's protobuf.
 
+## Verified end to end
+
+A real `AgentSession` (silero VAD + STT + this detector, audio paced at 1x wall
+clock), driven twice with a fixed probability either side of the threshold:
+
+| p(eot) | threshold | turn commits | path |
+|---:|---:|---:|---|
+| 0.9 | 0.2 | **+0.51 s** after speech | fast (`min_delay` 0.5 s) |
+| 0.05 | 0.5 | **+2.93 s** after speech | slow (`max_delay` 3.0 s) |
+
+The probability moves the turn boundary by 2.4 s, which is the only thing that
+proves the plugin does anything. `RUN_LIVEKIT_INTEGRATION=1 pytest
+tests/test_semantic_vad.py` runs it.
+
+That assertion is deliberately about the *effect*, not the call. An earlier
+version of the test checked only that `run_inference` was reached and a turn
+committed — it passed while the verdict was being ignored. It also watched
+`user_input_transcribed`, which fires when the STT returns rather than when the
+turn commits, so both the fast and slow cases looked identical at +0.50 s. If you
+extend these tests, assert on `on_user_turn_completed`.
+
 ## Which model
 
 Everything below is audio-native unless marked otherwise.
 
 | model | params | licence | languages | streaming | notes |
 |---|---|---|---|---|---|
+| **`Scicom-intl/semantic-vad-eot-whisper-*`** | 8 M (tiny) - 88 M (small) | Apache-2.0 | **ms**, en | windowed 8 s | **implemented.** Trained on real Malaysian call-centre telephony |
 | **`pipecat-ai/smart-turn-v3`** | 8 M | BSD-2 | 23 (no `ms`) | windowed 8 s | **implemented.** Whisper-Tiny encoder + linear head, 8 MB int8 ONNX |
 | **`anyreach-ai/dualturn-endpointing`** | ~1.5 M on frozen Mimi | Apache-2.0 | en | **true streaming, 12.5 Hz** | dual-channel (user + agent); explicit recurrent state |
 | `fixie-ai/turntaking-multilingual-llama8b-2a` | 8 B | **none stated** | multilingual | no | Ultravox-family; licence is a blocker |
@@ -100,30 +126,47 @@ Everything below is audio-native unless marked otherwise.
 | `TEN-framework/TEN_Turn_Detection` | ~7 B | Apache-2.0 | multi | no | **text**, not audio |
 | `KE-Team/KE-SemanticVAD` | 0.5 B | Apache-2.0 | zh/en | no | **text**; also classifies backchannel vs interrupt |
 
-### Measured here — smart-turn-v3, 12 VoiceBank utterances
+### Measured here — all four backends
 
-| input | p(complete) |
-|---|---|
-| complete utterance | 0.970 |
-| truncated mid-utterance | 0.656 |
-| silence | 0.987 |
+12 VoiceBank utterances, complete versus truncated mid-utterance, one CPU thread:
 
-Correct ordering on 10/12, **36 ms per call on one CPU thread**. Comfortable
-inside the 1 s budget with room for the STT and VAD sharing the core.
+| backend | window / normalise | complete | truncated | separation | correct order | ms/call |
+|---|---|---:|---:|---:|---:|---:|
+| smart-turn-v3 | 8 s / on | 0.970 | 0.656 | **+0.314** | 10/12 | 35.5 |
+| scicom tiny | 8 s / off | 0.864 | 0.801 | +0.063 | 9/12 | **24.4** |
+| scicom base | 8 s / off | 0.855 | 0.757 | +0.099 | 10/12 | 42.5 |
+| scicom small | 8 s / off | 0.851 | 0.663 | +0.188 | 11/12 | 145.2 |
 
-**Malay is not in smart-turn-v3's 23 languages** (Indonesian is, and is a useful
-prior). Benchmark before trusting it on `ms`.
+**Do not read this as a ranking.** The corpus is English read speech — inside
+smart-turn-v3's 23 languages and squarely *outside* what the Scicom models were
+trained for (Malaysian call-centre telephony, where a turn end is observed
+because the other party took the floor). All this table establishes is that the
+integration is wired correctly and every backend discriminates in the right
+direction.
 
-That gap is the argument for the in-house Qwen2-Audio model — but state it
-carefully. Its training data covers Malay (`ms_dialects`, `ms_imda`,
-`ms_malaysian`, `ms_parliament`, `ms_science_english`), yet the published
-`eot-v6` evaluation is **English only**, so Malay capability is available rather
-than demonstrated. Its measured lead is also distribution-specific: 0.923 AUC vs
-LiveKit v1's 0.671 on its own test split, but 0.808 vs 0.939 on
-`livekit/eot-bench-data` — the two datasets encode the hold/eot decision
-differently (87 % eot spans cut at a fixed 0.5 s versus 33.7 % cut at 1.5 s).
-Telephony augmentation is implemented but not yet trained, so there is no
-channel-robustness claim either.
+The useful signal in it is internal consistency: separation orders
+small > base > tiny, matching the publishers' own AUC ordering (0.86 > 0.84 >
+0.78) on their telephony benchmark. If the preprocessing were wrong, that
+ordering would not survive.
+
+For a real comparison on `ms`, use the publishers' eot-bench numbers over 300
+private telephony turns:
+
+| model | cutoff @ 300 ms | latency @ 10 % cutoff | AUC |
+|---|---:|---:|---:|
+| Scicom enterprise (GPU-served, private) | 38.6 % | 1034 ms | 0.87 |
+| semantic-vad whisper-small | 48.6 % | 1099 ms | 0.86 |
+| semantic-vad whisper-base | 45.0 % | 1260 ms | 0.84 |
+| semantic-vad whisper-tiny | 57.9 % | 1332 ms | 0.78 |
+
+**Picking a size.** `small` has the best ranking but 145 ms per call — still
+inside LiveKit's 1 s budget, though it is 4x `base` and shares a core with the
+STT and VAD. `base` is the reasonable default; `tiny` at 24 ms is for when CPU is
+the binding constraint and you can accept AUC 0.78.
+
+**int8 by default.** Roughly half the latency of fp32 for a reported mean
+absolute output shift of 0.068 — pass `quantized=False` and re-measure if you are
+calibrating a threshold near a decision boundary.
 
 ### DualTurn is worth a look before scaling up
 

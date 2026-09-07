@@ -192,21 +192,23 @@ def test_flush_clears_the_buffer_between_turns():
 
 @pytest.mark.skipif(
     os.environ.get("RUN_LIVEKIT_INTEGRATION") != "1",
-    reason="set RUN_LIVEKIT_INTEGRATION=1 (downloads silero weights, ~10s wall clock)",
+    reason="set RUN_LIVEKIT_INTEGRATION=1 (downloads silero weights, ~25s wall clock)",
 )
-def test_real_agent_session_consults_the_detector_and_commits_a_turn():
+def test_real_agent_session_lets_the_probability_move_the_turn_boundary():
     """
-    The only test here that proves the plugin actually works.
+    The only test here that proves the plugin actually does something.
 
-    Everything else checks a contract in isolation; this drives a real
-    `AgentSession` — silero VAD, an STT, `SemanticVAD` as `turn_detection` — with
-    audio paced at 1x wall clock, because the endpointing timers are real
-    `asyncio` sleeps and pushing a clip at once would make every pause look
-    instantaneous.
+    Drives a real `AgentSession` — silero VAD, an STT, `SemanticVAD` as
+    `turn_detection` — with audio paced at 1x wall clock, twice: once with a
+    probability above the threshold and once below. A working integration commits
+    the turn on `min_delay` in the first case and waits for `max_delay` in the
+    second.
 
-    Asserts two things a unit test cannot: that LiveKit routes audio into our
-    transport and calls `run_inference` at all, and that the session commits the
-    user's turn off the probability we return.
+    Asserting the *effect* rather than the call matters. An earlier version of
+    this test checked only that `run_inference` was reached and the turn
+    committed, and it passed while the verdict was being ignored — and it also
+    watched `user_input_transcribed`, which fires when the STT returns, not when
+    the turn commits. Both readings looked like success.
     """
     import asyncio
     import time
@@ -222,15 +224,19 @@ def test_real_agent_session_consults_the_detector_and_commits_a_turn():
 
     frame_ms = 50
     n = RATE * frame_ms // 1000
+    MIN_DELAY, MAX_DELAY = 0.5, 3.0
 
     class Paced(AudioInput):
         def __init__(self, audio):
             super().__init__(label="paced")
             clip = np.concatenate(
-                [np.zeros(int(0.3 * RATE), np.float32), audio, np.zeros(int(6 * RATE), np.float32)]
+                [np.zeros(int(0.3 * RATE), np.float32), audio, np.zeros(int(9 * RATE), np.float32)]
             )
             self.frames = [clip[i : i + n] for i in range(0, len(clip) - n + 1, n)]
             self.i, self.t0 = 0, None
+
+        def stream_time(self):
+            return 0.0 if self.t0 is None else time.monotonic() - self.t0
 
         async def __anext__(self):
             if self.t0 is None:
@@ -243,14 +249,16 @@ def test_real_agent_session_consults_the_detector_and_commits_a_turn():
             pcm = np.clip(np.rint(chunk * 32768), -32768, 32767).astype(np.int16)
             return rtc.AudioFrame(pcm.tobytes(), RATE, 1, n)
 
-    class Counting:
-        def __init__(self, inner):
-            self.inner, self.calls = inner, 0
-            self.window_seconds = inner.window_seconds
+    class Const:
+        """A fixed probability isolates the routing from any model's opinion."""
+
+        window_seconds = 8.0
+
+        def __init__(self, p):
+            self.p = p
 
         def predict(self, pcm):
-            self.calls += 1
-            return self.inner.predict(pcm)
+            return self.p
 
     wav = os.path.join(
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -264,36 +272,94 @@ def test_real_agent_session_consults_the_detector_and_commits_a_turn():
         import soxr
 
         raw = soxr.resample(raw, w.getframerate(), RATE).astype(np.float32)
+    speech_end = 0.3 + len(raw) / RATE
 
-    async def run():
-        backend = Counting(backends.SmartTurnV3())
+    async def commit_delay(prob, threshold):
         audio_in = Paced(raw)
-        finals = []
+        commits = []
+
+        class Rec(Agent):
+            async def on_user_turn_completed(self, turn_ctx, new_message):
+                commits.append(audio_in.stream_time())
+
         session = AgentSession(
             vad=silero.VAD.load(),
             stt=DummySTT(),
             llm=None,
             tts=None,
             turn_handling={
-                "turn_detection": SemanticVAD(backend=backend),
-                "endpointing": {"min_delay": 0.5, "max_delay": 3.0},
+                "turn_detection": SemanticVAD(
+                    backend=Const(prob), unlikely_threshold=threshold
+                ),
+                "endpointing": {"min_delay": MIN_DELAY, "max_delay": MAX_DELAY},
                 "interruption": {"mode": "vad"},
             },
             aec_warmup_duration=None,
             user_away_timeout=None,
         )
-
-        @session.on("user_input_transcribed")
-        def _on_final(ev):
-            if ev.is_final:
-                finals.append(ev.transcript)
-
         session.input.audio = audio_in
-        await session.start(Agent(instructions="test"))
-        await asyncio.sleep(11.0)
+        await session.start(Rec(instructions="test"))
+        await asyncio.sleep(12.0)
         await session.aclose()
-        return backend.calls, finals
+        assert commits, "the session never committed the user's turn"
+        return commits[0] - speech_end
 
-    calls, finals = asyncio.run(run())
-    assert calls > 0, "LiveKit never called the detector — the transport is not wired in"
-    assert finals, "the session never committed the user's turn"
+    fast = asyncio.run(commit_delay(0.9, 0.2))  # above threshold -> finished
+    slow = asyncio.run(commit_delay(0.05, 0.5))  # below threshold -> keep listening
+
+    assert fast == pytest.approx(MIN_DELAY, abs=0.35), f"expected the fast path, got {fast:.2f}s"
+    assert slow == pytest.approx(MAX_DELAY, abs=0.5), f"expected the slow path, got {slow:.2f}s"
+    assert slow - fast > 1.5, (
+        f"the probability did not move the turn boundary ({fast:.2f}s vs {slow:.2f}s) — "
+        "LiveKit is consulting the detector but ignoring its verdict"
+    )
+
+
+# --- ScicomEoT (Malaysian telephony family) -------------------------------
+
+
+@pytest.fixture(scope="module")
+def scicom_tiny():
+    try:
+        return backends.ScicomEoT("tiny")
+    except Exception as e:  # noqa: BLE001 - no network / no cache
+        pytest.skip(f"scicom weights unavailable: {e}")
+
+
+def test_scicom_reads_its_own_window_config(scicom_tiny):
+    """
+    Window and normalisation come from the checkpoint's `eot_window.json`, not
+    from a default.
+
+    `do_normalize` differs between the two families — smart-turn wants it on, the
+    Scicom models ship `false` — and the wrong value produces a plausible score
+    rather than an error (measured on one tone: 0.39 vs 0.53). Trusting the
+    checkpoint is what keeps that from being a silent 50/50 guess.
+    """
+    assert scicom_tiny.window_seconds == 8.0
+    assert scicom_tiny.do_normalize is False
+
+
+def test_scicom_rejects_an_unknown_size():
+    with pytest.raises(ValueError, match="size must be one of"):
+        backends.ScicomEoT("enormous")
+
+
+def test_scicom_discriminates_complete_from_truncated(scicom_tiny):
+    """
+    Direction only. This is English synthetic audio, well outside the Malaysian
+    telephony this model was trained on, so the *margin* means nothing — but a
+    complete utterance still must not score below a truncated one, and if the
+    preprocessing were wrong it would.
+    """
+    full = speech_like(3.0, seed=1)
+    p_full = scicom_tiny.predict(full)
+    p_cut = scicom_tiny.predict(full[: int(len(full) * 0.5)])
+    assert 0.0 <= p_cut <= 1.0
+    assert 0.0 <= p_full <= 1.0
+    assert p_full >= p_cut
+
+
+def test_scicom_satisfies_the_backend_protocol(scicom_tiny):
+    assert isinstance(scicom_tiny, backends.Backend)
+    assert scicom_tiny.predict(np.zeros(0, dtype=np.float32)) == 0.0
