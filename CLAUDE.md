@@ -11,6 +11,7 @@ Module-scoped notes live beside their code — see
 |---|---|
 | `stt_api/main.py` | FastAPI app: transcription, streaming WS, force alignment, speaker vectors |
 | `stt_api/diarization.py` | TitaNet Large speaker embeddings + online diarization |
+| `stt_api/nemo_speaker_vector.py` | the TitaNet model itself — **read the perf note below before touching `prep_batch`** |
 | `stt_api/clustering_torch.py` | streaming k-means / BIRCH over speaker vectors |
 | `stt_api/evaluation/` | convention-normalized WER/CER scoring (**has its own CLAUDE.md**) |
 | `stt_api/livekit_plugin/turn_detector/` | **text** end-of-turn detector, vLLM-backed |
@@ -54,6 +55,29 @@ Speaker vectors are **unnormalized** by design; `clustering_torch` calls
 `cosine_similarity` explicitly. If you add a consumer, either normalize both
 sides or neither — mixing them silently yields the wrong distance.
 
+### Two speaker-vector performance traps, both already paid for
+
+`nemo_speaker_vector.py` was 6x slower than it needed to be, and in both cases the
+GPU was innocent — it was doing 8 ms of work inside a 57 ms batch. Do not
+reintroduce either:
+
+- **`sequence_1d` padded through Python objects.** `.tolist()` on every input
+  array, list concatenation, then `np.array` to re-parse — ~768k float objects
+  per batch of 16, **50 ms**. There is now a vectorised fast path for ndarray
+  input; the generic path is kept for anything else.
+- **Pinned staging cost 40x the transfer it optimised.** H2D for a 16x48000 batch
+  is 0.07 ms; copying *into* the page-locked buffer was 10.4 ms on this host.
+  Pageable is 41x faster end to end. `SPEAKER_PIN_MEMORY=1` restores pinning —
+  measure before assuming your host is the other kind.
+
+Numbers and method: [`SPEAKER_VECTOR_BENCH.md`](SPEAKER_VECTOR_BENCH.md).
+
+**Ragged batches shift vectors.** Clips of differing length are padded to the
+longest, and the model sees the padding: cosine 0.963-1.0 against computing a
+clip alone, versus 3e-05 for uniform lengths. This predates the optimisation
+(padding output is bit-identical before and after) but it matters for an
+embedding API — enroll and query the same way, or batch similar lengths.
+
 ## LiveKit plugins
 
 There are **two unrelated end-of-turn interfaces** and picking the wrong one is
@@ -88,6 +112,14 @@ speaker stops, so no text detector can beat that. That is the reason
 
 - Imports **private** LiveKit internals (`livekit.agents.inference.eot.base`),
   verified against 1.7.x. An upgrade can move them.
+- **`do_normalize` is per-checkpoint, not per-family.** smart-turn-v3 wants it on;
+  the Scicom `semantic-vad-eot-whisper-*` models ship `do_normalize: false` in
+  `eot_window.json`. On one tone the flag moves p(eot) from 0.39 to 0.53 — both
+  plausible, nothing errors. Backends read the checkpoint's own config; keep it
+  that way rather than hardcoding a default.
+- Audio is **left**-padded into the 8 s window so the decision point stays at the
+  end. Right-padding (the feature extractor's default) is out of distribution and
+  scores confidently wrong.
 - **It fails closed** (`p = 0.0`, hold) — deliberately the opposite of
   `turn_detector/`. Failing toward silence is safer for a voice agent.
 - Self-hosting needs **no protobuf websocket server**: the transport is a
@@ -119,6 +151,20 @@ waveform that sounds like the same speech, so they rank it last however good it
 sounds. Judge that class on DNSMOS **and WER** — and never on MOS alone: DNSMOS
 and WER were *inversely* correlated across those models (Spearman ρ = +0.90),
 so picking on perceptual quality selects almost exactly the wrong model.
+
+### Testing a turn detector: assert the effect, not the call
+
+Two ways to write a passing test for a LiveKit turn detector that proves nothing:
+
+- **Asserting the detector was consulted.** `run_inference` being reached and a
+  turn committing are both true while LiveKit ignores the verdict entirely.
+- **Watching `user_input_transcribed`.** That fires when the STT returns, not
+  when the turn commits, so a fast path and a slow path both read as +0.50 s.
+
+Assert on `on_user_turn_completed`, and drive the session twice with a fixed
+probability either side of the threshold. A working integration commits on
+`min_delay` in one case and waits for `max_delay` in the other — currently a 2.4 s
+difference. `tests/test_semantic_vad.py` does exactly this.
 
 ### Alignment before any reference metric
 

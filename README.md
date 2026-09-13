@@ -169,6 +169,49 @@ When `LIVEKIT_REMOTE_EOT_URL` is unset, the plugin falls back to local inference
 
 ---
 
+## LiveKit Semantic VAD Plugin
+
+`stt_api/livekit_plugin/semantic_vad/` — end-of-turn decided from the **waveform**
+rather than the transcript.
+
+The turn detector above is a text model: it cannot answer until the STT has
+produced words, and on the production stack that transcript arrives a median
+1.5 s after the speaker stops. An audio-native model answers in tens of
+milliseconds from audio the agent already has. They are complementary, not
+alternatives — text sees semantics ("...and then he said" is clearly unfinished),
+audio sees prosody a transcript throws away.
+
+```python
+from stt_api.livekit_plugin.semantic_vad import SemanticVAD, ScicomEoT
+
+session = AgentSession(
+    stt=..., llm=..., tts=...,
+    vad=ctx.proc.userdata["vad"],          # still required — it decides *when* to ask
+    turn_detection=SemanticVAD(backend=ScicomEoT("base")),
+)
+```
+
+| backend | model | languages | ms/call |
+|---|---|---|---|
+| `ScicomEoT("tiny"\|"base"\|"small")` | `Scicom-intl/semantic-vad-eot-whisper-*` | **ms**, en | 24 / 43 / 145 |
+| `SmartTurnV3()` | `pipecat-ai/smart-turn-v3` | 23 (no `ms`) | 36 |
+| `RemoteEoT(url)` | your own GPU, plain JSON POST | — | network |
+
+`ScicomEoT` is trained on real Malaysian call-centre telephony, which is why it is
+the default choice here; `base` is the sensible size (`small` is 4x the CPU for
++0.02 AUC, `tiny` is for when CPU binds).
+
+Verified end to end against a real `AgentSession`: p(eot) 0.9 against a 0.2
+threshold commits the turn at +0.51 s, and 0.05 against 0.5 waits to +2.93 s — the
+probability moves the boundary by 2.4 s. Run it with
+`RUN_LIVEKIT_INTEGRATION=1 pytest tests/test_semantic_vad.py`.
+
+Self-hosting needs **no protobuf websocket server**, which is the usual assumption
+about LiveKit's audio EoT path — see
+[`stt_api/livekit_plugin/semantic_vad/README.md`](stt_api/livekit_plugin/semantic_vad/README.md).
+
+---
+
 ## Transcription Scoring (`stt_api.evaluation`)
 
 WER/CER for ASR output, reported twice: as an ordinary scorer charges it, and again with
