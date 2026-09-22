@@ -62,6 +62,17 @@ async def entrypoint(ctx: JobContext) -> None:
     await ctx.connect()
 
     stt = WhisperSTT()
+    # The local gate (skip the request for silent or very short segments) is on
+    # by default. It is independent of the blank filter: switching it off still
+    # returns "" for a whitespace response, so the no-bubble guarantee holds and
+    # you only give up the ~94 % of requests it saves.
+    #
+    #   WhisperSTT(silence_floor_dbfs=None)                          # RMS off
+    #   WhisperSTT(min_audio_duration=0.0)                           # duration off
+    #   WhisperSTT(silence_floor_dbfs=None, min_audio_duration=0.0)  # both off
+    #
+    # Prefer lowering the floor to disabling it -- silence_floor_dbfs=-60 still
+    # catches every all-zero segment with 38 dB of headroom under real speech.
     # Interruption-related options live on AgentSession, and the spelling is
     # version-dependent:
     #   livekit-agents 1.3.x-1.7.x   min_interruption_words=1

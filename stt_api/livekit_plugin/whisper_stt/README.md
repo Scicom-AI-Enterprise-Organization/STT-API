@@ -124,6 +124,36 @@ zero samples**, every one exactly 0.30 s long.
 transcribes to `' '` on this endpoint (0.15 s gives `' We'`), so anything
 shorter cannot produce text.
 
+### Turning the local gate off
+
+The two gates are independent, and **switching them off does not weaken the
+blank filter** — a whitespace response still comes back as `""`, so the bubble
+protection is unaffected. You only give up the saved requests.
+
+```python
+WhisperSTT(silence_floor_dbfs=None)                        # RMS check off
+WhisperSTT(min_audio_duration=0.0)                         # duration check off
+WhisperSTT(silence_floor_dbfs=None, min_audio_duration=0.0)  # both off
+```
+
+Measured on two segments that the defaults would both gate (2 s of digital
+silence, and a 0.05 s clip):
+
+| config | HTTP calls | skipped locally | text returned |
+|---|---:|---:|---|
+| defaults | 0 | 2 | `''` |
+| `silence_floor_dbfs=None` | 1 | 1 | `''` |
+| `min_audio_duration=0.0` | 0 | 2 | `''` |
+| both off | **2** | 0 | `''` |
+
+Reasons to turn it off: you suspect the floor is clipping quiet callers (check
+`counters.skipped_quiet` against your real turn count first), you are measuring
+the endpoint's own behaviour and want every segment to reach it, or your audio
+path is not the one these thresholds were measured on — 8 kHz SIP legs being the
+obvious case. Raising the floor is usually better than disabling it:
+`silence_floor_dbfs=-60` still catches every all-zero segment while leaving 38 dB
+below the quietest speech turn measured.
+
 ### Those all-zero segments are not silero's doing
 
 Fed 0.30 s of digital silence, silero peaks at p(speech) **0.0089** against its
