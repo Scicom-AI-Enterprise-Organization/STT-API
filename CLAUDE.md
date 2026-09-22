@@ -16,6 +16,8 @@ Module-scoped notes live beside their code — see
 | `stt_api/evaluation/` | convention-normalized WER/CER scoring (**has its own CLAUDE.md**) |
 | `stt_api/livekit_plugin/turn_detector/` | **text** end-of-turn detector, vLLM-backed |
 | `stt_api/livekit_plugin/semantic_vad/` | **audio** end-of-turn detector (semantic VAD) |
+| `stt_api/livekit_plugin/pulse_vad/` | **frame** VAD (is anyone speaking) — silero drop-in + `benchmark/` |
+| `stt_api/livekit_plugin/whisper_stt/` | Whisper STT client that stops silence interrupting the agent |
 | `stt_api/livekit_plugin/noise_cancellation/` | GTCRN filter + `benchmark/` harness |
 | `stt_api/livekit_plugin/dummy/` | no-op STT/LLM/TTS, useful for agent tests |
 
@@ -80,14 +82,17 @@ embedding API — enroll and query the same way, or batch similar lengths.
 
 ## LiveKit plugins
 
-There are **two unrelated end-of-turn interfaces** and picking the wrong one is
-the main way this goes wrong:
+There are **three unrelated interfaces** here and picking the wrong one is the
+main way this goes wrong. The first two answer *has the speaker finished*; the
+third answers *is anyone speaking right now*, and a session needs one of each —
+the VAD decides when to ask, the turn detector answers.
 
-| | `turn_detector/` | `semantic_vad/` |
-|---|---|---|
-| input | transcript text | streaming 16 kHz audio |
-| LiveKit API | `livekit-plugins-turn-detector` | `livekit.agents.inference.eot` |
-| answers | only after the STT emits words | from audio already buffered |
+| | `turn_detector/` | `semantic_vad/` | `pulse_vad/` | `whisper_stt/` |
+|---|---|---|---|---|
+| input | transcript text | streaming 16 kHz audio | streaming 16 kHz audio | one VAD segment |
+| LiveKit API | `livekit-plugins-turn-detector` | `livekit.agents.inference.eot` | `livekit.agents.vad.VAD` | `livekit.agents.stt.STT` |
+| passed as | `turn_detection=` | `turn_detection=` | `vad=` | `stt=` |
+| answers | only after the STT emits words | from audio already buffered | per 32 ms hop | what was said |
 
 On the production stack the transcript arrives a median **1.5 s** after the
 speaker stops, so no text detector can beat that. That is the reason
@@ -124,6 +129,114 @@ speaker stops, so no text detector can beat that. That is the reason
   `turn_detector/`. Failing toward silence is safer for a voice agent.
 - Self-hosting needs **no protobuf websocket server**: the transport is a
   seven-method Protocol implemented in-process.
+
+### `pulse_vad/`
+
+- **p(speech) saturates at 0.711**, not 1.0 — 0.708 int8, 0.895 for the `81k`
+  teacher. A threshold at or above the ceiling fires on **0 %** of windows: an
+  agent that never hears anyone, with no exception and no log line. Carrying
+  silero's `activation_threshold=0.8` across is the obvious way to hit it, so
+  `load()` raises. `model.CEILINGS` is the source of truth and is asserted in
+  `tests/test_pulse_vad.py`; re-measure it if a checkpoint is ever swapped.
+- **The graph emits `[non_speech, speech]` logits, not a probability.** The exact
+  mirror of the `semantic_vad` trap, where the sigmoid is already in the graph
+  and applying a second one pinned every score to ~0.73.
+- **int8 is not faster off-microcontroller** (0.019 ms vs fp32's 0.018 ms) and
+  its QDQ file is twice the size. `precision="fp32"` is the default here even
+  though upstream's `load_pulsevad` defaults to quantised.
+- **The 200 ms window is not the update rate.** It slides over a 32 ms hop, so
+  LiveKit's duration defaults still mean what they mean. At a 200 ms interval
+  `min_speech_duration=0.05` would be satisfied by a single window and one
+  spurious inference would open a turn.
+- **The front end, not the model, is the cost — and cutting its arithmetic makes
+  it slower.** 67 us of numpy against 17 us of ONNX, so silero's fully-fused
+  graph beats this 2,118-parameter model per window. Only the FFT (16 us) is real
+  compute; the rest is nine numpy calls whose cost is dispatch, not data —
+  `std()` over 1,344 floats measures 4.94 us. The 200 ms window slides by 32 ms,
+  so 85 % of the STFT is recomputed each hop, and removing that redundancy is the
+  obvious fix — **it was tried and it is 15 % slower**, because caching the
+  spectra takes more numpy calls than it saves FFTs. At these sizes the call
+  count is the cost function. The real fix is folding the front end into the ONNX
+  graph; with it free, PulseVAD costs 17 us against silero's 78 us.
+- **Upstream leaves the first sample of every window un-pre-emphasised**
+  (`pre[0] = x[0]`), and that sample feeds the window's own mean and variance. It
+  is a spike of median 2x and up to 53x the rest of the window's std, so a
+  streaming implementation must re-derive index 0 per window rather than
+  pre-emphasise continuously — doing the obvious continuous thing moves p(speech)
+  by up to 0.28.
+- Weights are **vendored**, not taken from the `pulsevad` PyPI package — it pulls
+  scipy and soundfile for a file reader this plugin never calls, and needs
+  Python 3.11 while this repo supports 3.10. `frontend.py` is a bit-exact
+  reimplementation, asserted against a transcription of upstream.
+
+Numbers, method and the silero head-to-head:
+[`PULSE_VAD_BENCH.md`](PULSE_VAD_BENCH.md). **The conclusion is "keep silero"** —
+PulseVAD matches it on accuracy over 1,500 real turns but costs 1.5x the CPU and
+commits 96 ms later. It wins only on footprint, and by less than it looks — 76 KB
+against 2.22 MB, because the 64.4 KB mel filterbank sits outside the graph. Note
+the VAD is 0.42 % of a core per stream either way, so this is never a lever on
+CPU load.
+
+### `whisper_stt/`
+
+- **Whisper answers silence with `' '`, not `''`, and a space is truthy.**
+  LiveKit only tests emptiness, so the space passes
+  `stream_adapter.py:149` and `audio_recognition.py:1215`, reaches
+  `on_final_transcript` (`:1217`), and that calls
+  `_interrupt_by_audio_activity()` (`agent_activity.py:2531`) **with no text
+  check of its own**. The agent gets cut off by silence and nothing logs an
+  error. 12 % of production turns (180 of 1,503) return exactly `' '`. Verified
+  by driving `AudioRecognition._on_stt_event`: `''` does not fire the hook,
+  `' '` / `'  \n\t'` / `'.'` all do.
+- **Return `text=""`, never `alternatives=[]`.** `audio_recognition.py:1207`
+  indexes `alternatives[0]` with no length check, so an empty list swaps the
+  interruption for an `IndexError`.
+- **Filter on `.strip()` length, never on a character class.** Four turns in the
+  production sample are real speech with no ASCII alphanumerics at all
+  (`' ஹலோ மாயா!'`, `' 你好,我想现在付款…'`); an `[A-Za-z0-9]` test would silently
+  discard Tamil and Chinese callers.
+- **94 % of the useless STT calls can be skipped locally.** Speech turns sit at
+  −18 dBFS median, non-speech at **−240 dBFS** — 169 of 180 are literally all
+  zero samples, each exactly 0.30 s. An RMS floor of −50 dBFS skips 170/180 and
+  loses 0/1,323 real turns. Also: 0.10 s of *real* speech transcribes to `' '`,
+  so segments that short need never be sent.
+- **Those all-zero segments are not silero's.** Fed 0.30 s of digital silence it
+  peaks at p(speech) 0.0089 against a 0.5 threshold. Something upstream emits
+  fixed 0.30 s zero buffers — a warmup or health probe fits the signature. Trace
+  it rather than blaming the VAD.
+- **The blank guard does NOT stop the interruption — the VAD does it first.**
+  Measured in a real in-process `AgentSession` with the agent mid-TTS: a 0.35 s
+  false positive cut the agent's speech **even when the STT returned `''`**,
+  `_interrupt_source == "audio_activity"` in both arms. What the guard does buy
+  is no chat bubble and no LLM context from silence (a blank never reaches
+  `on_final_transcript`), plus ~94 % fewer STT calls.
+- **`VADEvent.speech_duration` keeps accumulating through silero's 0.55 s
+  silence hangover**, so a burst far shorter than LiveKit's 0.5 s interrupt
+  threshold still clears it — 0.15 s and 0.35 s bursts both peak at **0.70 s**.
+  Every VAD segment, however short, can interrupt by itself via
+  `agent_activity.py:2447`. Do not assume a short segment is harmless; an
+  earlier version of this file said sub-0.5 s segments could only interrupt
+  through the STT path, and that was wrong.
+- **The lever that gates *both* paths is `min_words`**, at
+  `agent_activity.py:2325` — and it is inert at its default of **0**:
+
+      AgentSession(..., min_interruption_words=1)                      # 1.3.x-1.7.x
+      AgentSession(..., turn_handling={"interruption": {"min_words": 1}})  # 1.8+
+
+  **`turn_handling` does not exist before 1.8 and raises `TypeError` there** —
+  `ucc_tm-voice-assist` pins `livekit-agents~=1.3` and resolves to **1.3.11**,
+  so it needs the first form. Every mechanism above is present in both versions;
+  only line numbers and this spelling differ (1.3.11: the blank guard is
+  `audio_recognition.py:355`, the `min_words` gate `agent_activity.py:1174`, the
+  VAD-alone interrupt `agent_activity.py:1243`). It is Unicode-safe: `''`, `' '` and `'.'` all split to 0 words,
+  while `' ஹலோ மாயா!'` splits to 2 and `' 你好,我想现在付款'` to 8. Measured end to
+  end on 1.3.11 with the agent mid-TTS: unfiltered STT fires a bubble carrying
+  `' '` and cuts the TTS; `WhisperSTT` fires **no** bubble; `min_words=1` stops
+  the cut — and **real speech still barges in**, which is the control that makes
+  the setting usable rather than just interruption switched off. The plugin
+  removes the bubble, `min_words` removes the interruption, and you need both.
+  `whisper_stt/example_agent.py` wires it and picks the right spelling for the
+  installed version at runtime.
 
 ## Measurement invariants
 
@@ -165,6 +278,27 @@ Assert on `on_user_turn_completed`, and drive the session twice with a fixed
 probability either side of the threshold. A working integration commits on
 `min_delay` in one case and waits for `max_delay` in the other — currently a 2.4 s
 difference. `tests/test_semantic_vad.py` does exactly this.
+
+### A VAD benchmark measures the corpus unless you stop it
+
+Three corrections, each of which changed a headline number in
+`pulse_vad/benchmark/`:
+
+- **Score each model at its own threshold.** PulseVAD saturates at 0.711 and
+  silero at ~1.0; scoring both at 0.5 compares silero's mid-range against
+  PulseVAD's 70th percentile and reports the gap as accuracy.
+- **Exclude the hangover from the false-positive region.**
+  `min_silence_duration` keeps a VAD speaking for 0.55 s after the last word *by
+  design*. Counting it made both detectors look ~20 % false-positive — a
+  measurement of the setting, not the model.
+- **Pair timing within an item.** Production turns are cut by the upstream stack,
+  not trimmed to the first phoneme, so both detectors wait through the same
+  lead-in: over 250 real turns both reported a median onset of *exactly* 644 ms.
+  Differencing within an item cancels it.
+
+Plain F1 is nearly flat across thresholds here because the speech-bearing body
+dominates it, so it picks an operating point almost at random. Optimise
+`detect_rate - false_fire_rate` instead — what the agent actually experiences.
 
 ### Alignment before any reference metric
 

@@ -212,6 +212,152 @@ about LiveKit's audio EoT path — see
 
 ---
 
+## LiveKit PulseVAD Plugin
+
+`stt_api/livekit_plugin/pulse_vad/` — frame-level voice activity detection from a
+**2,118-parameter** CNN ([PulseVAD](https://github.com/AydinAdnan/PulseVAD), MIT).
+A drop-in for `silero.VAD`: 76 KB of weights and filterbank against silero's
+2.22 MB.
+
+This answers a different question from the two plugins above. They decide *has
+the speaker finished*; this decides *is someone speaking right now*. An
+`AgentSession` wants both — the VAD decides when to ask, the turn detector
+answers.
+
+```python
+from stt_api.livekit_plugin.pulse_vad import PulseVAD
+
+def prewarm(proc):
+    proc.userdata["vad"] = PulseVAD.load()          # 2.1k fp32; blocking
+
+session = AgentSession(
+    vad=ctx.proc.userdata["vad"],
+    turn_detection=SemanticVAD(backend=ScicomEoT("base")),
+    stt=..., llm=..., tts=...,
+)
+```
+
+Two things will bite you, and both are silent:
+
+- **p(speech) saturates at 0.711**, not 1.0 (0.895 for the `81k` teacher).
+  Carrying silero's `activation_threshold=0.8` across gives a VAD that fires on
+  **0 %** of windows — an agent that never hears anyone, with no error. `load()`
+  refuses a threshold at or above the ceiling. The default is `0.35`, the
+  midpoint of the measured range.
+- **`precision="fp32"` is the default**, unlike upstream. int8 measured *no
+  faster* off-microcontroller (0.019 ms vs 0.018 ms) in a file twice the size.
+
+The model's 200 ms window **slides** over a 32 ms hop, so it reports at silero's
+cadence rather than breaking LiveKit's duration defaults — about 0.3 % of one
+core.
+
+### Measured against silero on labelled production audio
+
+`benchmark/` runs both through the real `livekit.agents.vad.VAD` interface on
+turns from `stt-dev/drift/`, where an **empty Whisper transcript is a genuine
+no-speech label**.
+
+```bash
+pip install ".[benchmark]"
+python -m stt_api.livekit_plugin.pulse_vad.benchmark \
+    --s3-prefix stt-dev/drift/proxy-.../2026-09-22/ --limit 1500
+```
+
+Each model is scored at **its own** best threshold — scoring both at 0.5 would
+compare silero's mid-range against PulseVAD's 70th percentile and call the
+difference accuracy.
+
+On 1,500 production turns (4.4 h) the two are **statistically indistinguishable**
+on both detection (99.02 % vs 99.17 %, p = 0.84) and false fires (4.44 % vs
+2.78 %, p = 0.57). What differs is cost: PulseVAD is **1.33x more expensive per
+window** and commits a turn **96 ms later**. Its 2,118 parameters buy footprint
+(76 KB vs 2.22 MB), not CPU — the numpy log-mel front end costs 4x the model, so
+the *model* is 4.5x cheaper than silero's while the *package* is 1.33x dearer.
+
+**The recommendation is to keep silero** unless model footprint is the binding
+constraint. Full numbers and method in
+[`PULSE_VAD_BENCH.md`](PULSE_VAD_BENCH.md).
+
+---
+
+## LiveKit Whisper STT Plugin
+
+`stt_api/livekit_plugin/whisper_stt/` — an OpenAI-compatible Whisper client that
+**refuses to turn silence into an interruption**.
+
+```python
+from livekit.plugins import silero
+from stt_api.livekit_plugin.whisper_stt import WhisperSTT
+
+session = AgentSession(
+    stt=WhisperSTT(),          # reads STT_URL / STT_API / STT_MODEL
+    vad=silero.VAD.load(),     # required — this STT is not streaming
+    llm=..., tts=...,
+)
+```
+
+**Whisper answers silence with a single space, not an empty string** — measured,
+`' '` comes back with HTTP 200 for digital silence, room tone, and even 0.10 s of
+real speech. Across 1,503 production turns, **180 (12 %)** returned exactly `' '`.
+
+A space is truthy and LiveKit only tests emptiness, so it passes
+`audio_recognition.py:1215` and reaches `on_final_transcript`, which calls
+`_interrupt_by_audio_activity()` with no text check. The agent gets cut off by
+silence with nothing logged:
+
+| STT returns | interrupts the agent |
+|---|---|
+| `''` | no |
+| `' '`, `'  \n\t'`, `'.'` | **yes** |
+
+Two guards, both measured:
+
+- **Blank transcripts return `text=""`** — never `alternatives=[]`, which would
+  swap the interruption for an `IndexError` at `audio_recognition.py:1207`.
+  Filtering is `.strip()` length, not a character class: four production turns
+  are real Tamil and Chinese speech with no ASCII alphanumerics.
+- **Silent segments never reach the network.** Speech turns sit at −18 dBFS
+  median, non-speech at −240 (169 of 180 are literally all zeros, each exactly
+  0.30 s). An RMS floor of −50 dBFS skips **94 %** of the useless calls and
+  loses **0** of 1,323 real turns.
+
+`DropBlankSTT(openai.STT())` applies the blank guard to any other provider —
+`livekit-plugins-openai` has the same defect.
+
+**It does not stop the interruption, though** — measured in a real
+`AgentSession`, a 0.35 s VAD false positive cuts the agent's TTS *even when the
+STT returns `''`*, because `speech_duration` accumulates through silero's 0.55 s
+hangover and a 0.15 s burst already reports 0.70 s. What the guard buys is no
+chat bubble and no LLM context from silence, plus ~94 % fewer STT calls.
+
+The lever that gates the VAD path too is `min_words`, inert at its default of 0:
+
+```python
+session = AgentSession(
+    stt=WhisperSTT(),
+    vad=silero.VAD.load(),
+    llm=..., tts=...,
+    min_interruption_words=1,                            # livekit-agents 1.3.x-1.7.x
+    # turn_handling={"interruption": {"min_words": 1}},  # 1.8+ spelling
+)
+```
+
+`turn_handling` does not exist before 1.8 and raises `TypeError` there;
+[`example_agent.py`](stt_api/livekit_plugin/whisper_stt/example_agent.py) picks
+the right spelling at runtime and is runnable as-is.
+
+Measured end to end on 1.3.11 with the agent mid-TTS: an unfiltered STT fires a
+chat bubble carrying `' '` **and** cuts the TTS; `WhisperSTT` fires no bubble;
+`min_words=1` stops the cut — and real speech still barges in. The plugin
+removes the bubble, `min_words` removes the interruption, and you need both.
+Verified against **1.3.11 and 1.8.2**.
+
+`''`, `' '` and `'.'` all split to 0 words; `' ஹலோ மாயா!'` splits to 2. See
+[`whisper_stt/README.md`](stt_api/livekit_plugin/whisper_stt/README.md) for the
+measurements and the one control still unverified.
+
+---
+
 ## Transcription Scoring (`stt_api.evaluation`)
 
 WER/CER for ASR output, reported twice: as an ordinary scorer charges it, and again with

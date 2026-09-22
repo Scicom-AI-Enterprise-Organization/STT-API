@@ -64,6 +64,10 @@ benchmark = [
     "pystoi",        # STOI / ESTOI
     "pyrnnoise",     # Xiph RNNoise via its real C library, not an ONNX re-export
     "livekit-agents~=1.2",  # the GTCRN candidate runs through its production path
+    # VAD shootout: stt_api.livekit_plugin.pulse_vad.benchmark. silero is the
+    # incumbent being compared against, boto3 only pulls the labelled corpus.
+    "livekit-plugins-silero",
+    "boto3",
 ]
 dev = [
     "pytest>=8.0.0",
@@ -87,6 +91,10 @@ python_functions = ["test_*"]
 # The LLM-pass config template, so `cp .../.env.example .../.env` also works for
 # someone who pip-installed rather than cloned.
 "stt_api.evaluation" = [".env.example"]
+# PulseVAD's ONNX weights and its mel filterbank. Without this the plugin raises
+# at prewarm on an installed copy while working fine from a source checkout —
+# the same trap the noise_cancellation entry above exists to avoid.
+"stt_api.livekit_plugin.pulse_vad" = ["resources/*.onnx", "resources/*.npy", "resources/LICENSE.*"]
 
 [tool.setuptools.packages.find]
 include = ["stt_api*"]
