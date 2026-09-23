@@ -120,46 +120,82 @@ Long-form speech-to-text API that:
 
 ---
 
-## LiveKit Turn Detector Plugin
+## LiveKit Plugins
 
-A custom fork of `livekit-plugins-turn-detector` with vLLM backend support for end-of-turn detection.
+Plugins for [LiveKit Agents](https://docs.livekit.io/agents/), shipped from this
+repo and installable **without the STT server stack**:
 
-### Installation
+| Plugin | What it does |
+|---|---|
+| `WhisperSTT` `DropBlankSTT` | Whisper STT that will not let silence interrupt the agent — [whisper_stt](stt_api/livekit_plugin/whisper_stt/README.md) |
+| `PulseVAD` | Frame-level voice activity, 2,118 parameters — [pulse_vad](stt_api/livekit_plugin/pulse_vad/README.md) |
+| `SemanticVAD` | End of turn decided from audio, ahead of the transcript — [semantic_vad](stt_api/livekit_plugin/semantic_vad/README.md) |
+| `MultilingualModel` | End of turn from text — a fork of `livekit-plugins-turn-detector` with a vLLM backend |
+| `GTCRN` | Self-hosted noise cancellation, in-process, no LiveKit Cloud licence |
+| `DummySTT` `DummyLLM` `DummyTTS` | Canned responses for load tests, zero API cost |
+
+Index and install notes: [`stt_api/livekit_plugin/`](stt_api/livekit_plugin/README.md).
+
+### Install into an agent
 
 ```bash
-# Core package only
-pip install .
-
-# With the LiveKit turn detector plugin
-pip install ".[livekit]"
-
-# With the full STT API server stack
-pip install ".[server]"
-
-# With both server and LiveKit integrations
-pip install ".[server,livekit]"
-
-# WER/CER scoring (stt_api.evaluation) works with the core install; this extra is
-# only needed by load_canonical, which reads dataset variant maps from HuggingFace
-pip install ".[evaluation]"
+uv pip install "stt-api[scicom-livekit-plugin] @ git+https://github.com/Scicom-AI-Enterprise-Organization/STT-API.git"
 ```
+
+or as a dependency of the agent project:
+
+```toml
+[project]
+dependencies = [
+    "stt-api[scicom-livekit-plugin] @ git+https://github.com/Scicom-AI-Enterprise-Organization/STT-API.git",
+]
+```
+
+Append `@<sha-or-tag>` to the URL to pin. The repo is private, so the installing
+machine needs a Git credential (`gh auth setup-git`, or a token in the URL for CI).
+
+One extra covers every plugin above: `livekit-agents[turn-detector]`, `aiohttp`,
+`transformers`, `huggingface_hub`, `onnxruntime`, `numpy` and `soundfile` — and
+nothing from `[server]`: no torch, no fastapi, no diarization stack.
+`tests/test_packaging.py` enforces that.
+
+### Install for the server or for development
+
+```bash
+pip install ".[server]"                          # the STT API server stack
+pip install ".[server,scicom-livekit-plugin]"    # both
+pip install ".[dev]"                             # test tooling
+pip install ".[benchmark]"                       # the noise-cancellation and VAD shootouts
+pip install .                                    # the package alone: zero dependencies
+```
+
+`livekit` is an alias for `scicom-livekit-plugin`; both install the same set.
+WER/CER scoring (`stt_api.evaluation`) works with the core install — `[evaluation]`
+is only needed by `load_canonical`, which reads dataset variant maps from
+HuggingFace.
 
 ### Usage
 
+One import line, whichever plugins the agent uses:
+
 ```python
-from stt_api.livekit_plugin.turn_detector import MultilingualModel
+from stt_api.livekit_plugin import GTCRN, PulseVAD, SemanticVAD, WhisperSTT
 
 session = AgentSession(
-    stt=groq.STT(model="whisper-large-v3-turbo", language="en"),
+    stt=WhisperSTT(),                                 # reads STT_URL / STT_API / STT_MODEL
     llm=openai.LLM(model="gpt-4o-mini"),
     tts=openai.TTS(model="gpt-4o-mini-tts", voice="ash"),
-    turn_detection=MultilingualModel(),
+    vad=ctx.proc.userdata["vad"],                     # PulseVAD.load() in prewarm
+    turn_detection=SemanticVAD(backend=ScicomEoT()),
 )
 ```
 
+Names resolve on first use, so importing one plugin does not load the others'
+dependencies. Each plugin's README has the real usage.
+
 ### Configuration
 
-Set the vLLM endpoint via environment variable:
+Set the vLLM endpoint for the turn detector via environment variable:
 
 ```bash
 export LIVEKIT_REMOTE_EOT_URL="https://your-vllm-endpoint.example.com"

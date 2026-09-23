@@ -14,6 +14,8 @@ WORKDIR /app
 
 COPY pyproject.toml uv.lock* ./
 
-RUN uv sync --frozen -v || uv sync -v
+# The server stack is an extra: base dependencies are empty so that an agent
+# installing stt-api[scicom-livekit-plugin] never pulls torch and friends.
+RUN uv sync --extra server --frozen -v || uv sync --extra server -v
 
 COPY . .
