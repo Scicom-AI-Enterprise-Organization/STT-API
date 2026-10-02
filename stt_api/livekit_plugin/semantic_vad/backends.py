@@ -12,7 +12,7 @@ Three backends, because the useful deployments are genuinely different:
 
 * `ScicomEoT` — `Scicom-intl/semantic-vad-eot-whisper-{tiny,base,small}`,
   Apache-2.0, trained on real Malaysian call-centre telephony. **The one to use
-  on `ms`.** int8 ONNX, 24-145 ms on one CPU thread depending on size.
+  on `ms`.** int8 ONNX, 28-185 ms on one CPU thread depending on size.
 * `SmartTurnV3` — `pipecat-ai/smart-turn-v3`, BSD-2. Same architecture, 23
   languages, no Malay.
 * `RemoteEoT` — a plain HTTP POST to a model too large to co-locate, such as a
@@ -177,16 +177,17 @@ class ScicomEoT(_WhisperWindowEoT):
     That makes this the one to reach for on `ms`, which smart-turn-v3 does not
     cover.
 
-    Sizes, on the publishers' own eot-bench run over 300 private telephony turns:
+    Sizes, int8, 2026-10-03 release, publishers' eot-bench (AUC on their
+    telephony test / on LiveKit's eot-bench-data, ms per prediction on one CPU
+    thread at export):
 
-        tiny   AUC 0.78   ~30 ms int8, 10 MB
-        base   AUC 0.84
-        small  AUC 0.86   best of the three, still CPU-viable
+        tiny   0.841 / 0.867    28 ms, 10 MB
+        base   0.847 / 0.879    56 ms, 24 MB
+        small  0.850 / 0.915   185 ms, 95 MB
 
-    `int8` by default: roughly half the latency of `fp32` for a reported mean
-    absolute output shift of 0.068. That is a real difference — if you are
-    calibrating a threshold near a decision boundary, measure `fp32` too rather
-    than assuming the quantisation is free.
+    `int8` by default: 2-3x faster than `fp32`, for a mean output shift of
+    0.016-0.023 (0.12 at most, on small). If you are calibrating a threshold
+    near a decision boundary, measure `fp32` too.
 
     Window and normalisation are read from the checkpoint's own
     `eot_window.json` rather than hardcoded, so a re-trained model that changes

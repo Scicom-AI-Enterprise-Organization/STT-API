@@ -118,17 +118,81 @@ Everything below is audio-native unless marked otherwise.
 
 | model | params | licence | languages | streaming | notes |
 |---|---|---|---|---|---|
-| **`Scicom-intl/semantic-vad-eot-whisper-*`** | 8 M (tiny) - 88 M (small) | Apache-2.0 | **ms**, en | windowed 8 s | **implemented.** Trained on real Malaysian call-centre telephony |
-| **`pipecat-ai/smart-turn-v3`** | 8 M | BSD-2 | 23 (no `ms`) | windowed 8 s | **implemented.** Whisper-Tiny encoder + linear head, 8 MB int8 ONNX |
+| **`Scicom-intl/semantic-vad-eot-whisper-{tiny,base,small}`** | 8 M / 20 M / 88 M | Apache-2.0 | **ms**, en | windowed 8 s | **implemented** as `ScicomEoT`. Trained on real Malaysian call-centre telephony. Re-released 2026-10-03 |
+| **Scicom VAD**, **Scicom VAD Telephony** | 635 M | private | **ms**, en | windowed 8 s | GPU only, call it with `RemoteEoT`. Re-released 2026-10-02 |
+| **`pipecat-ai/smart-turn-v3`** | 8 M | BSD-2 | 23 (no `ms`) | windowed 8 s | **implemented**. Whisper-Tiny encoder + linear head, 8 MB int8 ONNX |
 | **`anyreach-ai/dualturn-endpointing`** | ~1.5 M on frozen Mimi | Apache-2.0 | en | **true streaming, 12.5 Hz** | dual-channel (user + agent); explicit recurrent state |
 | `fixie-ai/turntaking-multilingual-llama8b-2a` | 8 B | **none stated** | multilingual | no | Ultravox-family; licence is a blocker |
-| Qwen2-Audio EoT (in-house, `Semantic-VAD` repo) | 7 B backbone + 1 M head | Apache-2.0 backbone | trained on 19 configs incl. `ms_*`; **published eval is `en` only** | no | not on the Hub — a local checkpoint you would have to serve |
+| Qwen2-Audio EoT (in-house, `Semantic-VAD` repo) | 7 B backbone + 1 M head | Apache-2.0 backbone | trained on 19 configs incl. `ms_*`; **published eval is `en` only** | no | superseded by the Whisper family above. Not on the Hub |
 | `TEN-framework/TEN_Turn_Detection` | ~7 B | Apache-2.0 | multi | no | **text**, not audio |
 | `KE-Team/KE-SemanticVAD` | 0.5 B | Apache-2.0 | zh/en | no | **text**; also classifies backchannel vs interrupt |
 
-### Measured here — all four backends
+### Scores
 
-12 VoiceBank utterances, complete versus truncated mid-utterance, one CPU thread:
+From the model cards of the 2026-10-02 and 2026-10-03 releases, scored with
+[LiveKit's eot-bench](https://github.com/livekit/eot-bench) on two sets:
+
+- **Telephony**: the test split of Scicom's private Malaysian call-centre set.
+  English, Malay and both, 8 kHz. No call in it is in the training data.
+- **eot-bench-data**: LiveKit's own 14-language set (`livekit/eot-bench-data`,
+  validation), on the same spans as LiveKit's published runs.
+
+| model | telephony cut-offs @ 300 ms | telephony latency @ 5 % | telephony AUC | eot-bench-data cut-offs @ 300 ms | eot-bench-data latency @ 5 % | eot-bench-data AUC |
+|---|---:|---:|---:|---:|---:|---:|
+| Scicom VAD Telephony | **39.6 %** | **1,663 ms** | **0.871** | 17.0 % | 759 ms | 0.929 |
+| Scicom VAD | 40.7 % | 1,779 ms | 0.861 | 15.8 % | 718 ms | 0.937 |
+| semantic-vad whisper-small, int8 | 43.4 % | 1,803 ms | 0.850 | 20.1 % | 801 ms | 0.915 |
+| semantic-vad whisper-base, int8 | 44.2 % | 1,803 ms | 0.847 | 26.5 % | 861 ms | 0.879 |
+| semantic-vad whisper-tiny, int8 | 44.7 % | 1,836 ms | 0.841 | 28.4 % | 896 ms | 0.867 |
+| LiveKit Turn Detector v1 (cloud) | not run | | | **14.8 %** | **688 ms** | **0.941** |
+| LiveKit Turn Detector v1-mini, audio | 61.6 % | 2,043 ms | 0.748 | 29.9 % | 924 ms | 0.840 |
+| smart-turn v3.2, CPU int8 | 69.6 % | 2,274 ms | 0.670 | 39.0 % | 914 ms | 0.789 |
+| ultraVAD | not run | | | 38.1 % | 911 ms | 0.797 |
+| silence timer only | 77.6 % | 2,020 ms | | 54.9 % | 1,100 ms | |
+
+- **Cut-offs @ 300 ms**: share of mid-turn pauses the agent interrupts when it
+  may wait 300 ms on average after a finished turn. Lower is better.
+- **Latency @ 5 %**: mean wait after a finished turn when at most 5 % of pauses
+  may be interrupted. Lower is better.
+- **AUC** is taken 0.2 s into each pause.
+- The tiny, base and small rows are the int8 ONNX files `ScicomEoT` loads by
+  default.
+
+Against the 2026-09-07 release (int8 for the CPU sizes):
+
+| model | telephony cut-offs | eot-bench-data cut-offs |
+|---|---:|---:|
+| tiny | 6.0 points fewer | 4.8 points fewer |
+| base | 1.0 point more | 1.8 points fewer |
+| small | 1.3 points more | 3.5 points fewer |
+| Scicom VAD | 1.3 points fewer | 9.3 points fewer |
+
+The old weights are kept on the `release-2026-09-07` branch of each repo.
+`ScicomEoT` always loads `main`. If your traffic is telephony only, the old
+`base` and `small` are still slightly better there.
+
+**Picking a size.** On telephony the three CPU sizes are within 1.3 points of
+each other. On eot-bench-data they are not: small is at 20.1 %, tiny at 28.4 %.
+Per prediction on one CPU thread, int8, at export: tiny 28.5 ms, base 56 ms,
+small 185 ms. All fit LiveKit's 1 s budget, but small costs 6.5x tiny and shares
+a core with the STT and VAD.
+
+- Malaysian telephony on CPU: `tiny`. Close to `small` at about a sixth of the cost.
+- Wideband audio or other languages on CPU: `small`, or `base` if CPU is tight.
+- A GPU available: Scicom VAD Telephony for phone calls, Scicom VAD for wideband
+  audio and LiveKit's 14 languages. About 21 ms per request on an H20, and about 120
+  predictions/s per GPU at p90 0.2 s, roughly 800 concurrent calls.
+
+**int8 by default.** It is 2x (tiny) to 3x (small) faster than fp32 at export.
+The mean output shift against PyTorch is 0.016 to 0.023, the maximum 0.047
+(tiny) to 0.12 (small). On the benchmarks above, int8 and fp32 cut-off rates differ
+by at most 1.5 points. If you calibrate a threshold near a decision boundary, pass
+`quantized=False` and measure fp32 too.
+
+### Measured here, on the 2026-09-07 release
+
+12 VoiceBank utterances, complete versus truncated mid-utterance, one CPU thread.
+This ran on the weights before the re-release and has not been re-run.
 
 | backend | window / normalise | complete | truncated | separation | correct order | ms/call |
 |---|---|---:|---:|---:|---:|---:|
@@ -137,49 +201,27 @@ Everything below is audio-native unless marked otherwise.
 | scicom base | 8 s / off | 0.855 | 0.757 | +0.099 | 10/12 | 42.5 |
 | scicom small | 8 s / off | 0.851 | 0.663 | +0.188 | 11/12 | 145.2 |
 
-**Do not read this as a ranking.** The corpus is English read speech — inside
-smart-turn-v3's 23 languages and squarely *outside* what the Scicom models were
-trained for (Malaysian call-centre telephony, where a turn end is observed
-because the other party took the floor). All this table establishes is that the
-integration is wired correctly and every backend discriminates in the right
-direction.
+**Do not read this as a ranking.** The corpus is English read speech. That is
+inside smart-turn-v3's 23 languages and outside what the Scicom models were
+trained on, Malaysian call-centre telephony where a turn ends because the other
+party took the floor. The table only shows that the integration is wired
+correctly and that every backend moves in the right direction.
 
-The useful signal in it is internal consistency: separation orders
-small > base > tiny, matching the publishers' own AUC ordering (0.86 > 0.84 >
-0.78) on their telephony benchmark. If the preprocessing were wrong, that
-ordering would not survive.
-
-For a real comparison on `ms`, use the publishers' eot-bench numbers over 300
-private telephony turns:
-
-| model | cutoff @ 300 ms | latency @ 10 % cutoff | AUC |
-|---|---:|---:|---:|
-| Scicom enterprise (GPU-served, private) | 38.6 % | 1034 ms | 0.87 |
-| semantic-vad whisper-small | 48.6 % | 1099 ms | 0.86 |
-| semantic-vad whisper-base | 45.0 % | 1260 ms | 0.84 |
-| semantic-vad whisper-tiny | 57.9 % | 1332 ms | 0.78 |
-
-**Picking a size.** `small` has the best ranking but 145 ms per call — still
-inside LiveKit's 1 s budget, though it is 4x `base` and shares a core with the
-STT and VAD. `base` is the reasonable default; `tiny` at 24 ms is for when CPU is
-the binding constraint and you can accept AUC 0.78.
-
-**int8 by default.** Roughly half the latency of fp32 for a reported mean
-absolute output shift of 0.068 — pass `quantized=False` and re-measure if you are
-calibrating a threshold near a decision boundary.
+It is still internally consistent. Separation orders small > base > tiny, the
+same order as the publishers' AUCs. Wrong preprocessing would break that order.
 
 ### DualTurn is worth a look before scaling up
 
-It is the only candidate here that is *genuinely* streaming rather than windowed:
+It is the only candidate here that streams rather than windows.
 `stream_tick.onnx` takes an 80 ms chunk plus full recurrent state (KV cache,
-transformer history, LSTM `h`/`c`) and returns updated state alongside `eot`,
-`vad` and `fvad`. So it emits a turn-end probability **every 80 ms** instead of
-only when the VAD asks, and it reads **both channels** — hearing the agent's own
-speech is what makes barge-in and overlap judgements reliable. All for ~1.5 M
+transformer history, LSTM `h`/`c`) and returns updated state with `eot`, `vad`
+and `fvad`. So it emits a turn-end probability **every 80 ms** instead of only
+when the VAD asks. It also reads **both channels**, and hearing the agent's own
+speech is what makes barge-in and overlap calls reliable. All of that for ~1.5 M
 trainable parameters on a frozen Mimi encoder.
 
-Its limits are equally clear: English only, 24 kHz, and the dual-channel design
-wants the agent's audio wired in, which is a bigger change than swapping a
+The limits are just as clear. English only, 24 kHz, and the dual-channel design
+needs the agent's audio wired in, which is a bigger change than swapping a
 detector. Not implemented here.
 
 ## Serving a large model
