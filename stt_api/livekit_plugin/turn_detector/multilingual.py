@@ -167,5 +167,13 @@ def _remote_inference_url() -> Optional[str]:
     return f"{url_base}/v1/completions"
 
 
-if not _remote_inference_url():
+# Importing .base above runs livekit.plugins.turn_detector/__init__, which
+# registers a runner under this same INFERENCE_METHOD whenever the remote URL is
+# unset. Theirs is the same _EUORunnerBase("multilingual") over the same weights
+# as ours, so leave it in place: registering again raises "InferenceRunner
+# lk_end_of_utterance_multilingual already registered" and takes the import down.
+if (
+    not _remote_inference_url()
+    and _EUORunnerMultilingual.INFERENCE_METHOD not in _InferenceRunner.registered_runners
+):
     _InferenceRunner.register_runner(_EUORunnerMultilingual)

@@ -8,21 +8,31 @@ version = "0.1.0"
 description = "Long audio transcription API with VAD"
 readme = "README.md"
 requires-python = ">=3.10"
-dependencies = [
-    "aiohttp",
-    "transformers>=4.57.6",
-]
+# Deliberately empty. Every dependency belongs to the extra whose modules import
+# it, so `stt-api[scicom-livekit-plugin]` in an agent never drags the server
+# stack in.
+dependencies = []
 
 [project.optional-dependencies]
-livekit = [
+# Every LiveKit Agents plugin in stt_api/livekit_plugin — whisper_stt, pulse_vad,
+# semantic_vad, turn_detector, noise_cancellation, dummy — in one extra:
+#     uv pip install "stt-api[scicom-livekit-plugin] @ git+https://github.com/Scicom-AI-Enterprise-Organization/STT-API.git"
+# Listed by what the plugin modules actually import. livekit-agents[turn-detector]
+# happens to bring aiohttp, numpy, onnxruntime and transformers along today, but a
+# module that imports a package names it here rather than relying on that. The
+# benchmark and figure tooling inside those packages is NOT covered: it belongs to
+# [benchmark], so it never lands in an agent image.
+scicom-livekit-plugin = [
     "livekit-agents[turn-detector]~=1.2",
-    "soundfile",
-    # Self-hosted noise cancellation (livekit_plugin/noise_cancellation). Both
-    # already come in with livekit-plugins-silero, so an agent that installs plain
-    # `stt-api` alongside the LiveKit plugins still has them.
-    "onnxruntime",
-    "numpy",
+    "numpy",                  # pulse_vad, semantic_vad, whisper_stt, noise_cancellation
+    "onnxruntime",            # pulse_vad, semantic_vad, noise_cancellation
+    "aiohttp",                # turn_detector and whisper_stt: HTTP to the engines
+    "transformers>=4.57.6",   # turn_detector tokenizer, semantic_vad feature extractor
+    "huggingface_hub",        # semantic_vad: pulls the SmartTurn weights
+    "soundfile",              # dummy: TTS playback file
 ]
+# Pre-rename alias, same contents. Keep both working.
+livekit = ["stt-api[scicom-livekit-plugin]"]
 server = [
     "fastapi==0.110.2",
     "python-multipart",
@@ -41,6 +51,8 @@ server = [
     "packaging",
     "pyyaml",
     "huggingface_hub",
+    "aiohttp",                # main: upstream STT engine calls
+    "transformers>=4.57.6",   # force_alignment: MMS-300M
 ]
 # stt_api.evaluation (WER/CER scoring with spelling conventions normalized away) is
 # standard-library only — including its LLM pass, which speaks plain urllib. This
@@ -82,6 +94,9 @@ testpaths = ["tests"]
 python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
+markers = [
+    "slow: builds a wheel or reaches a package index; skipped when either is unavailable",
+]
 
 [tool.setuptools.package-data]
 "stt_api.livekit_plugin.dummy" = ["audio/*.mp3", "audio/*.wav"]
