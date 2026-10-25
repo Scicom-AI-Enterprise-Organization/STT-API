@@ -50,6 +50,9 @@ logger = logging.getLogger(__name__)
 class Stream(Protocol):
     """One call. Audio in, the isolated audio that is ready out."""
 
+    delay_s: float
+    """The model's own delay inside what `push` returns: its STFT look-ahead."""
+
     def push(self, pcm: np.ndarray) -> np.ndarray:
         """`pcm` is mono float32 in [-1, 1] at 16 kHz, any length."""
         ...
@@ -200,6 +203,7 @@ class RemoteIsolator:
 class _RemoteStream:
     def __init__(self, url, headers, timeout, enrollment) -> None:
         self.url = url
+        self.delay_s = 0.010  # the server's model: the same 20 ms window every 10 ms
         self._loop = _io_loop()
         self._buf = bytearray()
         self._lock = threading.Lock()

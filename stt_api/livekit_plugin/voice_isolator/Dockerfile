@@ -1,8 +1,9 @@
 # The GPU backend of the voice isolator plugin (RemoteIsolator): the release,
 # Scicom-intl/voice-isolator-m-wavlm (M + a causal WavLM-Large branch, 555M
-# parameters), served by the model repository's own WebSocket server. One GPU
-# carries 64 live calls with 20 ms chunks at 29 ms median / 39 ms p99 round trip
-# on the same host, once every call has enrolled; more calls fall behind.
+# parameters), served by the model repository's own WebSocket server. Measured
+# through LiveKit agents (benchmark/): one GPU carried 64 live calls in LiveKit's
+# 50 ms frames, the agents hearing them 140 ms late at the median, 150 ms at p99,
+# nothing passed unfiltered, the server busy 27 ms of every 40 ms.
 #
 # The repository is private: build with a token that can read it, as a secret,
 # so it is never written into a layer.
@@ -25,7 +26,9 @@ EXPOSE 8765
 
 # --workers: processes carrying the WebSockets (one Python process tops out near
 # 6,400 messages a second); --enroll-loud: the live enrollment rule, the same one
-# LocalIsolator runs; --chunk-hops 2: 20 ms steps (the WavLM branch needs 20 ms
-# multiples).
+# LocalIsolator runs; --chunk-hops 4: 40 ms steps, for LiveKit's 50 ms frames (the
+# WavLM branch needs 20 ms multiples). With agents set to 20 ms frames
+# (AudioInputOptions(frame_size_ms=20)), --chunk-hops 2 halves the delay (50 ms
+# median at 32 calls) for fewer calls per GPU.
 CMD ["python", "-m", "vi.server_mp", "--ckpt", "/model", "--port", "8765", \
-     "--workers", "8", "--enroll-loud", "--chunk-hops", "2", "--max-streams", "128"]
+     "--workers", "8", "--enroll-loud", "--chunk-hops", "4", "--max-streams", "128"]

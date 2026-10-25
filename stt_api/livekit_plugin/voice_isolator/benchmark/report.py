@@ -13,6 +13,13 @@ Per run, from every room's agent log (`agent.py`):
 - **drift**: how far the agent fell behind the stream over a call (the spread of
   arrival time minus audio position, p99 over calls); a filter that cannot keep up
   shows here first.
+- **unfiltered**: share of the calls' audio the plugin passed through untouched
+  because the server's reply came later than `max_lag_ms` (`unfiltered_ms`).
+- **join**: how long a call waited for its agent, from LiveKit's job request to the
+  agent in the room (median / max); the callers publish only once it is there.
+- **delay**: how far the filter's output stood behind its input, frame by frame
+  (`VoiceIsolator.delay_ms`), median / p99 / max: the model's 10 ms, and with a server
+  the round trip, its step and any late reply's silence.
 
 And, against the reference run (the same recordings with only the caller on the line,
 no filter), each room lined up with its recording by its level contour (`offset`):
@@ -39,22 +46,27 @@ SR = 16000
 GRID = 0.032
 
 
-def offset(frames: np.ndarray, wav: Path, max_s: float = 10.0) -> int:
+def offset(frames: np.ndarray, wav: Path, search_s: float = 2.0) -> int:
     """Stream samples before the recording's sample 0.
 
-    The level contour of the frames the agent received (dBFS per frame, after Opus and
-    WebRTC's start-up) against the recording's, at every 10 ms shift: the shift with
-    the smallest difference over the whole call. A first-sound threshold is not
-    enough: the first frames through WebRTC come in quieter, by a different number of
-    frames in every room."""
+    The callers start together once every agent is in, so a recording starts minutes
+    into its stream. First sound against first sound gives the start to within a few
+    frames; then the level contour of the frames the agent received (dBFS per frame,
+    after Opus and WebRTC) against the recording's, at every 10 ms shift within
+    `search_s` of it: the shift with the smallest difference over the whole call. First
+    sound alone is not enough: the first frames through WebRTC come in quieter, by a
+    different number of frames in every room."""
     pos, lev = frames[:, 1], np.clip(frames[:, 3], -70.0, 0.0)
     n = int(np.median(np.diff(pos)))
     x = sf.read(wav, dtype="float32")[0].astype(np.float64)
     cs = np.concatenate([[0.0], np.cumsum(x * x)])
     starts = np.arange(0, len(x) - n, 160)
     rec = np.clip(10 * np.log10((cs[starts + n] - cs[starts]) / n + 1e-12), -70.0, 0.0)
+    loud, rloud = np.flatnonzero(lev > -50.0), np.flatnonzero(rec > -50.0)
+    guess = int(pos[loud[0]] - starts[rloud[0]]) if len(loud) and len(rloud) else 0
+    lo = max(0, (guess - int(search_s * SR)) // 160 * 160)
     best, best_err = 0, np.inf
-    for off in range(0, int(max_s * SR), 160):
+    for off in range(lo, guess + int(search_s * SR) + 1, 160):
         r = pos - off
         ok = (r >= 0) & (r < starts[-1])
         if ok.sum() < 50:
@@ -144,19 +156,27 @@ def load(root: Path, run: str) -> tuple[dict, dict]:
 def summarize(root: Path, ref_run: str, run: str) -> dict:
     logs, files = load(root, run)
     ref_logs, ref_files = load(root, ref_run)
-    dts, filt, job, drift = [], [], [], []
+    dts, filt, job, drift, delay, join, unf = [], [], [], [], [], [], []
     vad = []
     for i, log in logs.items():
         fr = np.asarray(log["frames"], dtype=np.float64)
         if not len(fr) or i not in files:
             continue
         seconds = files[i][1]
+        # the filter ran on all the agent heard, the wait before the call included
+        heard = (fr[-1, 1] + np.median(np.diff(fr[:, 1]))) / SR
         dts.append(fr[:, 2] * 1000)
-        filt.append(fr[:, 2].sum() / seconds)
+        if fr.shape[1] > 4:
+            delay.append(fr[:, 4])
+        unf.append((log.get("unfiltered_s", 0.0), heard))
+        dp = log.get("dispatch") or {}
+        if dp.get("received_at") and dp.get("connected"):
+            join.append(dp["connected"] - dp["received_at"])
+        filt.append(fr[:, 2].sum() / heard)
         job.append(log["cpu_s"] / log["seconds"])
         lag = fr[:, 0] - fr[:, 1] / SR
         drift.append(float(lag.max() - lag.min()))
-        if i in ref_logs:
+        if i in ref_logs and i in ref_files:  # a caller that failed has no recording
             test_iv = turns(log, files[i][0])
             ref_iv = turns(ref_logs[i], ref_files[i][0])
             vad.append(against(test_iv, ref_iv, seconds))
@@ -171,6 +191,17 @@ def summarize(root: Path, ref_run: str, run: str) -> dict:
         "job_core_per_call": float(np.mean(job)) if job else None,
         "drift_s_p99": float(np.percentile(drift, 99)) if drift else None,
     }
+    if join:
+        out.update(join_s_p50=float(np.median(join)), join_s_max=float(max(join)))
+    if unf:
+        out["unfiltered_pct"] = 100 * sum(u for u, _ in unf) / sum(s for _, s in unf)
+    if delay:
+        dl = np.concatenate(delay)
+        out.update(
+            delay_ms_p50=float(np.percentile(dl, 50)),
+            delay_ms_p99=float(np.percentile(dl, 99)),
+            delay_ms_max=float(dl.max()),
+        )
     if vad:
         minutes = sum(v["speech_s"] + v["silence_s"] for v in vad) / 60
         dl = np.concatenate([v["delays"] for v in vad if v["delays"]] or [np.zeros(0)])

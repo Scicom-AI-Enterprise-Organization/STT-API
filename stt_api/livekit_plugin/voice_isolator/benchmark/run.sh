@@ -9,6 +9,8 @@
 # FILES: one directory per line with mix.wav (the call) and caller.wav (the caller
 # alone, 16 kHz mono). The reference run publishes caller.wav with no filter; every
 # other run publishes mix.wav. Results: $ROOT/report.json and the logs under $ROOT.
+# REF=keep reuses a reference run already in $ROOT; RUN_TAG names this matrix's runs
+# <filter><RUN_TAG>-<CALLS> (e.g. RUN_TAG=-f20 VI_BENCH_FRAME_MS=20 for 20 ms frames).
 #
 # The server is always this script's own: its ports (LK_PORT, +1 TCP, +2 UDP) and an API
 # key of its own, so that neither its callers nor its worker can ever reach another
@@ -34,10 +36,11 @@ rtc:
   tcp_port: $((LK_PORT + 1))
   udp_port: $((LK_PORT + 2))
   use_external_ip: false
+  node_ip: 127.0.0.1  # everything runs on this host: offer only the loopback address
 keys:
   vibench: $SECRET
 logging:
-  level: warn
+  level: ${LK_LOG_LEVEL:-warn}
 EOF
 "${LIVEKIT_SERVER:-livekit-server}" --config "$ROOT/livekit.yaml" > "$ROOT/livekit-server.log" 2>&1 &
 LK=$!
@@ -51,8 +54,13 @@ one() {  # one() FILTER RUN CHANNEL
   VI_BENCH_FILTER=$1 VI_BENCH_OUT="$ROOT/$2" VI_BENCH_IDLE=$((CALLS + 2)) \
     $PY -m stt_api.livekit_plugin.voice_isolator.benchmark.agent start > "$ROOT/agent-$2.log" 2>&1 &
   local W=$!
-  for _ in $(seq 120); do grep -q "registered worker" "$ROOT/agent-$2.log" 2>/dev/null && break; sleep 1; done
-  sleep $((CALLS / 4 + 5))   # the idle processes prewarm (VAD, model)
+  # every call's process warm (VAD, model) before the first caller joins
+  for _ in $(seq 300); do
+    n=$(grep -c '"process initialized"' "$ROOT/agent-$2.log" 2>/dev/null)
+    [ "${n:-0}" -ge $((CALLS + 2)) ] && break
+    sleep 1
+  done
+  sleep 2
   $PY -m stt_api.livekit_plugin.voice_isolator.benchmark.callers --files "$FILES" --calls "$CALLS" \
     --run "$2" --channel "$3" --out "$ROOT"
   for _ in $(seq 60); do
@@ -61,10 +69,12 @@ one() {  # one() FILTER RUN CHANNEL
   kill -INT $W; wait $W 2>/dev/null
 }
 
-one none "ref-$CALLS" caller.wav
+if [ "${REF:-}" != keep ] || [ ! -f "$ROOT/ref-$CALLS/callers.json" ]; then
+  one none "ref-$CALLS" caller.wav
+fi
 RUNS=""
 for F in "$@"; do
-  one "$F" "$F-$CALLS" mix.wav
-  RUNS="$RUNS $F-$CALLS"
+  one "$F" "$F${RUN_TAG:-}-$CALLS" mix.wav
+  RUNS="$RUNS $F${RUN_TAG:-}-$CALLS"
 done
 $PY -m stt_api.livekit_plugin.voice_isolator.benchmark.report --root "$ROOT" --reference "ref-$CALLS" --runs $RUNS

@@ -27,8 +27,13 @@ voice) and `caller.wav` (the caller alone), 16 kHz mono. Needs `livekit-plugins-
   which LiveKit calls exactly where it would call the filter. `Timed` records each
   frame's arrival, its position in the stream, the filter's time and the input level.
   The VAD's verdicts come from the session's own `user_state_changed` events.
-- **Callers** (`callers.py`). One participant per room joins, waits for the agent,
-  publishes a microphone track and pushes 10 ms frames paced on the wall clock.
+- **Callers** (`callers.py`). One participant per room joins, waits for its agent,
+  publishes a microphone track and pushes 20 ms frames paced on the wall clock, four
+  calls to a process (one Python process cannot push dozens of calls in real time).
+  Joining is not measured: every caller connects first, and the calls start streaming
+  together at a set time, spread over 10 s, so that they overlap for the whole call.
+  On a host with several network interfaces a WebRTC participant can take seconds of
+  CPU to connect; 64 at once take a minute (the report's **join**).
 - **Reference.** The same rooms are run first with `caller.wav` and no filter: what the
   agent's VAD does when only the caller is on the line.
 
@@ -50,19 +55,54 @@ voice) and `caller.wav` (the caller alone), 16 kHz mono. Needs `livekit-plugins-
 
 ## Results
 
-The trained models' run (32 calls per configuration, `call_test_mix`: 60 s
-call-centre calls with a second voice) goes here.
+One host carries everything: the LiveKit server, the agent worker, the callers and, for
+`RemoteIsolator`, the GPU server (the plugin's `Dockerfile` command; the release, M +
+causal WavLM-Large). The calls are `call_test_mix`: 60 s call-centre calls, each with a
+second voice; 32 at once unless noted. The reference is the same rooms with each
+caller's own channel and no filter.
 
-The harness check, 4 calls per configuration with a random 125K-parameter model in
-place of the CPU model and a CPU stand-in for the GPU server:
+What the filter costs the agent:
 
-| | frame p50 | frame p99 | filter, core per call | job, core per call | drift p99 |
+| filter | frame p50 / p99 | filter, core per call | delay p50 / p99 | unfiltered |
+|---|---|---|---|---|
+| none | 0.0 / 0.0 ms | 0 | 0 | |
+| GTCRN | 3.1 / 5.6 ms | 0.066 | | |
+| `RemoteIsolator`, LiveKit's 50 ms frames, server at 40 ms | 0.13 / 0.36 ms | 0.003 | 100 / 100 ms | 0.0% |
+| `RemoteIsolator`, 20 ms frames, server at 20 ms | 0.10 / 0.24 ms | 0.005 | 50 / 70 ms | 0.0% |
+| `RemoteIsolator`, 50 ms frames, server at 40 ms, **64 calls** | 0.15 / 0.40 ms | 0.003 | 140 / 150 ms | 0.0% |
+
+With 64 calls on one GPU a step of all of them took 23 ms of the server's 40 ms period.
+
+What the agent's VAD did, against each caller's own channel:
+
+| filter | false starts per min | speech in the caller's pauses | turn end p90 | turn ends held | caller missed |
 |---|---|---|---|---|---|
-| no filter | 0.0 ms | 0.0 ms | 0 | 0.17 | 53 ms |
-| GTCRN | 2.9 ms | 7.6 ms | 0.069 | 0.26 | 24 ms |
-| `LocalIsolator` (random tiny model) | 1.2 ms | 4.5 ms | 0.030 | 0.19 | 17 ms |
-| `RemoteIsolator` (queues only) | 0.09 ms | 0.85 ms | 0.003 | 0.17 | 24 ms |
+| none | 2.84 | 47.5% | 2.04 s | 23% | 0.3% |
+| GTCRN | 2.88 | 46.8% | 2.03 s | 22% | 0.7% |
+| `RemoteIsolator`, 50 ms frames | 1.78 | 25.6% | 1.15 s | 19% | 7.2% |
+| `RemoteIsolator`, 20 ms frames | 1.72 | 25.7% | 1.16 s | 17% | 6.6% |
+| `RemoteIsolator`, 64 calls | 1.61 | 23.7% | 1.12 s | 24% | 9.7% |
 
-With no filter, against the caller-alone run, the VAD misses 0.5% of the caller's speech
-over the 28 caller turns. That is the alignment and WebRTC floor of the method; the
-offline measurement on the same calls is 0.1%.
+These agree with the same VAD run offline over the recordings (Voice-Isolator's
+`scripts/vad_eval.py`: release 22.8% of pauses, 1.94 false starts a minute, 8.4% missed;
+no processing 47.9%, 3.33, 0.1%). Noise suppression leaves another voice in: GTCRN
+changes nothing here. The cost is the caller's own speech, mostly the first seconds of a
+call, before the live enrollment exists.
+
+The `LocalIsolator` rows (the CPU model) come with its weights.
+
+### What the benchmark found on the way
+
+- **The GPU server fell behind under real agents.** LiveKit hands a call's frames over a
+  few ms apart, not on a beat, so the server ran a partial step for nearly every chunk
+  and every call slid back for the rest of the call (22 of 32 calls at the delay bound).
+  It now steps again only within its tick's budget, plus at most one catch-up step every
+  fourth tick for calls that fell behind (`vi/server_mp.py`).
+- **The plugin waited for a late server without bound** (a call reached 10 s of delay).
+  The delay is now capped at `max_lag_ms`; audio whose isolated version comes later
+  passes unfiltered (`unfiltered_ms`), and delay a stall left behind is won back in the
+  caller's pauses.
+- **A stream that opens with silence enrolls on it.** The live enrollment counts from
+  the stream's first frame, so the callers publish at the call's start, as a real
+  caller does; a caller silent for the first 15 s of a real call has the same problem
+  (`enrollment=` avoids it).

@@ -86,6 +86,7 @@ class OnnxStream:
         c = self.cfg
         self.win, self.hop = c["win"], c["hop"]
         self.delay = self.win - self.hop
+        self.delay_s = self.delay / SAMPLE_RATE
         self.window, self.R = c["window"], c["window"] - 1
         self.L, self.heads, self.hd = c["layers"], c["heads"], c["head_dim"]
         self.w = sqrt_hann(self.win)

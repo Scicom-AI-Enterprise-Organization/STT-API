@@ -49,6 +49,14 @@ def speechlike(seconds: float, seed: int = 0, rate: int = 16000) -> np.ndarray:
     return np.clip(np.rint(x * 32768), -32768, 32767).astype(np.float32) / 32768
 
 
+def with_silences(seconds: float, seed: int = 0, rate: int = 16000) -> np.ndarray:
+    """speechlike() with digital silence in its pauses, as the isolated output of a
+    caller's pause is: where the plugin may win back delay."""
+    x = speechlike(seconds, seed, rate)
+    t = np.arange(len(x)) / rate
+    return np.where(np.sin(2 * np.pi * 1.3 * t) > -0.2, x, 0.0).astype(np.float32)
+
+
 def frames(x: np.ndarray, rate: int, ms: int):
     n = rate * ms // 1000
     for i in range(0, len(x) - n + 1, n):
@@ -106,6 +114,12 @@ class TestLocal:
         ref = np.clip(np.rint(ref * 32768), -32768, 32767) / 32768
         assert np.abs(y[160 : 160 + len(ref)] - ref).max() <= 2 * LSB
 
+    def test_reports_its_delay(self, local):
+        vi = VoiceIsolator(backend=local)
+        run(vi, speechlike(1.0), ms=50, close=False)
+        assert vi.delay_ms == pytest.approx(10.0)
+        vi._close()
+
     def test_calls_share_nothing(self, local):
         xa, xb = speechlike(4.0, seed=2), speechlike(4.0, seed=3)
         solo = run(VoiceIsolator(backend=local), xa, ms=20)
@@ -153,21 +167,33 @@ class TestLocal:
 
 @pytest.fixture
 def halving_server():
-    """A stand-in for the GPU server: same protocol, halves every sample."""
+    """A stand-in for the GPU server: same protocol, halves every sample. `delay`:
+    every reply that much later; `stall` (k, s): stop for s seconds at message k,
+    then answer what waited at once."""
     aiohttp = pytest.importorskip("aiohttp")
     from aiohttp import web
 
-    state = {"enroll": [], "close_after": None}
+    state = {"enroll": [], "close_after": None, "delay": 0.0, "stall": None}
 
     async def handler(request):
         ws = web.WebSocketResponse(max_msg_size=0)
         await ws.prepare(request)
+        loop = asyncio.get_running_loop()
         n = 0
         async for msg in ws:
             if msg.type == aiohttp.WSMsgType.BINARY:
                 a = np.frombuffer(msg.data, "<i2").astype(np.int32) // 2
-                await ws.send_bytes(a.astype("<i2").tobytes())
+                b = a.astype("<i2").tobytes()
                 n += 1
+                if state["stall"] and n == state["stall"][0]:
+                    await asyncio.sleep(state["stall"][1])
+                if state["delay"]:
+                    loop.call_later(
+                        state["delay"],
+                        lambda b=b: asyncio.ensure_future(ws.send_bytes(b)),
+                    )
+                else:
+                    await ws.send_bytes(b)
                 if state["close_after"] and n >= state["close_after"]:
                     await ws.close()
                     break
@@ -215,6 +241,44 @@ class TestRemote:
             d = lag_at(y, x, seg, 4000)
             err = np.abs(y[seg] - half[seg.start - d : seg.stop - d]).max()
             assert err <= 2 * LSB, f"output at {seg} is not the halved input at any lag"
+
+    def test_reports_its_delay(self, halving_server):
+        # delay_ms is the lag at which the output is the input at the end of the call,
+        # plus the model's own 10 ms (the stand-in server answers without it)
+        url, _ = halving_server
+        x = speechlike(2.0, seed=10)
+        vi = VoiceIsolator(backend=RemoteIsolator(url))
+        y = run(vi, x, ms=20, pause=0.005, close=False)
+        d = lag_at(y, x, slice(len(y) - 4000, len(y)), 4000)
+        assert vi.delay_ms == pytest.approx(10.0 + d / 16.0)
+        vi._close()
+
+    def test_a_slow_server_costs_at_most_max_lag(self, halving_server):
+        # replies 0.4 s late against a 0.25 s bound: the delay stops at the bound and
+        # the call goes out unfiltered (the input itself, not the halved input)
+        url, state = halving_server
+        state["delay"] = 0.4
+        x = speechlike(2.0, seed=11)
+        vi = VoiceIsolator(backend=RemoteIsolator(url), max_lag_ms=250.0)
+        y = run(vi, x, ms=20, pause=0.02, close=False)
+        assert vi.delay_ms == pytest.approx(260.0)
+        assert vi.unfiltered_ms > 1000.0  # all but the first 0.65 s or so
+        seg = slice(len(y) - 8000, len(y))
+        assert np.abs(y[seg] - x[seg.start - 4000 : seg.stop - 4000]).max() <= LSB
+        vi._close()
+
+    def test_delay_from_a_stall_is_won_back_in_pauses(self, halving_server):
+        url, state = halving_server
+        state["stall"] = (25, 0.2)  # half a second in, no reply for 0.2 s
+        vi = VoiceIsolator(backend=RemoteIsolator(url))
+        delays = []
+        for f in frames(with_silences(6.0, seed=12), 16000, 20):
+            vi._process(f)
+            delays.append(vi.delay_ms)
+            time.sleep(0.02)
+        vi._close()
+        assert max(delays) >= 150.0
+        assert delays[-1] <= 60.0
 
     def test_enrollment_is_sent_first(self, halving_server):
         url, state = halving_server

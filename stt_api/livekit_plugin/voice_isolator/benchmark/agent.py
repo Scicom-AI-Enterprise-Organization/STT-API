@@ -7,13 +7,14 @@ under test on its audio input.
         python -m stt_api.livekit_plugin.voice_isolator.benchmark.agent start
 
 VI_BENCH_FILTER: none | gtcrn | local | local-int8 | remote (VOICE_ISOLATOR_URL).
+VI_BENCH_FRAME_MS: the audio input's frame size (LiveKit's default, 50).
 
 Every room gets an `AgentSession` with LiveKit's Silero VAD (its defaults) and the
 dummy STT, LLM and TTS, so a turn runs the whole pipeline without paying for one. The
 filter is wrapped in `Timed`, which LiveKit calls exactly where it would call the
 filter, and which records each frame: when it arrived, how many samples came before
-it, how long the filter took and its input level (to line the stream up with the
-recording). The VAD's verdicts come from the session's own
+it, how long the filter took, its input level (to line the stream up with the
+recording) and how far the filter's output stood behind its input (`delay_ms`). The VAD's verdicts come from the session's own
 `user_state_changed` events. One JSON per room in VI_BENCH_OUT on shutdown, with the
 job process's CPU time.
 """
@@ -42,6 +43,7 @@ from livekit.plugins import silero
 from stt_api.livekit_plugin.dummy import LLM, STT, TTS
 
 FILTER = os.environ.get("VI_BENCH_FILTER", "none")
+FRAME_MS = int(os.environ.get("VI_BENCH_FRAME_MS", "50"))
 OUT = Path(os.environ.get("VI_BENCH_OUT", "/tmp/vi_bench"))
 
 
@@ -53,8 +55,8 @@ class Timed(rtc.FrameProcessor[rtc.AudioFrame]):
         self._enabled = True
         self.t0: float | None = None
         self.n = 0
-        # (arrival s, samples before it, filter s, input level dBFS)
-        self.frames: list[tuple[float, int, float, float]] = []
+        # (arrival s, samples before it, filter s, input level dBFS, output delay ms)
+        self.frames: list[tuple[float, int, float, float, float]] = []
 
     @property
     def enabled(self) -> bool:
@@ -72,7 +74,8 @@ class Timed(rtc.FrameProcessor[rtc.AudioFrame]):
         dt = time.perf_counter() - now
         x = np.frombuffer(frame.data, np.int16).astype(np.float32) / 32768.0
         db = float(10 * np.log10(np.mean(x * x) + 1e-12))
-        self.frames.append((now - self.t0, self.n, dt, db))
+        delay = float(getattr(self.inner, "delay_ms", 0.0))
+        self.frames.append((now - self.t0, self.n, dt, db, delay))
         self.n += frame.samples_per_channel
         return out
 
@@ -108,7 +111,15 @@ def make_filter(proc: JobProcess) -> rtc.FrameProcessor[rtc.AudioFrame] | None:
 
 
 async def entrypoint(ctx: JobContext) -> None:
+    entry = time.time()
     await ctx.connect()
+    # how long the call waited for its agent: LiveKit's dispatch timeline (wall clock)
+    info = getattr(ctx, "_info", None)
+    dispatch = {
+        k: getattr(info, k, None)
+        for k in ("received_at", "accepted_at", "assigned_at", "launched_at")
+    }
+    dispatch.update(entrypoint=entry, connected=time.time())
     cpu0, wall0 = resource.getrusage(resource.RUSAGE_SELF), time.perf_counter()
     timed: list[Timed] = []
     events: list[tuple[float, str]] = []
@@ -135,6 +146,8 @@ async def entrypoint(ctx: JobContext) -> None:
             "seconds": time.perf_counter() - wall0,
             "cpu_s": (cpu.ru_utime - cpu0.ru_utime) + (cpu.ru_stime - cpu0.ru_stime),
             "rss_mb": cpu.ru_maxrss / 1024,
+            "dispatch": dispatch,
+            "unfiltered_s": getattr(t.inner, "unfiltered_ms", 0.0) / 1000 if t else 0.0,
             "frames": t.frames if t else [],
             # user states in the stream's own time: seconds since its first frame
             "vad": [(w - t.t0, s) for w, s in events] if t and t.t0 is not None else [],
@@ -148,7 +161,10 @@ async def entrypoint(ctx: JobContext) -> None:
         room=ctx.room,
         room_options=room_io.RoomOptions(
             audio_input=room_io.AudioInputOptions(
-                sample_rate=16000, noise_cancellation=selector, pre_connect_audio=False
+                sample_rate=16000,
+                frame_size_ms=FRAME_MS,
+                noise_cancellation=selector,
+                pre_connect_audio=False,
             ),
         ),
     )

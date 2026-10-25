@@ -15,8 +15,8 @@ Two backends, like `../semantic_vad/`:
 |---|---|---|
 | model | `Scicom-intl/voice-isolator-cpu`, distilled for one CPU thread | `Scicom-intl/voice-isolator-m-wavlm`, the release: M + a causal WavLM-Large, 555M |
 | runs | in the agent process: onnxruntime + numpy, no torch, no GPU | on a GPU server (`Dockerfile`), one WebSocket per call |
-| delay | 10 ms (the STFT look-ahead) | 10 ms + one network round trip + up to one 20 ms server step |
-| cost | one thread per call, per frame, on the agent's audio loop | 64 calls per GPU (29 ms median, 39 ms p99 round trip on the host) |
+| delay in an agent | 10 ms (the STFT look-ahead) | 100 ms median at 32 calls, 140 ms at 64 (LiveKit's 50 ms frames, the server at 40 ms steps); 50 ms with 20 ms frames and steps |
+| cost | one thread per call, per frame, on the agent's audio loop | the agent only queues the frame (0.4 ms p99); 64 calls on one GPU measured |
 
 Both enroll the caller from the call itself and both give the same output whatever
 frame size LiveKit hands over (below).
@@ -57,7 +57,9 @@ Models:
   40 dB rather than to float rounding, so measure it on your calls before you switch.
 - `RemoteIsolator(url)` or `VOICE_ISOLATOR_URL` points at the GPU server. Build and run it
   from this directory's `Dockerfile`; it serves the release with the model repository's
-  own server (`python -m vi.server_mp --enroll-loud`).
+  own server (`python -m vi.server_mp --enroll-loud --chunk-hops 4`: 40 ms steps for
+  LiveKit's 50 ms frames; with `AudioInputOptions(frame_size_ms=20)`, `--chunk-hops 2`
+  halves the delay for fewer calls per GPU).
 
 Only phone callers, where it matters most:
 
@@ -85,7 +87,10 @@ the output of the model run offline over the whole recording, 10 ms later
 second, 124-134 dB against PyTorch on real calls, i.e. float rounding).
 
 The one place context runs short is the start of a call: before 3 s there is no
-speaker vector, and the model runs with its learned "no enrollment" vector.
+speaker vector, and the model runs with its learned "no enrollment" vector. The live
+enrollment counts from the stream's first frame and is fixed at 15.5 s, so a caller who
+says nothing in that time (a long greeting from the agent, a hold) is enrolled on
+whatever the line carried; pass `enrollment=` when you have a clip of the caller.
 
 ## What it does to the agent's VAD
 
@@ -136,12 +141,14 @@ caller alone. See [benchmark/README.md](benchmark/README.md).
 - **A server lost mid-call passes the caller through** for the rest of that call, with one
   warning: the agent keeps hearing the caller, unfiltered. It does not reconnect, because
   the server's state for the call (its enrollment, its last 10 s) went with the connection.
+- **A late server costs at most `max_lag_ms` (250) of delay.** Audio whose isolated
+  version is not back by then goes out as it came in, unfiltered, rather than ever
+  later; delay a stall left behind is won back in the caller's pauses. `delay_ms` (how
+  far the output stands behind the input) and `unfiltered_ms` (how much went out
+  unfiltered) are there to watch.
 - **`_process` runs on the agent's audio read loop.** With `LocalIsolator` that is one step
   of the model per frame on one thread; with `RemoteIsolator` it only queues the frame and
   takes what has come back, and the network lives on one background thread per process.
-- **`max_lag_ms` (250)** bounds the delay a late server can build up: a short frame is
-  answered with silence in front (the stream is delayed, nothing dropped), and a backlog
-  past the bound drops its oldest audio.
 - `enabled` is live: `nc.enabled = False` bypasses it mid-session.
 
 ## Models
