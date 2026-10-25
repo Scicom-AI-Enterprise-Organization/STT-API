@@ -6,13 +6,16 @@ Install just these — no server stack, no torch:
 
 Then one import line, whichever plugins the agent uses:
 
-    from stt_api.livekit_plugin import GTCRN, PulseVAD, SemanticVAD, WhisperSTT
+    from stt_api.livekit_plugin import GTCRN, PulseVAD, SemanticVAD, VoiceIsolator, WhisperSTT
 
 - ``WhisperSTT`` / ``DropBlankSTT`` — STT that silence cannot interrupt (``whisper_stt``)
 - ``PulseVAD`` — frame-level voice activity, 2,118 parameters (``pulse_vad``)
 - ``SemanticVAD`` — end of turn from audio, ahead of the transcript (``semantic_vad``)
 - ``MultilingualModel`` — end of turn from text, vLLM-backed (``turn_detector``)
 - ``GTCRN`` — self-hosted noise cancellation (``noise_cancellation``)
+- ``VoiceIsolator`` — keeps the caller, removes other voices and noise; CPU in the
+  agent (``LocalIsolator``) or the GPU release on a server (``RemoteIsolator``)
+  (``voice_isolator``)
 - ``DummySTT`` / ``DummyLLM`` / ``DummyTTS`` — free load testing (``dummy``)
 
 Each name is resolved on first access rather than at import time. Reaching for
@@ -33,12 +36,15 @@ __all__ = [
     "DummyLLM",
     "DummySTT",
     "DummyTTS",
+    "LocalIsolator",
     "MultilingualModel",
     "PulseVAD",
     "PulseVADModel",
+    "RemoteIsolator",
     "ScicomEoT",
     "SemanticVAD",
     "SmartTurnV3",
+    "VoiceIsolator",
     "WhisperSTT",
 ]
 
@@ -54,6 +60,9 @@ _EXPORTS = {
     "MultilingualModel": ("turn_detector", "MultilingualModel"),
     "GTCRN": ("noise_cancellation", "GTCRN"),
     "MODEL_SAMPLE_RATE": ("noise_cancellation", "MODEL_SAMPLE_RATE"),
+    "VoiceIsolator": ("voice_isolator", "VoiceIsolator"),
+    "LocalIsolator": ("voice_isolator", "LocalIsolator"),
+    "RemoteIsolator": ("voice_isolator", "RemoteIsolator"),
     "DummySTT": ("dummy", "STT"),
     "DummyLLM": ("dummy", "LLM"),
     "DummyTTS": ("dummy", "TTS"),
@@ -72,6 +81,7 @@ if TYPE_CHECKING:  # import-free completion for editors and type checkers
     from .pulse_vad import PulseVAD, PulseVADModel
     from .semantic_vad import ScicomEoT, SemanticVAD, SmartTurnV3
     from .turn_detector import MultilingualModel
+    from .voice_isolator import LocalIsolator, RemoteIsolator, VoiceIsolator
     from .whisper_stt import DropBlankSTT, WhisperSTT
 
 
