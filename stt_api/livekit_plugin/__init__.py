@@ -6,13 +6,15 @@ Install just these — no server stack, no torch:
 
 Then one import line, whichever plugins the agent uses:
 
-    from stt_api.livekit_plugin import GTCRN, PulseVAD, SemanticVAD, VoiceIsolator, WhisperSTT
+    from stt_api.livekit_plugin import GTCRN, ClearlineNC, ClearlineVAD, PulseVAD, SemanticVAD, VoiceIsolator, WhisperSTT
 
 - ``WhisperSTT`` / ``DropBlankSTT`` — STT that silence cannot interrupt (``whisper_stt``)
 - ``PulseVAD`` — frame-level voice activity, 2,118 parameters (``pulse_vad``)
 - ``SemanticVAD`` — end of turn from audio, ahead of the transcript (``semantic_vad``)
 - ``MultilingualModel`` — end of turn from text, vLLM-backed (``turn_detector``)
 - ``GTCRN`` — self-hosted noise cancellation (``noise_cancellation``)
+- ``ClearlineVAD`` / ``ClearlineNC`` — a silero drop-in VAD and a GTCRN drop-in noise
+  filter, both trained here for one CPU core (``clearline``)
 - ``VoiceIsolator`` — keeps the caller, removes other voices and noise; CPU in the
   agent (``LocalIsolator``) or the GPU release on a server (``RemoteIsolator``)
   (``voice_isolator``)
@@ -30,6 +32,8 @@ import importlib
 from typing import TYPE_CHECKING
 
 __all__ = [
+    "ClearlineNC",
+    "ClearlineVAD",
     "GTCRN",
     "MODEL_SAMPLE_RATE",
     "DropBlankSTT",
@@ -59,6 +63,8 @@ _EXPORTS = {
     "ScicomEoT": ("semantic_vad", "ScicomEoT"),
     "MultilingualModel": ("turn_detector", "MultilingualModel"),
     "GTCRN": ("noise_cancellation", "GTCRN"),
+    "ClearlineVAD": ("clearline", "ClearlineVAD"),
+    "ClearlineNC": ("clearline", "ClearlineNC"),
     "MODEL_SAMPLE_RATE": ("noise_cancellation", "MODEL_SAMPLE_RATE"),
     "VoiceIsolator": ("voice_isolator", "VoiceIsolator"),
     "LocalIsolator": ("voice_isolator", "LocalIsolator"),
@@ -74,6 +80,7 @@ INSTALL_HINT = (
 )
 
 if TYPE_CHECKING:  # import-free completion for editors and type checkers
+    from .clearline import ClearlineNC, ClearlineVAD
     from .dummy import LLM as DummyLLM
     from .dummy import STT as DummySTT
     from .dummy import TTS as DummyTTS

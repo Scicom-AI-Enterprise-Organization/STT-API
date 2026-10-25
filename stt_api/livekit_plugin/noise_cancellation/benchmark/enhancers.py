@@ -218,6 +218,47 @@ class GTCRNEnhancer(Enhancer):
         return y.astype(np.float32) / 32768.0
 
 
+class ClearlineNCEnhancer(Enhancer):
+    """
+    Clearline-NC (`../../clearline/`), driven exactly like the incumbent: through
+    `rtc.AudioFrame` and the plugin's own `_process`, int16 and resamplers included.
+
+    `clearline` is the plugin's default, its speech-recognition mode (noise kept
+    20 dB down, 10 % of the input mixed back); `clearline_quality` removes all the
+    noise it can. Weights come from the pinned Hugging Face revision (private: an
+    `HF_TOKEN` that can read it).
+    """
+
+    name = "clearline"
+    note = "Clearline-NC, ASR mode (plugin default), 16 kHz native"
+    native_rate = 16000
+    mode = "asr"
+
+    def __init__(self) -> None:
+        from stt_api.livekit_plugin.clearline import ClearlineNC
+
+        self._cls = ClearlineNC
+        self._nc = ClearlineNC(mode=self.mode)
+
+    def reset(self) -> None:
+        self._nc = self._cls(mode=self.mode)
+
+    def process(self, frame: np.ndarray, rate: int) -> np.ndarray:
+        from livekit import rtc
+
+        n = len(frame)
+        pcm = np.clip(np.rint(frame * 32768.0), -32768, 32767).astype(np.int16)
+        out = self._nc._process(rtc.AudioFrame(pcm.tobytes(), rate, 1, n))
+        y = np.frombuffer(out.data, dtype=np.int16, count=out.samples_per_channel)
+        return y.astype(np.float32) / 32768.0
+
+
+class ClearlineNCQualityEnhancer(ClearlineNCEnhancer):
+    name = "clearline_quality"
+    note = "Clearline-NC, quality mode (full removal), 16 kHz native"
+    mode = "quality"
+
+
 class DTLNEnhancer(Enhancer):
     """
     DTLN — two stacked LSTM stages, the closest real competitor on a CPU budget.
@@ -583,6 +624,8 @@ def _read_wav(path: Path) -> tuple[np.ndarray, int]:
 REGISTRY: dict[str, type[Enhancer]] = {
     Passthrough.name: Passthrough,
     GTCRNEnhancer.name: GTCRNEnhancer,
+    ClearlineNCEnhancer.name: ClearlineNCEnhancer,
+    ClearlineNCQualityEnhancer.name: ClearlineNCQualityEnhancer,
     DTLNEnhancer.name: DTLNEnhancer,
     RNNoiseEnhancer.name: RNNoiseEnhancer,
     WienerEnhancer.name: WienerEnhancer,
