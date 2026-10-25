@@ -116,6 +116,14 @@ most of it in the first seconds of a call, before the enrollment exists. These a
 GPU release's numbers; the CPU model's come with its weights. Method and data:
 Voice-Isolator's preprint, section "In a voice agent" (`scripts/vad_eval.py`).
 
+## Streaming benchmark
+
+`benchmark/` measures the filter inside a real LiveKit agent: its own LiveKit server, a
+LiveKit Agents worker with `AgentSession` (Silero VAD, dummy STT/LLM/TTS) and callers
+streaming recordings into rooms in real time, many at once. It reports the filter's time
+per frame, its CPU per call, drift, and the VAD's false starts and turn ends against the
+caller alone. See [benchmark/README.md](benchmark/README.md).
+
 ## Notes
 
 - **Mono only.** Anything else passes through with one warning, rather than being
