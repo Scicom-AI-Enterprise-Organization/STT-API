@@ -80,7 +80,7 @@ class LocalIsolator:
     private: an `HF_TOKEN` that can read it) or a local directory with
     `config.json`, `step.onnx` and `enroll.onnx`; `VOICE_ISOLATOR_MODEL` overrides
     the default. `quantized=True` takes the 8-bit export from the repository's
-    `int8/` folder: about 2.7x cheaper per call, at the price of agreeing with the
+    `int8/` folder: about 1.4x cheaper per call, at the price of agreeing with the
     float model to tens of dB rather than to float rounding.
 
     One instance per process is enough: the sessions are shared and each `open()`

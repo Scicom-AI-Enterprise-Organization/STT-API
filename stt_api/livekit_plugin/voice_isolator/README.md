@@ -16,7 +16,7 @@ Two backends, like `../semantic_vad/`:
 | model | `Scicom-intl/voice-isolator-cpu`, distilled for one CPU thread | `Scicom-intl/voice-isolator-m-wavlm`, the release: M + a causal WavLM-Large, 555M |
 | runs | in the agent process: onnxruntime + numpy, no torch, no GPU | on a GPU server (`Dockerfile`), one WebSocket per call |
 | delay in an agent | 10 ms (the STFT look-ahead) | 100 ms median at 32 calls, 140 ms at 64 (LiveKit's 50 ms frames, the server at 40 ms steps); 50 ms with 20 ms frames and steps |
-| cost | one thread per call, per frame, on the agent's audio loop | the agent only queues the frame (0.4 ms p99); 64 calls on one GPU measured |
+| cost | one thread per call on the agent's audio loop: 17% of a core in 50 ms frames, 33% in 20 ms (8-bit 12% and 22%) | the agent only queues the frame (0.4 ms p99); 64 calls on one GPU measured |
 
 Both enroll the caller from the call itself and both give the same output whatever
 frame size LiveKit hands over (below).
@@ -53,8 +53,9 @@ Models:
 - `LocalIsolator()` reads `Scicom-intl/voice-isolator-cpu` (private: an `HF_TOKEN` that
   can read it), or a local directory: `LocalIsolator("/models/voice-isolator-cpu")` or
   `VOICE_ISOLATOR_MODEL`. `quantized=True` takes the 8-bit export from the repository's
-  `int8/`: about 2.7x cheaper per call, but it agrees with the float model to about
-  40 dB rather than to float rounding, so measure it on your calls before you switch.
+  `int8/`: about 1.4x cheaper per call (1.6x in 10 ms frames), but it agrees with the
+  float model to about 50 dB, and with itself across frame sizes to about 40 dB, rather
+  than to float rounding, so measure it on your calls before you switch.
 - `RemoteIsolator(url)` or `VOICE_ISOLATOR_URL` points at the GPU server. Build and run it
   from this directory's `Dockerfile`; it serves the release with the model repository's
   own server (`python -m vi.server_mp --enroll-loud --chunk-hops 4`: 40 ms steps for

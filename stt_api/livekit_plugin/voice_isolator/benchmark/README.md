@@ -67,11 +67,16 @@ What the filter costs the agent:
 |---|---|---|---|---|
 | none | 0.0 / 0.0 ms | 0 | 0 | |
 | GTCRN | 3.1 / 5.6 ms | 0.066 | | |
+| `LocalIsolator` (CPU, float) | 15.2 / 24.9 ms | 0.323 | 10 / 10 ms | |
+| `LocalIsolator(quantized=True)` (CPU, 8-bit) | 9.5 / 16.7 ms | 0.200 | 10 / 10 ms | |
 | `RemoteIsolator`, LiveKit's 50 ms frames, server at 40 ms | 0.13 / 0.36 ms | 0.003 | 100 / 100 ms | 0.0% |
 | `RemoteIsolator`, 20 ms frames, server at 20 ms | 0.10 / 0.24 ms | 0.005 | 50 / 70 ms | 0.0% |
 | `RemoteIsolator`, 50 ms frames, server at 40 ms, **64 calls** | 0.15 / 0.40 ms | 0.003 | 140 / 150 ms | 0.0% |
 
 With 64 calls on one GPU a step of all of them took 23 ms of the server's 40 ms period.
+The `LocalIsolator` times are wall clock on the agent's audio loop while 32 agents and
+32 callers share the host: alone, one thread, the float model takes 17% of a core per
+call in 50 ms frames (8-bit 12%), so a frame takes about 8 ms.
 
 What the agent's VAD did, against each caller's own channel:
 
@@ -79,6 +84,8 @@ What the agent's VAD did, against each caller's own channel:
 |---|---|---|---|---|---|
 | none | 2.84 | 47.5% | 2.04 s | 23% | 0.3% |
 | GTCRN | 2.88 | 46.8% | 2.03 s | 22% | 0.7% |
+| `LocalIsolator` | 2.12 | 27.7% | 1.03 s | 18% | 3.0% |
+| `LocalIsolator`, 8-bit | 2.25 | 28.2% | 1.04 s | 16% | 2.9% |
 | `RemoteIsolator`, 50 ms frames | 1.78 | 25.6% | 1.15 s | 19% | 7.2% |
 | `RemoteIsolator`, 20 ms frames | 1.72 | 25.7% | 1.16 s | 17% | 6.6% |
 | `RemoteIsolator`, 64 calls | 1.61 | 23.7% | 1.12 s | 24% | 9.7% |
@@ -89,7 +96,13 @@ no processing 47.9%, 3.33, 0.1%). Noise suppression leaves another voice in: GTC
 changes nothing here. The cost is the caller's own speech, mostly the first seconds of a
 call, before the live enrollment exists.
 
-The `LocalIsolator` rows (the CPU model) come with its weights.
+The CPU model (22M parameters, distilled from the release) keeps most of the release's
+effect on the VAD; offline over the recordings it heard 26.2% of the caller's pauses,
+started 2.27 false turns a minute and missed 6.7% of the caller's speech.
+
+`VI_BENCH_RECORD=1` makes the agent also write what LiveKit handed the filter and what
+came out of it, `<room>.in.wav` and `<room>.out.wav`: the before-and-after examples on
+the CPU model's card were recorded this way.
 
 ### What the benchmark found on the way
 

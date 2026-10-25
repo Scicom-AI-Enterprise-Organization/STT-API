@@ -8,6 +8,8 @@ under test on its audio input.
 
 VI_BENCH_FILTER: none | gtcrn | local | local-int8 | remote (VOICE_ISOLATOR_URL).
 VI_BENCH_FRAME_MS: the audio input's frame size (LiveKit's default, 50).
+VI_BENCH_RECORD=1: also write what LiveKit handed the filter and what came out of it,
+the audio the session's VAD and STT hear, as `<room>.in.wav` and `<room>.out.wav`.
 
 Every room gets an `AgentSession` with LiveKit's Silero VAD (its defaults) and the
 dummy STT, LLM and TTS, so a turn runs the whole pipeline without paying for one. The
@@ -25,6 +27,7 @@ import json
 import os
 import resource
 import time
+import wave
 from pathlib import Path
 
 import numpy as np
@@ -45,6 +48,7 @@ from stt_api.livekit_plugin.dummy import LLM, STT, TTS
 FILTER = os.environ.get("VI_BENCH_FILTER", "none")
 FRAME_MS = int(os.environ.get("VI_BENCH_FRAME_MS", "50"))
 OUT = Path(os.environ.get("VI_BENCH_OUT", "/tmp/vi_bench"))
+RECORD = os.environ.get("VI_BENCH_RECORD", "") not in ("", "0")
 
 
 class Timed(rtc.FrameProcessor[rtc.AudioFrame]):
@@ -57,6 +61,9 @@ class Timed(rtc.FrameProcessor[rtc.AudioFrame]):
         self.n = 0
         # (arrival s, samples before it, filter s, input level dBFS, output delay ms)
         self.frames: list[tuple[float, int, float, float, float]] = []
+        # int16 frames in and out, and their rate, with VI_BENCH_RECORD
+        self.audio: tuple[list[bytes], list[bytes]] | None = ([], []) if RECORD else None
+        self.rate = 16000
 
     @property
     def enabled(self) -> bool:
@@ -77,6 +84,10 @@ class Timed(rtc.FrameProcessor[rtc.AudioFrame]):
         delay = float(getattr(self.inner, "delay_ms", 0.0))
         self.frames.append((now - self.t0, self.n, dt, db, delay))
         self.n += frame.samples_per_channel
+        if self.audio is not None:
+            self.audio[0].append(bytes(frame.data))
+            self.audio[1].append(bytes(out.data))
+            self.rate = frame.sample_rate
         return out
 
     def _close(self) -> None:
@@ -154,6 +165,13 @@ async def entrypoint(ctx: JobContext) -> None:
         }
         OUT.mkdir(parents=True, exist_ok=True)
         (OUT / f"{ctx.room.name}.json").write_text(json.dumps(log))
+        if t is not None and t.audio is not None:
+            for side, chunks in zip(("in", "out"), t.audio):
+                with wave.open(str(OUT / f"{ctx.room.name}.{side}.wav"), "wb") as w:
+                    w.setnchannels(1)
+                    w.setsampwidth(2)
+                    w.setframerate(t.rate)
+                    w.writeframes(b"".join(chunks))
 
     ctx.add_shutdown_callback(write_log)
     await session.start(
