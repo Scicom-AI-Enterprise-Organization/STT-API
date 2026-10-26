@@ -12,7 +12,7 @@ Two backends, because the useful deployments are genuinely different:
 * `LocalIsolator`: the CPU model, `Scicom-intl/voice-isolator-cpu`, distilled from
   the GPU release into a transformer that one CPU thread steps live. onnxruntime
   and numpy inside the agent process: no GPU, no torch, nothing to deploy.
-* `RemoteIsolator`: the GPU release, `Scicom-intl/voice-isolator-m-wavlm` (M with a
+* `RemoteIsolator`: the GPU release, `Scicom-intl/voice-isolator` (M with a
   causal WavLM-Large branch, 555M parameters), on a GPU server that steps every
   call it holds in one batched step per 20 ms. One WebSocket per call. The server
   is the model repository's own `vi.server_mp` (see `Dockerfile`).

@@ -1,15 +1,11 @@
 # The GPU backend of the voice isolator plugin (RemoteIsolator): the release,
-# Scicom-intl/voice-isolator-m-wavlm (M + a causal WavLM-Large branch, 555M
+# Scicom-intl/voice-isolator (M + a causal WavLM-Large branch, 555M
 # parameters), served by the model repository's own WebSocket server. Measured
 # through LiveKit agents (benchmark/): one GPU carried 64 live calls in LiveKit's
 # 50 ms frames, the agents hearing them 140 ms late at the median, 150 ms at p99,
 # nothing passed unfiltered, the server busy 27 ms of every 40 ms.
 #
-# The repository is private: build with a token that can read it, as a secret,
-# so it is never written into a layer.
-#
-#   docker build --secret id=hf_token,env=HF_TOKEN -t voice-isolator-gpu \
-#       -f stt_api/livekit_plugin/voice_isolator/Dockerfile .
+#   docker build -t voice-isolator-gpu -f stt_api/livekit_plugin/voice_isolator/Dockerfile .
 #   docker run --gpus all -p 8765:8765 voice-isolator-gpu
 #
 # Agents then use RemoteIsolator("ws://<host>:8765") or VOICE_ISOLATOR_URL.
@@ -17,9 +13,8 @@ FROM pytorch/pytorch:2.8.0-cuda12.8-cudnn9-runtime
 
 RUN pip install --no-cache-dir numpy soundfile safetensors huggingface_hub websockets uvloop
 
-RUN --mount=type=secret,id=hf_token \
-    HF_TOKEN="$(cat /run/secrets/hf_token)" python -c \
-    "from huggingface_hub import snapshot_download; snapshot_download('Scicom-intl/voice-isolator-m-wavlm', local_dir='/model')"
+RUN python -c \
+    "from huggingface_hub import snapshot_download; snapshot_download('Scicom-intl/voice-isolator', local_dir='/model')"
 
 WORKDIR /model
 EXPOSE 8765
