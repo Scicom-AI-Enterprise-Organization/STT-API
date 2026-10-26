@@ -20,6 +20,7 @@ Module-scoped notes live beside their code — see
 | `stt_api/livekit_plugin/whisper_stt/` | Whisper STT client that stops silence interrupting the agent |
 | `stt_api/livekit_plugin/noise_cancellation/` | GTCRN filter + `benchmark/` harness |
 | `stt_api/livekit_plugin/voice_isolator/` | voice isolation filter: `LocalIsolator` (CPU, ONNX) / `RemoteIsolator` (GPU server) |
+| `stt_api/livekit_plugin/clearline/` | `ClearlineVAD` (silero drop-in) and `ClearlineNC` (GTCRN drop-in), weights from a pinned private HF revision |
 | `stt_api/livekit_plugin/dummy/` | no-op STT/LLM/TTS, useful for agent tests |
 
 ## Repo-wide traps
@@ -151,6 +152,32 @@ speaker stops, so no text detector can beat that. That is the reason
   `scripts/tiny_fixture.py`, every file under the 1 MB pre-commit limit). It tests the
   mechanics (frame contract, frame-size invariance, isolation between calls, the
   enrollment switching on at 3.0 s), not quality.
+
+### `clearline/`
+
+- **The weights are not vendored**: 1.4 MB (VAD) and 1.6 MB (NC) are over the 1 MB
+  pre-commit limit, so `hub.py` fetches them from `Scicom-intl/Clearline-VAD` (public)
+  and `Scicom-intl/Clearline-NC` (private: `HF_TOKEN` needed, or
+  `CLEARLINE_NC_ONNX_PATH`) at a **pinned revision**. A missing token raises at
+  construction, never on the first frame.
+- **The VAD's default threshold is 0.80 with the filter at 0.35** for the release at
+  512-sample windows, 0.85 for the other three graphs: the operating points chosen on
+  development data for the pinned weights, one per (variant, window) in
+  `hub.OPERATING_POINT`, not silero's 0.5. Bump `hub.VAD_REVISION` and
+  `hub.OPERATING_POINT` together; the wrong pair fails silently.
+- **`smoothing_alpha` is LiveKit's `ExpFilter` alpha, the weight of the previous
+  value**: 1.0 freezes it and `load()` refuses it, 0 turns it off. This is the
+  opposite of how `pulse_vad/`'s option is documented; never copy a value between them.
+- `vad.py` is `livekit-plugins-silero` 1.8.9's stream with the model swapped
+  (Apache-2.0 header kept); keep it in step with upstream rather than editing the
+  state machine. Inference runs inline: the thread-pool hop costs more than the model.
+- `ClearlineNC` defaults to `mode="asr"` (noise kept 20 dB down, 10% of the input mixed
+  back): it costs Whisper less than GTCRN; `mode="quality"` removes more noise and
+  costs Whisper more through a phone path. Both are registered in the NC benchmark as
+  `clearline` / `clearline_quality`.
+- `tests/test_clearline.py` passes on livekit-agents 1.2.18, 1.3.11 and 1.8.9. Off the
+  extra, 1.2.x/1.3.x import `httpx` without declaring it: a bare
+  `pip install livekit-agents==1.3.11` fails at `from livekit import agents`, not here.
 
 ### `pulse_vad/`
 

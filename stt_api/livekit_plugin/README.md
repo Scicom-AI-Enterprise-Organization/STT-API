@@ -11,6 +11,7 @@ stack. No torch, no fastapi, no server-side diarization models.
 | `SemanticVAD` | End of turn from audio, without waiting for the transcript | [semantic_vad](semantic_vad/README.md) |
 | `MultilingualModel` | End of turn from text, against a vLLM endpoint or locally | [turn_detector](turn_detector/README.md) |
 | `GTCRN` | Self-hosted noise cancellation, in-process, no licence key | [noise_cancellation](noise_cancellation/README.md) |
+| `ClearlineVAD` `ClearlineNC` | A silero drop-in VAD (1.7x less CPU per call) and a GTCRN drop-in noise filter (3.6x less CPU), for wideband and telephone audio, weights from a pinned Hugging Face revision | [clearline](clearline/README.md) |
 | `VoiceIsolator` | Keeps the caller, removes other voices and noise: CPU in-process or the GPU release on a server | [voice_isolator](voice_isolator/README.md) |
 | `DummySTT` `DummyLLM` `DummyTTS` | Canned responses for load tests, zero API cost | [dummy](dummy/README.md) |
 
@@ -47,7 +48,7 @@ of the image — pass it as a build secret.
 ## Use
 
 ```python
-from stt_api.livekit_plugin import GTCRN, PulseVAD, SemanticVAD, VoiceIsolator, WhisperSTT
+from stt_api.livekit_plugin import GTCRN, ClearlineNC, ClearlineVAD, PulseVAD, SemanticVAD, VoiceIsolator, WhisperSTT
 ```
 
 Names resolve on first use, so importing one plugin does not load the others'

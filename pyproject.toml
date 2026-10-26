@@ -15,7 +15,7 @@ dependencies = []
 
 [project.optional-dependencies]
 # Every LiveKit Agents plugin in stt_api/livekit_plugin — whisper_stt, pulse_vad,
-# semantic_vad, turn_detector, noise_cancellation, voice_isolator, dummy — in one extra:
+# semantic_vad, turn_detector, noise_cancellation, voice_isolator, clearline, dummy — in one extra:
 #     uv pip install "stt-api[scicom-livekit-plugin] @ git+https://github.com/Scicom-AI-Enterprise-Organization/STT-API.git"
 # Listed by what the plugin modules actually import. livekit-agents[turn-detector]
 # happens to bring aiohttp, numpy, onnxruntime and transformers along today, but a
@@ -24,11 +24,11 @@ dependencies = []
 # [benchmark], so it never lands in an agent image.
 scicom-livekit-plugin = [
     "livekit-agents[turn-detector]~=1.2",
-    "numpy",                  # pulse_vad, semantic_vad, whisper_stt, noise_cancellation, voice_isolator
-    "onnxruntime",            # pulse_vad, semantic_vad, noise_cancellation, voice_isolator
+    "numpy",                  # pulse_vad, semantic_vad, whisper_stt, noise_cancellation, voice_isolator, clearline
+    "onnxruntime",            # pulse_vad, semantic_vad, noise_cancellation, voice_isolator, clearline
     "aiohttp",                # turn_detector, whisper_stt; voice_isolator's WebSocket to the GPU server
     "transformers>=4.57.6",   # turn_detector tokenizer, semantic_vad feature extractor
-    "huggingface_hub",        # semantic_vad, voice_isolator: pull the weights
+    "huggingface_hub",        # semantic_vad, voice_isolator, clearline: pull the weights
     "soundfile",              # dummy: TTS playback file
 ]
 # Pre-rename alias, same contents. Keep both working.
