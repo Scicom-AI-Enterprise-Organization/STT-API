@@ -69,11 +69,12 @@ What the filter costs the agent:
 | GTCRN | 3.1 / 5.6 ms | 0.066 | | |
 | `LocalIsolator` (CPU, float) | 15.2 / 24.9 ms | 0.323 | 10 / 10 ms | |
 | `LocalIsolator(quantized=True)` (CPU, 8-bit) | 9.5 / 16.7 ms | 0.200 | 10 / 10 ms | |
-| `RemoteIsolator`, LiveKit's 50 ms frames, server at 40 ms | 0.13 / 0.36 ms | 0.003 | 100 / 100 ms | 0.0% |
-| `RemoteIsolator`, 20 ms frames, server at 20 ms | 0.10 / 0.24 ms | 0.005 | 50 / 70 ms | 0.0% |
-| `RemoteIsolator`, 50 ms frames, server at 40 ms, **64 calls** | 0.15 / 0.40 ms | 0.003 | 140 / 150 ms | 0.0% |
+| `RemoteIsolator`, LiveKit's 50 ms frames, server at 40 ms | 0.11 / 0.31 ms | 0.003 | 90 / 90 ms | 0.0% |
+| `RemoteIsolator`, 20 ms frames, server at 20 ms | 0.09 / 0.20 ms | 0.005 | 50 / 70 ms | 0.0% |
+| `RemoteIsolator`, 50 ms frames, server at 40 ms, **64 calls** | 0.13 / 0.40 ms | 0.003 | 100 / 110 ms | 0.0% |
 
-With 64 calls on one GPU a step of all of them took 23 ms of the server's 40 ms period.
+With 64 calls on one GPU a step of all of them took 10 ms of the server's 40 ms period (medians; the server is busy
+33 ms of it, stepping again for calls whose next chunk has already arrived).
 The `LocalIsolator` times are wall clock on the agent's audio loop while 32 agents and
 32 callers share the host: alone, one thread, the float model takes 17% of a core per
 call in 50 ms frames (8-bit 12%), so a frame takes about 8 ms.
@@ -86,9 +87,9 @@ What the agent's VAD did, against each caller's own channel:
 | GTCRN | 2.88 | 46.8% | 2.03 s | 22% | 0.7% |
 | `LocalIsolator` | 2.12 | 27.7% | 1.03 s | 18% | 3.0% |
 | `LocalIsolator`, 8-bit | 2.25 | 28.2% | 1.04 s | 16% | 2.9% |
-| `RemoteIsolator`, 50 ms frames | 1.78 | 25.6% | 1.15 s | 19% | 7.2% |
-| `RemoteIsolator`, 20 ms frames | 1.72 | 25.7% | 1.16 s | 17% | 6.6% |
-| `RemoteIsolator`, 64 calls | 1.61 | 23.7% | 1.12 s | 24% | 9.7% |
+| `RemoteIsolator`, 50 ms frames | 1.59 | 25.4% | 1.15 s | 19% | 7.0% |
+| `RemoteIsolator`, 20 ms frames | 1.88 | 25.8% | 1.08 s | 16% | 6.5% |
+| `RemoteIsolator`, 64 calls | 1.59 | 22.8% | 1.03 s | 21% | 8.6% |
 
 These agree with the same VAD run offline over the recordings (Voice-Isolator's
 `scripts/vad_eval.py`: release 22.8% of pauses, 1.94 false starts a minute, 8.4% missed;
