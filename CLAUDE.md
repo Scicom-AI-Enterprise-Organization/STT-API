@@ -19,6 +19,7 @@ Module-scoped notes live beside their code — see
 | `stt_api/livekit_plugin/pulse_vad/` | **frame** VAD (is anyone speaking) — silero drop-in + `benchmark/` |
 | `stt_api/livekit_plugin/whisper_stt/` | Whisper STT client that stops silence interrupting the agent |
 | `stt_api/livekit_plugin/noise_cancellation/` | GTCRN filter + `benchmark/` harness |
+| `stt_api/livekit_plugin/voice_isolator/` | voice isolation filter: `LocalIsolator` (CPU, ONNX) / `RemoteIsolator` (GPU server) |
 | `stt_api/livekit_plugin/dummy/` | no-op STT/LLM/TTS, useful for agent tests |
 
 ## Repo-wide traps
@@ -129,6 +130,27 @@ speaker stops, so no text detector can beat that. That is the reason
   `turn_detector/`. Failing toward silence is safer for a voice agent.
 - Self-hosting needs **no protobuf websocket server**: the transport is a
   seven-method Protocol implemented in-process.
+
+### `voice_isolator/`
+
+- **The CPU runtime is half of the model.** `onnx_stream.py` is the export's other
+  half (Voice-Isolator's `scripts/export_onnx.py`): the STFT, the attention rings, the
+  rotary angles and the live enrollment rule live in numpy, and the export is checked
+  against PyTorch *through this code*. Change it only with the export, and keep the
+  live rule's float32 energies and `np.convolve(...).argmax()`: a cumulative-sum
+  version picks a different window on ties and the enrollment silently differs.
+- **`_process` is synchronous, on the audio read loop.** `RemoteIsolator` therefore
+  keeps every call's WebSocket on one background event loop per process and only
+  queues frames from `_process`; a blocking client there would stall the agent.
+- **It fails open mid-call, closed at start.** An unreachable server or a missing model
+  raises when the filter is built; a server lost mid-call passes the caller through
+  unfiltered, without reconnecting (the server's state for the call is gone with the
+  connection).
+- **The test model is random.** `tests/fixtures/voice_isolator_tiny` is the released
+  architecture at 125K parameters with random weights (Voice-Isolator's
+  `scripts/tiny_fixture.py`, every file under the 1 MB pre-commit limit). It tests the
+  mechanics (frame contract, frame-size invariance, isolation between calls, the
+  enrollment switching on at 3.0 s), not quality.
 
 ### `pulse_vad/`
 
