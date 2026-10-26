@@ -4,8 +4,9 @@ Tests for the Clearline plugins (`stt_api/livekit_plugin/clearline/`).
 Each of these fails *silently* in production rather than raising, which is why
 it is guarded here:
 
-* **The operating point.** The default threshold (0.80 for the release at
-  512-sample windows, 0.85 otherwise) and filter (0.35) belong to the pinned weights. Silero's 0.5 carried across would fire more and earlier,
+* **The operating point.** The default threshold (0.825 for the release at
+  512-sample windows, 0.85 at 256, 0.75 for the distilled variant) and filter (0.35,
+  0.5 for the distilled variant) belong to the pinned weights. Silero's 0.5 carried across would fire more and earlier,
   with nothing in the logs.
 * **The filter's direction.** `smoothing_alpha` is LiveKit's ExpFilter alpha, the
   weight of the *previous* value: 1.0 freezes the filter (a VAD stuck on its first
@@ -141,17 +142,18 @@ def test_missing_local_model_raises_instead_of_falling_back():
 def test_defaults_are_the_pinned_operating_point(vad_weights):
     vad = _vad()
     point = hub.OPERATING_POINT[("release", 512)]
-    assert vad._opts.activation_threshold == point["activation_threshold"] == 0.80
+    assert vad._opts.activation_threshold == point["activation_threshold"] == 0.825
     assert vad._opts.smoothing_alpha == point["smoothing_alpha"] == 0.35
-    assert vad._opts.deactivation_threshold == pytest.approx(0.65)
+    assert vad._opts.deactivation_threshold == pytest.approx(0.675)
     assert vad.model == "clearline-vad-release"
 
 
 @pytest.mark.parametrize("variant", ["release", "distilled"])
 @pytest.mark.parametrize("window", [512, 256])
 def test_each_graph_gets_its_own_operating_point(vad_weights, variant, window):
-    # The points differ by graph (0.80 for the release at 512 samples, 0.85 for
-    # the others): a single default would silently mis-set three of the four.
+    # The points differ by graph (0.825 for the release at 512 samples, 0.85 at
+    # 256, 0.75 for the distilled variant): a single default would silently mis-set
+    # three of the four.
     vad = _vad(variant=variant, window=window)
     point = hub.OPERATING_POINT[(variant, window)]
     assert vad._opts.activation_threshold == point["activation_threshold"]
@@ -291,23 +293,38 @@ def test_delay_is_bounded_and_frame_size_independent(nc_weights):
     assert delays.pop() <= 2 * 256  # 32 ms: one hop of priming plus one of STFT fill
 
 
-@pytest.mark.parametrize("mode", ["asr", "quality"])
-@pytest.mark.parametrize("in_snr", [0, 5, 10])
-def test_improves_snr_on_noisy_speech(nc_weights, mode, in_snr):
+def _noisy(in_snr: float):
     clean = load_speech(RATE)
     rng = np.random.default_rng(7)
     noise = rng.standard_normal(len(clean)).astype(np.float32)
     noise *= np.sqrt(
         float(np.mean(clean**2)) / (10 ** (in_snr / 10)) / float(np.mean(noise**2))
     )
-    noisy = clean + noise
-    y = run(_nc(mode=mode), noisy, RATE)
+    return clean, clean + noise
+
+
+@pytest.mark.parametrize("mode", ["asr", "quality"])
+@pytest.mark.parametrize("in_snr", [0, 5, 10])
+def test_models_improve_snr_on_noisy_speech(nc_weights, mode, in_snr):
+    # each mode's model itself, nothing mixed back
+    clean, noisy = _noisy(in_snr)
+    y = run(_nc(mode=mode, mix_back=0.0), noisy, RATE)
     before, after = snr_db(clean, noisy), snr_db(clean, y, best_lag(clean, y, 1200))
     assert after > before + 4.0, f"{mode}: {before:.1f} dB -> {after:.1f} dB"
 
 
+@pytest.mark.parametrize("in_snr", [0, 5])
+def test_asr_mode_cleans_up(nc_weights, in_snr):
+    # 70 % of the input mixed back: a gentle clean-up (+1.3 dB at 0 dB in on this
+    # speech and white noise), never a removal
+    clean, noisy = _noisy(in_snr)
+    y = run(_nc(mode="asr"), noisy, RATE)
+    before, after = snr_db(clean, noisy), snr_db(clean, y, best_lag(clean, y, 1200))
+    assert before + 1.0 < after < before + 6.0, f"asr: {before:.1f} dB -> {after:.1f} dB"
+
+
 def test_asr_mode_keeps_some_of_the_input(nc_weights):
-    # mix_back: the ASR mode leaves 10 % of the input under the output, so a pure
+    # mix_back: the ASR mode leaves 70 % of the input under the output, so a pure
     # noise input is attenuated, not erased; the quality mode removes more of it.
     rng = np.random.default_rng(1)
     x = (rng.standard_normal(2 * RATE) * 0.05).astype(np.float32)

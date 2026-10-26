@@ -19,9 +19,9 @@ one CPU core.
 
 Two things that fail silently when wrong, both in README.md:
 
-* The default threshold is **0.80, not silero's 0.5** (0.85 with 256-sample windows
-  or the distilled variant): the operating points chosen on development data for
-  the pinned weights (`hub.OPERATING_POINT`).
+* The default threshold is **0.825, not silero's 0.5** (0.85 with 256-sample windows,
+  0.75 with the filter at 0.5 for the distilled variant): the operating points chosen
+  on development data for the pinned weights (`hub.OPERATING_POINT`).
 * `smoothing_alpha` is LiveKit's ExpFilter alpha, the weight of the **previous**
   value (1.0 freezes the filter, so it is refused) — the opposite reading of
   `PulseVAD`'s option of the same name.

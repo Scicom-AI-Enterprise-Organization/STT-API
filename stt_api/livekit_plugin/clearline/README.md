@@ -39,7 +39,7 @@ await session.start(
 )
 ```
 
-Tested (`tests/test_clearline.py`, 47 tests) on `livekit-agents` 1.2.18, 1.3.11 and
+Tested (`tests/test_clearline.py`, 49 tests) on `livekit-agents` 1.2.18, 1.3.11 and
 1.8.9, the range the `scicom-livekit-plugin` extra allows.
 
 The weights live in Hugging Face repositories, `Scicom-intl/Clearline-VAD` (public)
@@ -60,34 +60,36 @@ Xeon server through ONNX Runtime with one thread. `load()` takes silero's option
 | option | default | what |
 |---|---|---|
 | `window` | 512 | samples per call at 16 kHz: 512 (32 ms, silero's cadence) or 256 (16 ms updates, same weights) |
-| `activation_threshold` | 0.80 | **not silero's 0.5**; 0.85 with `window=256` or the distilled variant (see below) |
-| `smoothing_alpha` | 0.35 | LiveKit's ExpFilter alpha; **0 turns it off, 1 is refused** (see below) |
+| `activation_threshold` | 0.825 | **not silero's 0.5**; 0.85 with `window=256`, 0.75 for the distilled variant (see below) |
+| `smoothing_alpha` | 0.35 | LiveKit's ExpFilter alpha (0.5 for the distilled variant); **0 turns it off, 1 is refused** (see below) |
 | `variant` | `"release"` | `"distilled"`: the better frame classifier, ends turns a little later |
 | `inline` | True | run the model on the event loop: the call costs less than the thread-pool hop |
 | `onnx_file_path`, `revision` | | a local graph, or another Hugging Face revision |
 
 Against silero v6 on thirteen test sets (meetings, broadcast, films, earnings calls,
 private telephone calls, noisy read speech in 40 languages), each model at the
-operating point chosen for it on development data and replayed through LiveKit's
-own state machine:
+point it ships with, chosen on the development sets (AMI dev and VoxConverse dev,
+wideband and through a phone codec), and silero v6 at its own best point on the same
+four (threshold 0.70), replayed through LiveKit's own state machine:
 
 | | silero v6 | Clearline-VAD | Clearline-VAD, distilled |
 |---|---|---|---|
-| CPU per 32 ms (median) | 101 us | **61 us** | 62 us |
-| mean frame ROC-AUC, 13 sets | 0.912 | 0.921 (higher on 8) | **0.925** (higher on 9) |
-| fresh turns detected | 0.782 | **0.855** | 0.835 |
-| median onset delay | 326 ms | **233 ms** | 293 ms |
-| turn ends on time | 0.686 | **0.776** | 0.721 |
-| false triggers per hour of non-speech | **15.7** | 42.6 | 29.1 |
-| on the telephone (AMI dev through codecs): turns / ends / false per hour | 0.800 / 0.639 / **7.7** | **0.947 / 0.864** / 37.2 | 0.852 / 0.758 / 67.7 |
+| CPU per 32 ms (median) | 101 us | **61 us** | same graph |
+| mean frame ROC-AUC, 13 sets | 0.912 | 0.921 (higher on 8) | **0.923** (higher on 9) |
+| fresh turns detected | 0.801 | **0.857** | 0.841 |
+| median onset delay | 247 ms | **239 ms** | 296 ms |
+| turn ends on time | 0.718 | **0.775** | 0.733 |
+| false triggers per hour of non-speech, 10 sets | 29.6 | 38.0 | **29.2** |
+| the same without the two private telephone sets | 28.1 | 27.5 | **18.9** |
+| on the telephone (AMI dev through codecs): turns / ends / false per hour | 0.877 / 0.750 / **17.4** | **0.947 / 0.857** / 32.4 | 0.914 / 0.772 / 28.1 |
 
-Most of the extra false triggers are on telephone legs, in the line's silences:
-background sounds about 25 dB under the caller's own speech (113 and 71 per hour
-on the two private telephone sets against silero's 23 and 13; 30 per hour on the
-other eight sets against silero's 15). On such lines raise `activation_threshold`
-to 0.9-0.95. On telephone audio silero still ranks frames slightly better (frame
-ROC-AUC 0.936 against 0.923 on FLEURS through five codecs); the distilled variant
-is the wideband frame classifier.
+The extra false triggers are on telephone legs, in the line's silences: background
+sounds about 25 dB under the caller's own speech (95 and 65 per hour on the two
+private telephone sets against silero's 45 and 26; on the other eight sets 27.5 per
+hour against silero's 28.1). On such lines raise `activation_threshold` to
+0.9-0.95. On telephone audio silero still ranks frames slightly better (frame
+ROC-AUC 0.936 against 0.923 for the release and 0.933 for the distilled variant on
+FLEURS through five codecs).
 
 ## `ClearlineNC`
 
@@ -99,27 +101,39 @@ A band-gain and deep-filter enhancer on GTCRN's STFT (512-point sqrt-Hann, 256 h
 
 | | GTCRN | `mode="quality"` | `mode="asr"` (default) |
 |---|---|---|---|
-| VoiceBank+DEMAND PESQ / SI-SDR | 2.535 / 14.6 dB | 2.610 / **17.7 dB** | **2.612** / 16.3 dB |
-| DNS 2020 synthetic PESQ / ESTOI | **2.293 / 0.872** | 2.239 / 0.871 | 2.190 / 0.864 |
-| real-time factor; p99 per 20 ms frame | 0.064; 3.24 ms | 0.018; 0.69 ms | **0.018; 0.68 ms** |
-| Whisper large-v3 WER, all 824 VoiceBank utterances, wideband / phone path | 2.55% / 4.28% | 2.48% / 6.00% | **2.02% / 4.07%** |
+| VoiceBank+DEMAND PESQ / SI-SDR | 2.535 / 14.6 dB | **2.610 / 17.7 dB** | 2.135 / 10.5 dB |
+| DNS 2020 synthetic PESQ / ESTOI | **2.293 / 0.872** | 2.239 / 0.871 | 1.697 / 0.827 |
+| real-time factor; p99 per 20 ms frame | 0.064; 3.24 ms | **0.018; 0.69 ms** | **0.016; 0.46 ms** |
+| Whisper large-v3 WER, all 824 VoiceBank utterances, wideband / phone path | 2.65% / 4.26% | 2.48% / 6.27% | **1.55% / 2.90%** |
+| Whisper large-v3 WER, DNS 2020 synthetic (150 clips) | 5.30% | 6.46% | **5.02%** |
 
-(Unprocessed: 1.45% / 2.95%. Neither mode is trained on VoiceBank, VCTK or DEMAND.)
+(Unprocessed: 1.45% / 2.95% on VoiceBank, 5.38% on DNS. Neither mode is trained on
+VoiceBank, VCTK or DEMAND. The two modes are one graph with different weights: their
+cost differs only by the run it was measured in.) Every WER here is on the
+benchmark's harness as fixed: a streaming filter's output is flushed and aligned
+before Whisper hears it (`../noise_cancellation/benchmark/README.md`); before
+2026-10-27 the harness cut each utterance's last 32 ms for every streaming filter.
+On the harness's own 100-item protocol the ASR mode gives 1.65% wideband and 3.18%
+through G.711, against 1.53% and 3.82% unprocessed and GTCRN's 2.42% and 4.07%.
 The same 824 utterances through five telephone codecs at 8 kHz (* never in training),
 Whisper's WER after each filter:
 
 | | unprocessed | GTCRN | `mode="quality"` | `mode="asr"` |
 |---|---|---|---|---|
-| G.711 | 3.25% | 10.82% | 4.95% | **3.90%** |
-| GSM | 6.80% | 17.79% | **10.97%** | 12.27% |
-| Opus | 4.94% | 13.90% | 7.54% | **6.08%** |
-| AMR-NB* | 4.96% | 13.12% | 7.77% | **6.10%** |
-| G.723.1* | 7.72% | 19.53% | **12.08%** | 13.53% |
+| G.711 | 3.25% | 10.72% | 5.20% | **3.20%** |
+| GSM | 7.41% | 15.60% | 11.07% | **6.96%** |
+| Opus | 4.94% | 13.46% | 7.57% | **4.81%** |
+| AMR-NB* | 4.83% | 13.66% | 7.63% | **5.24%** |
+| G.723.1* | 7.72% | 16.62% | 11.96% | **7.78%** |
 
 `mode="asr"` is the model trained to keep noise 20 dB down rather than remove it,
-with 10% of the input mixed back (`mix_back`): what a recogniser downstream wants,
-and the reason it is the default. `mode="quality"` removes all the noise it can, for
-a human listener, and costs Whisper more on most lines.
+with 70% of the input mixed back (`mix_back`), chosen on development data: a robust
+recogniser is hurt by a filter's artifacts more than by the noise it leaves, and at
+that share Whisper's word error rate stays where the unprocessed input has it (over
+eight test conditions, 1.00 times the unprocessed input's on average; GTCRN 2.17).
+It is the default for agents. The price is quality: it leaves most of the noise in.
+`mode="quality"` removes all the noise it can, for a human listener, and costs
+Whisper more on most lines.
 
 ```bash
 python -m stt_api.livekit_plugin.noise_cancellation.benchmark --corpus voicebank \
@@ -128,11 +142,11 @@ python -m stt_api.livekit_plugin.noise_cancellation.benchmark --corpus voicebank
 
 ## Traps
 
-- **The default threshold is 0.80, not silero's 0.5.** The models are calibrated
-  differently; 0.80 (with the filter at 0.35) is the point chosen on the
-  development sets for the pinned release at 512-sample windows, and 0.85 for the
-  256-sample window and the distilled variant (`hub.OPERATING_POINT`, one entry per
-  graph). It moves with the weights: `hub.VAD_REVISION` and `hub.OPERATING_POINT`
+- **The default threshold is 0.825, not silero's 0.5.** The models are calibrated
+  differently; 0.825 (with the filter at 0.35) is the point chosen on the
+  development sets for the pinned release at 512-sample windows, 0.85 for the
+  256-sample window, and 0.75 with the filter at 0.5 for the distilled variant
+  (`hub.OPERATING_POINT`, one entry per graph). It moves with the weights: `hub.VAD_REVISION` and `hub.OPERATING_POINT`
   change together.
 - **`smoothing_alpha` reads LiveKit's way**: `ExpFilter` keeps `alpha` of the
   previous value, so silero's 0.35 keeps 65% of each new probability and 1.0 would
