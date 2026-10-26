@@ -156,13 +156,15 @@ speaker stops, so no text detector can beat that. That is the reason
 ### `clearline/`
 
 - **The weights are not vendored**: 1.4 MB (VAD) and 1.6 MB (NC) are over the 1 MB
-  pre-commit limit, so `hub.py` fetches them from the private repos
-  `Scicom-intl/Clearline-VAD` / `-NC` at a **pinned revision** (`HF_TOKEN` needed, or
-  `CLEARLINE_VAD_ONNX_PATH` / `CLEARLINE_NC_ONNX_PATH`). A missing token raises at
-  `load()` / construction, never on the first frame.
-- **The VAD's default threshold is 0.85 with the filter at 0.35**, the operating point
-  chosen on development data for the pinned weights, not silero's 0.5. Bump
-  `hub.VAD_REVISION` and `hub.OPERATING_POINT` together; the wrong pair fails silently.
+  pre-commit limit, so `hub.py` fetches them from `Scicom-intl/Clearline-VAD` (public)
+  and `Scicom-intl/Clearline-NC` (private: `HF_TOKEN` needed, or
+  `CLEARLINE_NC_ONNX_PATH`) at a **pinned revision**. A missing token raises at
+  construction, never on the first frame.
+- **The VAD's default threshold is 0.80 with the filter at 0.35** for the release at
+  512-sample windows, 0.85 for the other three graphs: the operating points chosen on
+  development data for the pinned weights, one per (variant, window) in
+  `hub.OPERATING_POINT`, not silero's 0.5. Bump `hub.VAD_REVISION` and
+  `hub.OPERATING_POINT` together; the wrong pair fails silently.
 - **`smoothing_alpha` is LiveKit's `ExpFilter` alpha, the weight of the previous
   value**: 1.0 freezes it and `load()` refuses it, 0 turns it off. This is the
   opposite of how `pulse_vad/`'s option is documented; never copy a value between them.

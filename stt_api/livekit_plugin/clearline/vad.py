@@ -85,9 +85,9 @@ class ClearlineVAD(agents.vad.VAD):
         min_silence_duration: float = 0.55,
         prefix_padding_duration: float = 0.5,
         max_buffered_speech: float = 60.0,
-        activation_threshold: float = hub.OPERATING_POINT["activation_threshold"],
+        activation_threshold: NotGivenOr[float] = NOT_GIVEN,
         window: int = 512,
-        smoothing_alpha: float = hub.OPERATING_POINT["smoothing_alpha"],
+        smoothing_alpha: NotGivenOr[float] = NOT_GIVEN,
         variant: str = "release",
         inline: bool = True,
         num_threads: int = 1,
@@ -106,10 +106,11 @@ class ClearlineVAD(agents.vad.VAD):
             prefix_padding_duration: audio kept before the detected onset.
             max_buffered_speech: cap on buffered speech, in seconds.
             activation_threshold: p(speech) to count a window as speech. **Not
-                silero's 0.5**: 0.85 is the operating point chosen on development
-                data for these weights (see `hub.OPERATING_POINT`); the two models'
-                probabilities are calibrated differently. On telephone legs with a
-                busy room behind the caller, raise it (0.9-0.95).
+                silero's 0.5**: the default is the operating point chosen on
+                development data for the pinned graph (`hub.OPERATING_POINT`: 0.80
+                for the release at 512-sample windows, 0.85 otherwise); the two
+                models' probabilities are calibrated differently. On telephone legs
+                with a busy room behind the caller, raise it (0.9-0.95).
             window: samples per inference at 16 kHz: 512 (32 ms, silero's cadence)
                 or 256 (16 ms updates, the same weights).
             smoothing_alpha: LiveKit's ExpFilter alpha on p, **LiveKit's
@@ -135,6 +136,11 @@ class ClearlineVAD(agents.vad.VAD):
                 f"no Clearline-VAD graph for variant={variant!r}, window={window}; "
                 f"have {sorted(hub.VAD_FILES)}"
             )
+        point = hub.OPERATING_POINT[(variant, window)]
+        if not is_given(activation_threshold):
+            activation_threshold = point["activation_threshold"]
+        if not is_given(smoothing_alpha):
+            smoothing_alpha = point["smoothing_alpha"]
         if not 0.0 <= smoothing_alpha < 1.0:
             raise ValueError(
                 "smoothing_alpha must be in [0, 1): 1.0 would freeze LiveKit's ExpFilter"
