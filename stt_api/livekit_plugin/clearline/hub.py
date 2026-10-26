@@ -9,8 +9,9 @@ Clearline-VAD is public; Clearline-NC is private, so the noise filter needs an
 `HF_TOKEN` that can read it.
 
 The pin is not decoration. The VAD's default operating points (`OPERATING_POINT`:
-threshold 0.80 for the release at 512-sample windows, 0.85 otherwise, filter 0.35)
-were chosen on development data *for these weights*; a newer upload can be
+for the release 0.825 at 512-sample windows and 0.85 at 256 with the filter at 0.35,
+for the distilled variant 0.75 with the filter at 0.5) were chosen on development
+data *for these weights*; a newer upload can be
 calibrated differently, and the wrong threshold fails silently (a VAD that fires
 too often, or late). Bump `VAD_REVISION` and `OPERATING_POINT` together, never
 one without the other.
@@ -25,8 +26,8 @@ import os
 
 VAD_REPO = "Scicom-intl/Clearline-VAD"
 NC_REPO = "Scicom-intl/Clearline-NC"
-VAD_REVISION = "85c0d48adb346b7f1b9996e53751de7c77f8cf4c"
-NC_REVISION = "48198e19a7a60a8bb20e649bd0fcb8c9bb0158ba"
+VAD_REVISION = "7c2b4bc6ef659fd2b5c6918bc0de301c316d03f2"
+NC_REVISION = "f0d0e14826ef5b608fc806a82e6e50a1d3bca6d5"
 
 VAD_FILES = {
     ("release", 512): "clearline_vad.onnx",
@@ -38,15 +39,18 @@ VAD_FILES = {
 many samples one call takes (512 = 32 ms, silero's cadence; 256 = 16 ms)."""
 
 OPERATING_POINT = {
-    ("release", 512): {"activation_threshold": 0.80, "smoothing_alpha": 0.35},
+    ("release", 512): {"activation_threshold": 0.825, "smoothing_alpha": 0.35},
     ("release", 256): {"activation_threshold": 0.85, "smoothing_alpha": 0.35},
-    ("distilled", 512): {"activation_threshold": 0.85, "smoothing_alpha": 0.35},
-    ("distilled", 256): {"activation_threshold": 0.85, "smoothing_alpha": 0.35},
+    ("distilled", 512): {"activation_threshold": 0.75, "smoothing_alpha": 0.5},
+    ("distilled", 256): {"activation_threshold": 0.75, "smoothing_alpha": 0.5},
 }
 """(variant, window) -> the default options, chosen on the development sets (AMI
-dev, VoxConverse dev) for each graph at `VAD_REVISION`: the highest mean of LiveKit
-onset and end-of-turn recall at no more false triggers per hour than silero v6 at
-its own defaults."""
+dev and VoxConverse dev, wideband and through a phone codec) for each graph at
+`VAD_REVISION`. The release: the highest mean of LiveKit onset and end-of-turn
+recall among points at least as good as silero v6's own tuned point on onset
+recall, end recall, false triggers per hour and onset delay. The distilled variant
+reaches no such point, so it takes the highest mean recall at no more false
+triggers per hour than silero v6 at its own defaults."""
 
 NC_FILES = {"asr": "clearline_nc_asr.onnx", "quality": "clearline_nc.onnx"}
 

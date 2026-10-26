@@ -15,12 +15,13 @@ overlap-add of those hops are vectorised, so a frame costs one session call, not
 per hop. That, not arithmetic, is most of the 3.8x.
 
 Two modes. "asr" (the default, for an agent whose listener is a speech recogniser):
-the model trained to keep noise 20 dB down rather than remove it, with 10% of the
-input mixed back; over all 824 VoiceBank test utterances it costs Whisper large-v3
-1.90% WER against GTCRN's 2.55% (wideband) and 4.18% against 4.28% through a G.711
-phone path. "quality": the model trained to remove all the noise it can, for a human
-listener (VoiceBank+DEMAND PESQ 2.633 against GTCRN's 2.535). Neither mode is
-trained on VoiceBank, VCTK or DEMAND.
+the model trained to keep noise 20 dB down rather than remove it, with 70% of the
+input mixed back, chosen on development data. On the benchmark's harness (streaming
+output flushed and aligned) over all 824 VoiceBank test utterances, Whisper large-v3
+scores 1.55% WER after it against 1.45% unprocessed and GTCRN's 2.65% (wideband), and
+2.90% against 2.95% and 4.26% through a G.711 phone path. "quality": the model
+trained to remove all the noise it can, for a human listener (VoiceBank+DEMAND PESQ
+2.610 against GTCRN's 2.535). Neither mode is trained on VoiceBank, VCTK or DEMAND.
 """
 
 from __future__ import annotations
@@ -40,7 +41,7 @@ __all__ = ["MODEL_SAMPLE_RATE", "ClearlineNC"]
 
 MODEL_SAMPLE_RATE = 16000
 _N_FFT, _HOP = 512, 256
-_MIX_BACK = {"asr": 0.1, "quality": 0.0}
+_MIX_BACK = {"asr": 0.7, "quality": 0.0}
 _PRIME_16K = _HOP
 _NATIVE_SLACK_MS = 5
 _MAX_PRIME_ROUNDS = 40
@@ -81,8 +82,9 @@ class ClearlineNC(rtc.FrameProcessor[rtc.AudioFrame]):
                 `CLEARLINE_NC_ONNX_PATH`).
             num_threads: ONNX Runtime threads; 1 is right for this size.
             mix_back: share of the unprocessed input added back (0 = none; default
-                0.1 in "asr" mode, 0 in "quality"). A little of the noisy input under
-                the enhanced signal is what keeps an enhancer from costing ASR accuracy.
+                0.7 in "asr" mode, 0 in "quality"). The noisy input under the enhanced
+                signal is what keeps an enhancer from costing a recogniser words: its
+                artifacts, not the noise left in, are what cost them.
             revision: a Hugging Face revision instead of the pinned one.
 
         Raises at construction, not on the first frame, if the model cannot be

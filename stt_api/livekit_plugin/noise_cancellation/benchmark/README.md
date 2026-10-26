@@ -34,6 +34,15 @@ resamplers included. Three consequences worth knowing:
   recovered by cross-correlating its output against the clean reference. GTCRN
   measures 32.0 ms, exactly the two hops its own documentation claims — which is
   the cheapest available check that the harness is not lying.
+- **A streaming filter is flushed, then aligned, before anything is scored.** Its
+  output lags its input by that delay, so the harness feeds `_MAX_LAG_MS` of
+  silence after the item (untimed) and reads every axis from the output with the
+  delay taken off the front, at the input's length. Until 2026-10-27 it kept the
+  first `len(input)` samples instead, which dropped each item's last 32 ms for
+  every streaming filter and for nothing else: on 300 VoiceBank utterances a filter
+  returning its own input 32 ms late scored 3.95 % WER against the input's 3.60 %,
+  and 14.3 % against 12.5 % through a phone line. Streaming WER from before that date is biased
+  against the filter.
 - **Cost is reported at p99, not as a mean.** `_process` runs inline on the audio
   read loop. A filter with a fine RTF that occasionally takes 60 ms on a 20 ms
   frame will stutter, and the mean will never show it.
