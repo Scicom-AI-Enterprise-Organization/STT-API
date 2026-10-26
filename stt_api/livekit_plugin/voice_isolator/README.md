@@ -160,4 +160,4 @@ that sees the last 10 s; one frame LSTM; a complex mask), conditioned on the cal
 through FiLM from a speaker vector. The release adds WavLM-Large's own weights made
 causal. Trained on 2,760 h of speech with simulated rooms, lines and crosstalk plus real
 headset crosstalk from AMI, NOTSOFAR and AliMeeting; chosen on development sets only.
-The training data carries mixed licences: internal use until reviewed.
+The training data carries mixed licences, and the licence of the weights is not set yet.
