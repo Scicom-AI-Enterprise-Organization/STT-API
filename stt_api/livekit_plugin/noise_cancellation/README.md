@@ -205,6 +205,28 @@ what CallEnhancer's published CER table used.
 | resemble-enhance | **3.21** | **+0.52** | 3.57 % | +2.29 % |
 | voicefixer | 3.20 | +0.52 | 4.59 % | +3.31 % |
 
+### The streaming rows were cut (fixed 2026-10-27)
+
+Until 2026-10-27 the harness kept `len(input)` samples of a streaming filter's
+output. That output lags the input by the filter's delay, so GTCRN and DTLN lost
+each item's last ~32 ms before the recogniser heard it; the unprocessed input and
+the offline generative models lost nothing. The harness now flushes a streaming
+filter and aligns its output (`benchmark/README.md`). Re-run on the fixed harness,
+same 100 items and seed, with Whisper large-v3 run locally (`--asr-whisper`) rather
+than through an stt-api server, so the absolute levels differ from the tables above:
+
+| model | wideband WER | Δ | telephony WER | Δ |
+|---|---|---|---|---|
+| unprocessed | **1.53 %** | — | 3.82 % | — |
+| GTCRN | 2.42 % | +0.89 % | 4.07 % | +0.25 % |
+| DTLN | 2.67 % | +1.14 % | 4.07 % | +0.25 % |
+| RNNoise | 3.82 % | +2.29 % | 7.12 % | +3.30 % |
+| Clearline-NC, `mode="quality"` (`../clearline/`) | 2.16 % | +0.63 % | 6.36 % | +2.54 % |
+| Clearline-NC, `mode="asr"` (`../clearline/`) | 1.65 % | +0.12 % | **3.18 %** | **−0.64 %** |
+
+On 100 items a point is a handful of words; `../clearline/README.md` has all 824
+VoiceBank utterances, the DNS set and five telephone codecs.
+
 ### The finding: perceptual quality and WER are inversely related here
 
 Rank the telephony table by DNSMOS and you get almost exactly the reverse of its

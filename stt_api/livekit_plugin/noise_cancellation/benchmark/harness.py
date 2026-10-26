@@ -127,7 +127,18 @@ def run_item(
             finally:
                 if gc_was_on:
                     gc.enable()
-            enhanced = np.concatenate(out)[: len(item.noisy)] if out else np.zeros(0, np.float32)
+            # A streaming filter holds its delay's worth of the item back. A live stream
+            # never ends, so nothing is lost there; a benchmark item does. Cutting the
+            # output at the input's length dropped the last 32 ms of every utterance for
+            # every streaming filter and for nothing else, and Whisper paid for it in
+            # words (a filter mixing all of its input back, i.e. the input delayed, went
+            # from 3.60 % to 3.95 % WER on 300 VoiceBank utterances, and from 12.5 % to
+            # 14.3 % through a phone line). So the filter is flushed with silence
+            # (untimed) and every axis below reads its output aligned: the delay off the
+            # front, the input's length kept.
+            for f in iter_frames(np.zeros(int(_MAX_LAG_MS * item.rate / 1000), np.float32), n):
+                out.append(enh.process(f, item.rate))
+            enhanced = np.concatenate(out) if out else np.zeros(0, np.float32)
             res.frame_times_ms = times
         else:
             enhanced = enh.process_all(item.noisy, item.rate)
@@ -136,12 +147,18 @@ def run_item(
             res.error = "produced no audio"
             return res
 
+        max_lag = int(_MAX_LAG_MS * item.rate / 1000)
+        res.delay_samples = estimate_delay(
+            item.clean if item.clean is not None else item.noisy, enhanced, max_lag
+        )
+        enhanced = enhanced[res.delay_samples : res.delay_samples + len(item.noisy)]
+        if len(enhanced) < len(item.noisy):
+            enhanced = np.pad(enhanced, (0, len(item.noisy) - len(enhanced)))
+
         res.level_change_db = rms_db(enhanced) - rms_db(item.noisy)
 
         if item.clean is not None:
-            max_lag = int(_MAX_LAG_MS * item.rate / 1000)
-            res.delay_samples = estimate_delay(item.clean, enhanced, max_lag)
-            ref, est = align(item.clean, enhanced, res.delay_samples)
+            ref, est = align(item.clean, enhanced, 0)
             res.quality = score_quality(ref, est, item.rate)
             res.noise_floor_db = _noise_floor_db(ref, est, item.rate)
 
@@ -150,7 +167,7 @@ def run_item(
 
             res.crosstalk = score_crosstalk(
                 item.noisy, enhanced, item.clean, item.interferer, item.rate,
-                delay=res.delay_samples or 0,
+                delay=0,
             )
 
         if dnsmos is not None:

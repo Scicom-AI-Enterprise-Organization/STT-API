@@ -184,6 +184,34 @@ def test_reset_fully_isolates_consecutive_items(name):
 # --- harness --------------------------------------------------------------
 
 
+def test_streaming_output_is_flushed_and_aligned():
+    """
+    A streaming filter holds its delay's worth of the item back. The harness must
+    flush it and drop the delay, not cut the output at the input's length: that cut
+    lost the end of every utterance for every streaming filter (and Whisper paid in
+    words), while the unprocessed baseline kept it.
+    """
+
+    class Delay(enhancers.Enhancer):
+        name = "delay"
+        lag = 160
+
+        def reset(self):
+            self.buf = np.zeros(self.lag, np.float32)
+
+        def process(self, frame, rate):
+            x = np.concatenate((self.buf, frame))
+            self.buf = x[len(frame):]
+            return x[: len(frame)]
+
+    item = make_item()
+    r = run_item(Delay(), item, frame_ms=20, keep_audio=True)
+    assert r.error is None, r.error
+    assert r.delay_samples == Delay.lag
+    assert len(r.enhanced) == len(item.noisy)
+    np.testing.assert_allclose(r.enhanced, item.noisy, atol=1e-6)
+
+
 def test_run_item_reports_errors_instead_of_aborting():
     """One bad item must not take down a run that is minutes into a corpus."""
 
