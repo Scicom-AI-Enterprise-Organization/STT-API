@@ -15,8 +15,8 @@ Two backends, like `../semantic_vad/`:
 |---|---|---|
 | model | `Scicom-intl/voice-isolator-cpu`, distilled for one CPU thread | `Scicom-intl/voice-isolator`, the release: M + a causal WavLM-Large, 555M |
 | runs | in the agent process: onnxruntime + numpy, no torch, no GPU | on a GPU server (`Dockerfile`), one WebSocket per call |
-| delay in an agent | 10 ms (the STFT look-ahead) | 90 ms median at 32 calls, 100 ms at 64 (LiveKit's 50 ms frames, the server at 40 ms steps); 50 ms with 20 ms frames and steps |
-| cost | one thread per call on the agent's audio loop: 17% of a core in 50 ms frames, 33% in 20 ms (8-bit 12% and 22%) | the agent only queues the frame (0.4 ms p99); 64 calls on one GPU measured |
+| delay in an agent | 10 ms (the STFT look-ahead) | 40 ms median at 32 calls, 50 ms at 64 (LiveKit's 50 ms frames, the server at 40 ms steps, each frame waiting up to 30 ms for its reply); 30 ms with 20 ms frames and steps |
+| cost | one thread per call on the agent's audio loop: 17% of a core in 50 ms frames, 33% in 20 ms (8-bit 12% and 22%) | each frame waits on the agent's audio loop for its reply: 15 ms median, 30 ms at most, no CPU (`wait_ms=0` only queues it: 0.4 ms, but 90 ms behind); 64 calls on one GPU measured |
 
 Both enroll the caller from the call itself and both give the same output whatever
 frame size LiveKit hands over (below).

@@ -8,6 +8,10 @@ under test on its audio input.
 
 VI_BENCH_FILTER: none | gtcrn | local | local-int8 | remote (VOICE_ISOLATOR_URL).
 VI_BENCH_FRAME_MS: the audio input's frame size (LiveKit's default, 50).
+VI_BENCH_WAIT_MS: VoiceIsolator(wait_ms=...), how long a frame may wait for the
+server's reply (unset: the backend's default, RemoteIsolator 30).
+VI_BENCH_MAX_LAG_MS: VoiceIsolator(max_lag_ms=...), the most delay a late server may
+build up (unset: the backend's default, RemoteIsolator 40 while it waits).
 VI_BENCH_RECORD=1: also write what LiveKit handed the filter and what came out of it,
 the audio the session's VAD and STT hear, as `<room>.in.wav` and `<room>.out.wav`.
 
@@ -47,6 +51,16 @@ from stt_api.livekit_plugin.dummy import LLM, STT, TTS
 
 FILTER = os.environ.get("VI_BENCH_FILTER", "none")
 FRAME_MS = int(os.environ.get("VI_BENCH_FRAME_MS", "50"))
+WAIT_MS = (
+    float(os.environ["VI_BENCH_WAIT_MS"])
+    if os.environ.get("VI_BENCH_WAIT_MS")
+    else None
+)
+MAX_LAG_MS = (
+    float(os.environ["VI_BENCH_MAX_LAG_MS"])
+    if os.environ.get("VI_BENCH_MAX_LAG_MS")
+    else None
+)
 OUT = Path(os.environ.get("VI_BENCH_OUT", "/tmp/vi_bench"))
 RECORD = os.environ.get("VI_BENCH_RECORD", "") not in ("", "0")
 
@@ -62,7 +76,9 @@ class Timed(rtc.FrameProcessor[rtc.AudioFrame]):
         # (arrival s, samples before it, filter s, input level dBFS, output delay ms)
         self.frames: list[tuple[float, int, float, float, float]] = []
         # int16 frames in and out, and their rate, with VI_BENCH_RECORD
-        self.audio: tuple[list[bytes], list[bytes]] | None = ([], []) if RECORD else None
+        self.audio: tuple[list[bytes], list[bytes]] | None = (
+            ([], []) if RECORD else None
+        )
         self.rate = 16000
 
     @property
@@ -117,7 +133,9 @@ def make_filter(proc: JobProcess) -> rtc.FrameProcessor[rtc.AudioFrame] | None:
     if FILTER in ("local", "local-int8", "remote"):
         from stt_api.livekit_plugin.voice_isolator import VoiceIsolator
 
-        return VoiceIsolator(backend=proc.userdata["backend"])
+        return VoiceIsolator(
+            backend=proc.userdata["backend"], wait_ms=WAIT_MS, max_lag_ms=MAX_LAG_MS
+        )
     return None
 
 

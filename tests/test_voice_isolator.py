@@ -254,12 +254,13 @@ class TestRemote:
         vi._close()
 
     def test_a_slow_server_costs_at_most_max_lag(self, halving_server):
-        # replies 0.4 s late against a 0.25 s bound: the delay stops at the bound and
-        # the call goes out unfiltered (the input itself, not the halved input)
+        # the non-waiting plugin, replies 0.4 s late against a 0.25 s bound: the delay
+        # stops at the bound and the call goes out unfiltered (the input itself, not
+        # the halved input)
         url, state = halving_server
         state["delay"] = 0.4
         x = speechlike(2.0, seed=11)
-        vi = VoiceIsolator(backend=RemoteIsolator(url), max_lag_ms=250.0)
+        vi = VoiceIsolator(backend=RemoteIsolator(url), wait_ms=0, max_lag_ms=250.0)
         y = run(vi, x, ms=20, pause=0.02, close=False)
         assert vi.delay_ms == pytest.approx(260.0)
         assert vi.unfiltered_ms > 1000.0  # all but the first 0.65 s or so
@@ -268,9 +269,10 @@ class TestRemote:
         vi._close()
 
     def test_delay_from_a_stall_is_won_back_in_pauses(self, halving_server):
+        # the non-waiting plugin: the delay grows through a stall and is won back later
         url, state = halving_server
         state["stall"] = (25, 0.2)  # half a second in, no reply for 0.2 s
-        vi = VoiceIsolator(backend=RemoteIsolator(url))
+        vi = VoiceIsolator(backend=RemoteIsolator(url), wait_ms=0, max_lag_ms=250.0)
         delays = []
         for f in frames(with_silences(6.0, seed=12), 16000, 20):
             vi._process(f)
@@ -279,6 +281,48 @@ class TestRemote:
         vi._close()
         assert max(delays) >= 150.0
         assert delays[-1] <= 60.0
+
+    def test_each_frame_waits_for_its_own_reply(self, halving_server):
+        # 50 ms frames, replies 5 ms after each: waiting answers a frame with its own
+        # reply (only the model's 10 ms behind); not waiting, with the frame before's
+        url, state = halving_server
+        state["delay"] = 0.005
+        x = speechlike(2.0, seed=13)
+        waiting = VoiceIsolator(backend=RemoteIsolator(url))
+        run(waiting, x, ms=50, pause=0.02, close=False)
+        at_once = VoiceIsolator(
+            backend=RemoteIsolator(url), wait_ms=0, max_lag_ms=250.0
+        )
+        run(at_once, x, ms=50, pause=0.02, close=False)
+        assert waiting.delay_ms <= 20.0
+        assert at_once.delay_ms >= 50.0
+        waiting._close()
+        at_once._close()
+
+    def test_a_late_reply_goes_out_unfiltered_rather_than_late(self, halving_server):
+        # replies 0.1 s late against the default 40 ms cap: the delay stops at the cap
+        # and the late part of the call goes out as the input itself
+        url, state = halving_server
+        state["delay"] = 0.1
+        x = speechlike(2.0, seed=14)
+        vi = VoiceIsolator(backend=RemoteIsolator(url))
+        run(vi, x, ms=50, pause=0.02, close=False)
+        assert vi.delay_ms <= 50.0
+        assert vi.unfiltered_ms > 500.0
+        vi._close()
+
+    def test_waiting_wins_back_the_delay_of_a_stall(self, halving_server):
+        url, state = halving_server
+        state["stall"] = (10, 0.2)  # half a second in, no reply for 0.2 s
+        vi = VoiceIsolator(backend=RemoteIsolator(url))
+        delays = []
+        for f in frames(with_silences(12.0, seed=15), 16000, 50):
+            vi._process(f)
+            delays.append(vi.delay_ms)
+            time.sleep(0.02)
+        vi._close()
+        assert max(delays) >= 40.0  # the stall built delay up to the cap
+        assert delays[-1] <= 30.0  # probing in the pauses won it back
 
     def test_enrollment_is_sent_first(self, halving_server):
         url, state = halving_server

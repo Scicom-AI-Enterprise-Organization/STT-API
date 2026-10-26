@@ -2,8 +2,9 @@
 # Scicom-intl/voice-isolator (M + a causal WavLM-Large branch, 555M
 # parameters), served by the model repository's own WebSocket server. Measured
 # through LiveKit agents (benchmark/): one GPU carried 64 live calls in LiveKit's
-# 50 ms frames, the agents hearing them 100 ms late at the median, 110 ms at p99,
-# nothing passed unfiltered, a step of all 64 taking 10 ms of every 40 ms.
+# 50 ms frames, the agents hearing them 50 ms late at the median and at p99 (each
+# frame waiting up to 30 ms for its reply), 1% passed unfiltered, a step of all 64
+# taking 10 ms of every 40 ms.
 #
 #   docker build -t voice-isolator-gpu -f stt_api/livekit_plugin/voice_isolator/Dockerfile .
 #   docker run --gpus all -p 8765:8765 voice-isolator-gpu

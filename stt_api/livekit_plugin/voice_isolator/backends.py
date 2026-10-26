@@ -167,6 +167,13 @@ class RemoteIsolator:
     caller's voice. Started with `--enroll-loud`, the server runs the same live
     enrollment rule as `LocalIsolator`.
 
+    `wait_ms` and `max_lag_ms` are what `VoiceIsolator` uses unless given its own:
+    each frame waits up to 30 ms for the server's reply to it, and a reply later
+    than 40 ms of delay allows passes that piece through unfiltered rather than
+    delaying the rest of the call (tuned on LiveKit's 50 ms frames with the server
+    at 40 ms steps; `wait_ms=0, max_lag_ms=250` is the old, non-blocking behaviour:
+    about 90 ms behind).
+
     `url` defaults to `VOICE_ISOLATOR_URL`. An unreachable server raises at
     `open()`. A connection lost mid-call logs one warning and passes the caller's
     audio through untouched for the rest of the call, so the agent keeps hearing
@@ -181,8 +188,11 @@ class RemoteIsolator:
         headers: dict[str, str] | None = None,
         connect_timeout: float = 5.0,
         enrollment: np.ndarray | None = None,
+        wait_ms: float = 30.0,
+        max_lag_ms: float = 40.0,
     ) -> None:
         url = url or os.environ.get("VOICE_ISOLATOR_URL")
+        self.wait_ms, self.max_lag_ms = wait_ms, max_lag_ms
         if not url:
             raise ValueError(
                 "RemoteIsolator needs url= or VOICE_ISOLATOR_URL (ws://host:port)"
@@ -207,6 +217,9 @@ class _RemoteStream:
         self._loop = _io_loop()
         self._buf = bytearray()
         self._lock = threading.Lock()
+        self._ready = threading.Condition(
+            self._lock
+        )  # audio came back, or the connection went
         self._down = False
         self._closed = False
         fut = asyncio.run_coroutine_threadsafe(
@@ -253,8 +266,9 @@ class _RemoteStream:
         try:
             async for msg in self._ws:
                 if msg.type == aiohttp.WSMsgType.BINARY:
-                    with self._lock:
+                    with self._ready:
                         self._buf.extend(msg.data)
+                        self._ready.notify_all()
                 elif msg.type in (aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSED):
                     break
         except Exception as exc:  # noqa: BLE001
@@ -271,12 +285,25 @@ class _RemoteStream:
                 exc,
             )
         self._down = True
+        with self._ready:
+            self._ready.notify_all()
 
     def push(self, pcm: np.ndarray) -> np.ndarray:
         if self._down:
             return np.asarray(pcm, np.float32)
         self._loop.call_soon_threadsafe(self._q.put_nowait, _to_pcm16(pcm))
         with self._lock:
+            out = bytes(self._buf)
+            self._buf.clear()
+        return np.frombuffer(out, "<i2").astype(np.float32) / 32768.0
+
+    def wait(self, samples: int, timeout: float) -> np.ndarray:
+        """Up to `timeout` seconds for `samples` more isolated samples to come back;
+        returns what came back meanwhile, all of it or not."""
+        with self._ready:
+            self._ready.wait_for(
+                lambda: len(self._buf) >= 2 * samples or self._down, timeout
+            )
             out = bytes(self._buf)
             self._buf.clear()
         return np.frombuffer(out, "<i2").astype(np.float32) / 32768.0

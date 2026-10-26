@@ -69,10 +69,14 @@ What the filter costs the agent:
 | GTCRN | 3.1 / 5.6 ms | 0.066 | | |
 | `LocalIsolator` (CPU, float) | 15.2 / 24.9 ms | 0.323 | 10 / 10 ms | |
 | `LocalIsolator(quantized=True)` (CPU, 8-bit) | 9.5 / 16.7 ms | 0.200 | 10 / 10 ms | |
-| `RemoteIsolator`, LiveKit's 50 ms frames, server at 40 ms | 0.11 / 0.31 ms | 0.003 | 90 / 90 ms | 0.0% |
-| `RemoteIsolator`, 20 ms frames, server at 20 ms | 0.09 / 0.20 ms | 0.005 | 50 / 70 ms | 0.0% |
-| `RemoteIsolator`, 50 ms frames, server at 40 ms, **64 calls** | 0.13 / 0.40 ms | 0.003 | 100 / 110 ms | 0.0% |
+| `RemoteIsolator`, LiveKit's 50 ms frames, server at 40 ms | 14.5 / 30.3 ms (waiting) | | 40 / 50 ms | 0.13% |
+| `RemoteIsolator(wait_ms=0, max_lag_ms=250)`, same | 0.11 / 0.31 ms | 0.003 | 90 / 90 ms | 0.0% |
+| `RemoteIsolator`, 20 ms frames, server at 20 ms | 0.12 / 11.8 ms (waiting) | | 30 / 50 ms | 0.0% |
+| `RemoteIsolator`, 50 ms frames, server at 40 ms, **64 calls** | 18.2 / 30.3 ms (waiting) | | 50 / 50 ms | 1.0% |
 
+`RemoteIsolator` waits up to 30 ms per frame (on the agent's audio loop, no CPU) for the server's reply to that
+frame, so the isolated audio goes out with its own frame rather than the next one: 40 ms behind instead of 90. A reply
+that would put the call more than 40 ms behind goes out as the caller's own audio instead (the unfiltered column).
 With 64 calls on one GPU a step of all of them took 10 ms of the server's 40 ms period (medians; the server is busy
 33 ms of it, stepping again for calls whose next chunk has already arrived).
 The `LocalIsolator` times are wall clock on the agent's audio loop while 32 agents and
@@ -87,9 +91,10 @@ What the agent's VAD did, against each caller's own channel:
 | GTCRN | 2.88 | 46.8% | 2.03 s | 22% | 0.7% |
 | `LocalIsolator` | 2.12 | 27.7% | 1.03 s | 18% | 3.0% |
 | `LocalIsolator`, 8-bit | 2.25 | 28.2% | 1.04 s | 16% | 2.9% |
-| `RemoteIsolator`, 50 ms frames | 1.59 | 25.4% | 1.15 s | 19% | 7.0% |
-| `RemoteIsolator`, 20 ms frames | 1.88 | 25.8% | 1.08 s | 16% | 6.5% |
-| `RemoteIsolator`, 64 calls | 1.59 | 22.8% | 1.03 s | 21% | 8.6% |
+| `RemoteIsolator`, 50 ms frames | 1.75 | 24.9% | 1.06 s | 18% | 6.9% |
+| `RemoteIsolator(wait_ms=0)`, 50 ms frames | 1.59 | 25.4% | 1.15 s | 19% | 7.0% |
+| `RemoteIsolator`, 20 ms frames | 1.59 | 24.1% | 1.03 s | 18% | 6.8% |
+| `RemoteIsolator`, 64 calls | 1.61 | 22.8% | 1.02 s | 21% | 8.5% |
 
 These agree with the same VAD run offline over the recordings (Voice-Isolator's
 `scripts/vad_eval.py`: release 22.8% of pauses, 1.94 false starts a minute, 8.4% missed;

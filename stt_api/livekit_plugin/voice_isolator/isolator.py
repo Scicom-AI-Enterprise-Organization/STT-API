@@ -68,6 +68,22 @@ class VoiceIsolator(rtc.FrameProcessor[rtc.AudioFrame]):
     for 2 s, a quiet 10 ms piece is dropped per frame. With `LocalIsolator` none
     of this happens: the output is ready when `_process` returns.
 
+    `wait_ms` (remote backends) lets `_process` wait that long for the server's
+    reply to the frame it just sent, instead of returning what came back for
+    earlier frames: the reply then goes out with its own frame rather than the next
+    one, so the delay drops by about a frame, at the cost of holding the agent's
+    audio loop for up to `wait_ms` per frame (the CPU model holds it for its
+    compute); never more than 60% of a frame. 0 never waits. `wait_ms` and
+    `max_lag_ms` default to the backend's (`RemoteIsolator`: wait 30 ms, delay at
+    most 40 ms; measured through LiveKit agents, 32 calls on one GPU in 50 ms
+    frames came back 40 ms behind instead of 90, with 0.06% of the audio passed
+    unfiltered). While waiting, the delay a late reply added is won
+    back by probing: after 2 s without a late frame, one frame waits for 10 ms more
+    than it needs, and if that piece comes back in time and is quiet, it is
+    dropped. A probe that a late frame soon follows doubles the time to the next
+    (up to 32 s), so the delay settles instead of swinging: every late frame puts
+    a little silence into the stream.
+
     A backend that cannot load or connect raises here, at session start, rather
     than passing audio through untouched; that silent degradation is the failure
     this replaces.
@@ -78,11 +94,21 @@ class VoiceIsolator(rtc.FrameProcessor[rtc.AudioFrame]):
         backend: Backend | None = None,
         *,
         enabled: bool = True,
-        max_lag_ms: float = 250.0,
+        max_lag_ms: float | None = None,
+        wait_ms: float | None = None,
     ) -> None:
         self._enabled = enabled
         self._backend = backend if backend is not None else LocalIsolator()
         self._stream = self._backend.open()
+        if wait_ms is None:
+            wait_ms = getattr(self._backend, "wait_ms", 0.0)
+        self._wait_s = wait_ms / 1000.0 if hasattr(self._stream, "wait") else 0.0
+        if (
+            max_lag_ms is None
+        ):  # a cap that fits only a stream whose frames wait for replies
+            max_lag_ms = (
+                getattr(self._backend, "max_lag_ms", 250.0) if self._wait_s else 250.0
+            )
         self._max_lag_ms = max_lag_ms
         # at the frames' rate: isolated audio not yet sent out, the input of the
         # last max_lag_ms + one frame, isolated samples to drop because their time
@@ -92,6 +118,13 @@ class VoiceIsolator(rtc.FrameProcessor[rtc.AudioFrame]):
         self._skip = 0
         self._lag = 0
         self._waits: list[int] = []  # isolated samples left waiting, last 2 s of frames
+        self._calm = (
+            0  # frames since one came back short (a wait that ran out), when waiting
+        )
+        self._probe_s = (
+            2.0  # how long a stretch without a late frame before the next probe
+        )
+        self._since_drop = 1 << 30  # frames since a probe last won back a hop
         # audio that went out unfiltered because its isolated version came late
         self._unfiltered_s = 0.0
         self._rate = MODEL_SAMPLE_RATE
@@ -153,12 +186,30 @@ class VoiceIsolator(rtc.FrameProcessor[rtc.AudioFrame]):
                     out.data, dtype=np.int16, count=out.samples_per_channel
                 )
                 self._emit_up(self._stream.push(a.astype(np.float32) / 32768.0))
-        y = self._take(raw, rate)
+        wait = getattr(self._stream, "wait", None)
+        probe = False
+        if self._wait_s > 0 and wait is not None:
+            hop = rate // 100
+            # after 2 s without a late frame, ask for one hop more than this frame needs
+            probe = self._lag > 0 and self._calm >= max(
+                1, round(self._probe_s * rate / n)
+            )
+            short = n + self._skip + (hop if probe else 0) - self._out.size
+            if short > 0:
+                limit = min(self._wait_s, 0.6 * n / rate)  # never most of a frame
+                got = wait(int(np.ceil(short * MODEL_SAMPLE_RATE / rate)), limit)
+                if rate == MODEL_SAMPLE_RATE:
+                    self._out = np.concatenate([self._out, got])
+                else:
+                    self._emit_up(got)
+        y = self._take(raw, rate, probe)
         pcm_out = np.clip(np.rint(y * 32768.0), -32768, 32767).astype(np.int16)
         return rtc.AudioFrame(pcm_out.tobytes(), rate, ch, n)
 
-    def _take(self, raw: np.ndarray, rate: int) -> np.ndarray:
-        """This frame's output: the isolated audio `_lag` samples behind the input."""
+    def _take(self, raw: np.ndarray, rate: int, probe: bool = False) -> np.ndarray:
+        """This frame's output: the isolated audio `_lag` samples behind the input.
+        `probe`: the frame waited for one hop more than it needed; if that hop came
+        and the first one waiting is quiet, it is dropped (10 ms less delay)."""
         n = raw.size
         cap = int(self._max_lag_ms * rate / 1000)
         keep = cap + n
@@ -168,9 +219,28 @@ class VoiceIsolator(rtc.FrameProcessor[rtc.AudioFrame]):
         if self._skip:  # isolated audio for time that already went out unfiltered
             k = min(self._skip, buf.size)
             buf, self._skip = buf[k:], self._skip - k
+        hop = rate // 100
         if buf.size >= n:
+            if probe:
+                if buf.size >= n + hop and np.abs(buf[:hop]).max() < QUIET:
+                    buf, self._lag, self._calm = buf[hop:], self._lag - hop, 0
+                    self._since_drop = 0
+                elif buf.size < n + hop:  # the server could not give the hop in time
+                    self._calm = 0
+            self._calm += 1
+            self._since_drop += 1
+            if self._since_drop * n > 8 * self._probe_s * rate and self._probe_s > 2.0:
+                self._probe_s, self._since_drop = (
+                    self._probe_s / 2,
+                    0,
+                )  # long settled: probe sooner
             y, buf = buf[:n], buf[n:]
         else:
+            if (
+                self._since_drop * n < 2 * self._probe_s * rate
+            ):  # the last probe went too far
+                self._probe_s = min(2 * self._probe_s, 32.0)
+            self._calm = 0
             short = n - buf.size
             pad = min(short, max(0, cap - self._lag))  # silence in front: more delay
             late = short - pad  # past max_lag_ms: the input itself
@@ -184,7 +254,7 @@ class VoiceIsolator(rtc.FrameProcessor[rtc.AudioFrame]):
             buf = buf[:0]
         # more delay than the backend needs (left by a stall): if at least two hops
         # have been waiting after every frame for 2 s, drop one quiet hop
-        hop, span = rate // 100, max(1, round(2.0 * rate / n))
+        span = max(1, round(2.0 * rate / n))
         self._waits = self._waits[1 - span :] + [buf.size] if span > 1 else [buf.size]
         if (
             len(self._waits) == span
@@ -217,7 +287,8 @@ class VoiceIsolator(rtc.FrameProcessor[rtc.AudioFrame]):
             MODEL_SAMPLE_RATE, rate, num_channels=1, quality=AudioResamplerQuality.QUICK
         )
         self._out, self._hist = np.zeros(0, np.float32), np.zeros(0, np.float32)
-        self._skip = self._lag = 0
+        self._skip = self._lag = self._calm = 0
+        self._probe_s, self._since_drop = 2.0, 1 << 30
         self._waits = []
 
     def _close(self) -> None:
