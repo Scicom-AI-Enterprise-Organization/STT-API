@@ -108,8 +108,8 @@ class ClearlineVAD(agents.vad.VAD):
             activation_threshold: p(speech) to count a window as speech. **Not
                 silero's 0.5**: the default is the operating point chosen on
                 development data for the pinned graph (`hub.OPERATING_POINT`: 0.825
-                for the release at 512-sample windows, 0.85 at 256, 0.75 for the
-                distilled variant); the two models' probabilities are calibrated
+                for the release at 512-sample windows, 0.85 at 256; 0.85 and 0.825
+                for the distilled variant); the two models' probabilities are calibrated
                 differently. On telephone legs
                 with a busy room behind the caller, raise it (0.9-0.95).
             window: samples per inference at 16 kHz: 512 (32 ms, silero's cadence)
@@ -120,8 +120,10 @@ class ClearlineVAD(agents.vad.VAD):
                 chosen with the threshold. (`PulseVAD`'s option reads the other
                 way round; do not copy a value across.)
             variant: "release" (the default: best LiveKit turn-taking on the
-                development sets) or "distilled" (the better frame classifier,
-                ends turns slightly later; for offline segmentation).
+                development sets) or "distilled" (the better frame classifier, a
+                larger graph: level with silero through telephone codecs and ahead
+                of it in noisy rooms, ends turns slightly later, about 1.4 times the
+                release's CPU; for offline segmentation and noisy rooms).
             inline: run inference on the event loop instead of the thread pool.
             num_threads: ONNX Runtime intra-op threads; 1 is right for this size.
             onnx_file_path: a local graph instead of the pinned download (also
