@@ -5,8 +5,8 @@ Each of these fails *silently* in production rather than raising, which is why
 it is guarded here:
 
 * **The operating point.** The default threshold (0.825 for the release at
-  512-sample windows, 0.85 at 256; 0.85 and 0.825 for the distilled variant) and
-  filter (0.35; 0.2 for the distilled variant at 512) belong to the pinned weights. Silero's 0.5 carried across would fire more and earlier,
+  512-sample windows, 0.875 at 256; 0.825 and 0.75 for the distilled variant) and
+  filter (0.35; 0.5 for the distilled variant at 256) belong to the pinned weights. Silero's 0.5 carried across would fire more and earlier,
   with nothing in the logs.
 * **The filter's direction.** `smoothing_alpha` is LiveKit's ExpFilter alpha, the
   weight of the *previous* value: 1.0 freezes the filter (a VAD stuck on its first
@@ -151,8 +151,8 @@ def test_defaults_are_the_pinned_operating_point(vad_weights):
 @pytest.mark.parametrize("variant", ["release", "distilled"])
 @pytest.mark.parametrize("window", [512, 256])
 def test_each_graph_gets_its_own_operating_point(vad_weights, variant, window):
-    # The points differ by graph (0.825 for the release at 512 samples, 0.85 at
-    # 256; 0.85 with the filter at 0.2 and 0.825 with 0.35 for the distilled
+    # The points differ by graph (0.825 for the release at 512 samples, 0.875 at
+    # 256; 0.825 with the filter at 0.35 and 0.75 with 0.5 for the distilled
     # variant): a single default would silently mis-set three of the four.
     vad = _vad(variant=variant, window=window)
     point = hub.OPERATING_POINT[(variant, window)]

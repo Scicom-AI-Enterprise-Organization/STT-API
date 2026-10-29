@@ -108,7 +108,7 @@ class ClearlineVAD(agents.vad.VAD):
             activation_threshold: p(speech) to count a window as speech. **Not
                 silero's 0.5**: the default is the operating point chosen on
                 development data for the pinned graph (`hub.OPERATING_POINT`: 0.825
-                for the release at 512-sample windows, 0.85 at 256; 0.85 and 0.825
+                for the release at 512-sample windows, 0.875 at 256; 0.825 and 0.75
                 for the distilled variant); the two models' probabilities are calibrated
                 differently. On telephone legs
                 with a busy room behind the caller, raise it (0.9-0.95).

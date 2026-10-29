@@ -60,9 +60,9 @@ Xeon server through ONNX Runtime with one thread. `load()` takes silero's option
 | option | default | what |
 |---|---|---|
 | `window` | 512 | samples per call at 16 kHz: 512 (32 ms, silero's cadence) or 256 (16 ms updates, same weights) |
-| `activation_threshold` | 0.825 | **not silero's 0.5**; 0.85 with `window=256`; 0.85 for the distilled variant (0.825 at 256) (see below) |
-| `smoothing_alpha` | 0.35 | LiveKit's ExpFilter alpha (0.2 for the distilled variant at 512 samples); **0 turns it off, 1 is refused** (see below) |
-| `variant` | `"release"` | `"distilled"`: the better frame classifier (96 units; level with silero through telephone codecs, ahead in noisy rooms), ends turns a little later |
+| `activation_threshold` | 0.825 | **not silero's 0.5**; 0.875 with `window=256`; 0.825 for the distilled variant (0.75 at 256) (see below) |
+| `smoothing_alpha` | 0.35 | LiveKit's ExpFilter alpha (0.5 for the distilled variant at 256 samples); **0 turns it off, 1 is refused** (see below) |
+| `variant` | `"release"` | `"distilled"`: the better frame classifier (96 units; ahead of silero through all five telephone codecs and in noisy rooms), ends turns a little later |
 | `inline` | True | run the model on the event loop: the call costs less than the thread-pool hop |
 | `onnx_file_path`, `revision` | | a local graph, or another Hugging Face revision |
 
@@ -75,21 +75,32 @@ four (threshold 0.70), replayed through LiveKit's own state machine:
 | | silero v6 | Clearline-VAD | Clearline-VAD, distilled |
 |---|---|---|---|
 | CPU per 32 ms (median) | 103 us | **60 us** | 83 us |
-| mean frame ROC-AUC, 13 sets | 0.912 | 0.921 (higher on 8) | 0.921 (higher on 9) |
-| fresh turns detected | 0.801 | **0.857** | 0.813 |
-| median onset delay | 247 ms | **239 ms** | 289 ms |
-| turn ends on time | 0.718 | **0.775** | 0.737 |
-| false triggers per hour of non-speech, 10 sets | 29.6 | 38.0 | **24.6** |
-| the same without the two private telephone sets | 28.1 | 27.5 | **15.7** |
-| on the telephone (AMI dev through codecs): turns / ends / false per hour | 0.877 / 0.750 / **17.4** | **0.947 / 0.857** / 32.4 | 0.907 / 0.767 / 20.8 |
+| mean frame ROC-AUC, 13 sets | 0.912 | 0.920 (higher on 8) | **0.921 (higher on 10)** |
+| fresh turns detected | 0.801 | **0.835** | 0.801 |
+| median onset delay, mean over the sets | **247 ms** | 261 ms | 465 ms (220 without CHiME-6) |
+| turn ends on time | 0.718 | **0.757** | 0.728 |
+| false triggers per hour of non-speech, 10 sets | 29.6 | 35.1 | **21.4** |
+| the same without the two private telephone sets | 28.1 | 23.6 | **14.3** |
+| on the telephone (AMI dev through codecs): turns / ends / false per hour | 0.877 / 0.750 / **17.4** | **0.944 / 0.866** / 34.3 | 0.929 / 0.825 / 22.7 |
+
+Both models at this revision were fine-tuned with half their training examples heard
+through Clearline-NC first, because a LiveKit agent runs its noise filter before its
+VAD: behind a filter that removes the noise outright (Clearline-NC's quality mode,
+GTCRN) the weights before them heard the filtered pauses as loud. Behind GTCRN, which
+they never heard, they now rank frames better than those weights did (and the
+distilled variant better than silero v6); with no filter they are level with them.
+Far-field meetings behind a strong filter are the exception (AliMeeting).
 
 The extra false triggers are on telephone legs, in the line's silences: background
-sounds about 25 dB under the caller's own speech (95 and 65 per hour on the two
-private telephone sets against silero's 45 and 26; on the other eight sets 27.5 per
-hour against silero's 28.1). On such lines raise `activation_threshold` to
-0.9-0.95. On FLEURS through five telephone codecs the distilled variant ranks frames
-level with silero (frame ROC-AUC 0.936 each) and the release a little behind (0.923);
-the distilled variant fires more than the release in the pauses of far-field meetings.
+sounds about 25 dB under the caller's own speech (91 and 71 per hour on the two
+private telephone sets against silero's 45 and 26; on the other eight sets 23.6 per
+hour against silero's 28.1). Behind `ClearlineNC` in its default mode they fall to 50
+and 37 per hour; without it, raise `activation_threshold` to 0.9-0.95 on such lines.
+On FLEURS through five telephone codecs the distilled variant ranks frames ahead of
+silero on every codec (frame ROC-AUC 0.939 against 0.936) and the release a little
+behind (0.924). The distilled variant misses distant talkers in far-field meetings:
+its mean onset delay above is mostly CHiME-6's dinner parties, where it catches 6% of
+turns, 2.7 s late (silero v6 15%, at 0.5 s). Use the release for meetings.
 
 ## `ClearlineNC`
 
@@ -144,8 +155,8 @@ python -m stt_api.livekit_plugin.noise_cancellation.benchmark --corpus voicebank
 
 - **The default threshold is 0.825, not silero's 0.5.** The models are calibrated
   differently; 0.825 (with the filter at 0.35) is the point chosen on the
-  development sets for the pinned release at 512-sample windows, 0.85 for the
-  256-sample window, and 0.85 with the filter at 0.2 (0.825 with 0.35 at 256) for
+  development sets for the pinned release at 512-sample windows, 0.875 for the
+  256-sample window, and 0.825 with the filter at 0.35 (0.75 with 0.5 at 256) for
   the distilled variant
   (`hub.OPERATING_POINT`, one entry per graph). It moves with the weights: `hub.VAD_REVISION` and `hub.OPERATING_POINT`
   change together.
