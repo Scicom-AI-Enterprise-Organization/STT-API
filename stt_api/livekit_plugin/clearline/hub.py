@@ -9,8 +9,8 @@ Clearline-VAD is public; Clearline-NC is private, so the noise filter needs an
 `HF_TOKEN` that can read it.
 
 The pin is not decoration. The VAD's default operating points (`OPERATING_POINT`:
-for the release 0.825 at 512-sample windows and 0.85 at 256 with the filter at 0.35,
-for the distilled variant 0.85 with the filter at 0.2 at 512 and 0.825 with 0.35 at
+for the release 0.825 at 512-sample windows and 0.875 at 256 with the filter at 0.35,
+for the distilled variant 0.825 with the filter at 0.35 at 512 and 0.75 with 0.5 at
 256) were chosen on development
 data *for these weights*; a newer upload can be
 calibrated differently, and the wrong threshold fails silently (a VAD that fires
@@ -27,7 +27,7 @@ import os
 
 VAD_REPO = "Scicom-intl/Clearline-VAD"
 NC_REPO = "Scicom-intl/Clearline-NC"
-VAD_REVISION = "539a7830b7d096d9ee28c32132deae021e9c55a5"
+VAD_REVISION = "da8f290b566938ee1b1ce30f211b9be94ebf3836"
 NC_REVISION = "f0d0e14826ef5b608fc806a82e6e50a1d3bca6d5"
 
 VAD_FILES = {
@@ -41,18 +41,21 @@ many samples one call takes (512 = 32 ms, silero's cadence; 256 = 16 ms)."""
 
 OPERATING_POINT = {
     ("release", 512): {"activation_threshold": 0.825, "smoothing_alpha": 0.35},
-    ("release", 256): {"activation_threshold": 0.85, "smoothing_alpha": 0.35},
-    ("distilled", 512): {"activation_threshold": 0.85, "smoothing_alpha": 0.2},
-    ("distilled", 256): {"activation_threshold": 0.825, "smoothing_alpha": 0.35},
+    ("release", 256): {"activation_threshold": 0.875, "smoothing_alpha": 0.35},
+    ("distilled", 512): {"activation_threshold": 0.825, "smoothing_alpha": 0.35},
+    ("distilled", 256): {"activation_threshold": 0.75, "smoothing_alpha": 0.5},
 }
 """(variant, window) -> the default options, chosen on the development sets (AMI
 dev and VoxConverse dev, wideband and through a phone codec) for each graph at
 `VAD_REVISION`. The release: the highest mean of LiveKit onset and end-of-turn
 recall among points at least as good as silero v6's own tuned point on onset
 recall, end recall, false triggers per hour and onset delay. The distilled variant
-(a larger graph since this revision: 96 units and per-band level trackers, chosen
-for frames on six development sets including rooms full of other people's voices)
-takes the same rule's point for itself."""
+(a larger graph: 96 units and per-band level trackers, chosen for frames on six
+development sets including rooms full of other people's voices) takes the same rule's
+point for itself. At this revision both graphs were fine-tuned with half their training
+examples heard through Clearline-NC first, because a LiveKit agent runs its noise filter
+before its VAD; behind a filter they never heard (GTCRN) they rank frames better than
+the weights before them, and with no filter they are level."""
 
 NC_FILES = {"asr": "clearline_nc_asr.onnx", "quality": "clearline_nc.onnx"}
 

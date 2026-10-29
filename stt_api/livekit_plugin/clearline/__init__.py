@@ -19,8 +19,8 @@ one CPU core.
 
 Two things that fail silently when wrong, both in README.md:
 
-* The default threshold is **0.825, not silero's 0.5** (0.85 with 256-sample windows;
-  0.85 with the filter at 0.2 for the distilled variant, 0.825 with 0.35 at 256): the operating points chosen
+* The default threshold is **0.825, not silero's 0.5** (0.875 with 256-sample windows;
+  0.825 with the filter at 0.35 for the distilled variant, 0.75 with 0.5 at 256): the operating points chosen
   on development data for the pinned weights (`hub.OPERATING_POINT`).
 * `smoothing_alpha` is LiveKit's ExpFilter alpha, the weight of the **previous**
   value (1.0 freezes the filter, so it is refused) — the opposite reading of
