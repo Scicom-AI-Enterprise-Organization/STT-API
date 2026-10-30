@@ -19,9 +19,12 @@ the model trained to keep noise 20 dB down rather than remove it, with 70% of th
 input mixed back, chosen on development data. On the benchmark's harness (streaming
 output flushed and aligned) over all 824 VoiceBank test utterances, Whisper large-v3
 scores 1.55% WER after it against 1.45% unprocessed and GTCRN's 2.65% (wideband), and
-2.90% against 2.95% and 4.26% through a G.711 phone path. "quality": the model
-trained to remove all the noise it can, for a human listener (VoiceBank+DEMAND PESQ
-2.610 against GTCRN's 2.535). Neither mode is trained on VoiceBank, VCTK or DEMAND.
+2.90% against 2.95% and 4.26% through a G.711 phone path. "quality": for a human
+listener, a larger graph (256 units with per-bin levels and gains) distilled from a
+GPU model (Scicom-intl/Clearline-NC-GPU) that removes background noise and keeps every
+voice: VoiceBank+DEMAND PESQ 2.575 and DNS 2020 synthetic 2.389, against GTCRN's 2.535
+and 2.293, at about half GTCRN's CPU. Neither mode is trained on VoiceBank, VCTK or
+DEMAND.
 """
 
 from __future__ import annotations

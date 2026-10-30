@@ -221,11 +221,13 @@ than through an stt-api server, so the absolute levels differ from the tables ab
 | GTCRN | 2.42 % | +0.89 % | 4.07 % | +0.25 % |
 | DTLN | 2.67 % | +1.14 % | 4.07 % | +0.25 % |
 | RNNoise | 3.82 % | +2.29 % | 7.12 % | +3.30 % |
-| Clearline-NC, `mode="quality"` (`../clearline/`) | 2.16 % | +0.63 % | 6.36 % | +2.54 % |
+| Clearline-NC, `mode="quality"` (`../clearline/`) | 2.16 % | +0.63 % | 4.58 % | +0.76 % |
 | Clearline-NC, `mode="asr"` (`../clearline/`) | 1.65 % | +0.12 % | **3.18 %** | **−0.64 %** |
 
 On 100 items a point is a handful of words; `../clearline/README.md` has all 824
-VoiceBank utterances, the DNS set and five telephone codecs.
+VoiceBank utterances, the DNS set and five telephone codecs. The quality row is the
+quality mode since 2026-10-30 (distilled from a GPU model); the one before it scored
+2.16 % and 6.36 %.
 
 ### The finding: perceptual quality and WER are inversely related here
 

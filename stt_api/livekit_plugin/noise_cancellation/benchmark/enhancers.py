@@ -224,9 +224,9 @@ class ClearlineNCEnhancer(Enhancer):
     `rtc.AudioFrame` and the plugin's own `_process`, int16 and resamplers included.
 
     `clearline` is the plugin's default, its speech-recognition mode (noise kept
-    20 dB down, 10 % of the input mixed back); `clearline_quality` removes all the
-    noise it can. Weights come from the pinned Hugging Face revision (private: an
-    `HF_TOKEN` that can read it).
+    20 dB down, 70 % of the input mixed back); `clearline_quality` removes background
+    noise and keeps every voice (since 2026-10-30 a larger graph distilled from a GPU
+    model). Weights come from the pinned revision of a public Hugging Face repository.
     """
 
     name = "clearline"
@@ -255,7 +255,7 @@ class ClearlineNCEnhancer(Enhancer):
 
 class ClearlineNCQualityEnhancer(ClearlineNCEnhancer):
     name = "clearline_quality"
-    note = "Clearline-NC, quality mode (full removal), 16 kHz native"
+    note = "Clearline-NC, quality mode (distilled; removes background noise), 16 kHz native"
     mode = "quality"
 
 
