@@ -2,11 +2,11 @@
 Where the Clearline weights come from.
 
 The ONNX graphs are over the repo's 1 MB pre-commit limit (1.4 MB for the VAD,
-1.6 MB for the noise canceller), so they are not vendored: they are fetched from
+1.6 and 5.3 MB for the noise canceller's two modes), so they are not vendored: they are fetched from
 the Hugging Face repositories below on first use, **pinned to the revision this
 plugin was tested against**, and cached by `huggingface_hub` as usual.
-Clearline-VAD is public; Clearline-NC is private, so the noise filter needs an
-`HF_TOKEN` that can read it.
+Both repositories are public, so no token is needed: Clearline-VAD and
+Clearline-NC-CPU (named Clearline-NC until 2026-10-30; that id redirects here).
 
 The pin is not decoration. The VAD's default operating points (`OPERATING_POINT`:
 for the release 0.825 at 512-sample windows and 0.875 at 256 with the filter at 0.35,
@@ -26,9 +26,9 @@ from __future__ import annotations
 import os
 
 VAD_REPO = "Scicom-intl/Clearline-VAD"
-NC_REPO = "Scicom-intl/Clearline-NC"
+NC_REPO = "Scicom-intl/Clearline-NC-CPU"
 VAD_REVISION = "da8f290b566938ee1b1ce30f211b9be94ebf3836"
-NC_REVISION = "f0d0e14826ef5b608fc806a82e6e50a1d3bca6d5"
+NC_REVISION = "7355439a484a87af343628c28f945183fb599a46"
 
 VAD_FILES = {
     ("release", 512): "clearline_vad.onnx",
@@ -77,8 +77,8 @@ def _fetch(repo: str, filename: str, revision: str) -> str:
     except Exception as e:  # noqa: BLE001 - re-raised with what to do about it
         raise FileNotFoundError(
             f"could not fetch {filename} from {repo}@{revision[:7]} ({type(e).__name__}: {e}). "
-            "The repository is private: set an HF_TOKEN that can read it, or point at a "
-            "local copy with model_path= or the CLEARLINE_*_ONNX_PATH variables."
+            "Both repositories are public: check the network or the Hugging Face cache, or "
+            "point at a local copy with model_path= or the CLEARLINE_*_ONNX_PATH variables."
         ) from e
 
 

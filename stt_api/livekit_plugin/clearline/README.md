@@ -42,12 +42,12 @@ await session.start(
 Tested (`tests/test_clearline.py`, 49 tests) on `livekit-agents` 1.2.18, 1.3.11 and
 1.8.9, the range the `scicom-livekit-plugin` extra allows.
 
-The weights live in Hugging Face repositories, `Scicom-intl/Clearline-VAD` (public)
-and `Scicom-intl/Clearline-NC` (private), and are fetched on first use **at a pinned
-revision** (`hub.VAD_REVISION`, `hub.NC_REVISION`). The noise filter needs an
-`HF_TOKEN` that can read its repository, or a local copy: `ClearlineNC(model_path=...)`
-or `CLEARLINE_NC_ONNX_PATH` (for the VAD, `ClearlineVAD.load(onnx_file_path=...)` or
-`CLEARLINE_VAD_ONNX_PATH`).
+The weights live in public Hugging Face repositories, `Scicom-intl/Clearline-VAD` and
+`Scicom-intl/Clearline-NC-CPU` (named `Clearline-NC` until 2026-10-30; the old id
+redirects), and are fetched on first use **at a pinned revision** (`hub.VAD_REVISION`,
+`hub.NC_REVISION`); no token is needed. A local copy overrides the download:
+`ClearlineNC(model_path=...)` or `CLEARLINE_NC_ONNX_PATH` (for the VAD,
+`ClearlineVAD.load(onnx_file_path=...)` or `CLEARLINE_VAD_ONNX_PATH`).
 
 ## `ClearlineVAD`
 
@@ -112,15 +112,17 @@ A band-gain and deep-filter enhancer on GTCRN's STFT (512-point sqrt-Hann, 256 h
 
 | | GTCRN | `mode="quality"` | `mode="asr"` (default) |
 |---|---|---|---|
-| VoiceBank+DEMAND PESQ / SI-SDR | 2.535 / 14.6 dB | **2.610 / 17.7 dB** | 2.135 / 10.5 dB |
-| DNS 2020 synthetic PESQ / ESTOI | **2.293 / 0.872** | 2.239 / 0.871 | 1.697 / 0.827 |
-| real-time factor; p99 per 20 ms frame | 0.064; 3.24 ms | **0.018; 0.69 ms** | **0.016; 0.46 ms** |
-| Whisper large-v3 WER, all 824 VoiceBank utterances, wideband / phone path | 2.65% / 4.26% | 2.48% / 6.27% | **1.55% / 2.90%** |
-| Whisper large-v3 WER, DNS 2020 synthetic (150 clips) | 5.30% | 6.46% | **5.02%** |
+| VoiceBank+DEMAND PESQ / SI-SDR | 2.535 / 14.6 dB | **2.575 / 17.4 dB** | 2.135 / 10.5 dB |
+| DNS 2020 synthetic PESQ / ESTOI | 2.293 / 0.872 | **2.389 / 0.886** | 1.697 / 0.827 |
+| real-time factor; p99 per 20 ms frame | 0.064; 3.24 ms | 0.025; 0.72 ms | **0.016; 0.46 ms** |
+| Whisper large-v3 WER, all 824 VoiceBank utterances, wideband / phone path | 2.65% / 4.26% | 2.32% / 5.79% | **1.55% / 2.90%** |
+| Whisper large-v3 WER, DNS 2020 synthetic (150 clips) | 5.30% | 6.48% | **5.02%** |
 
 (Unprocessed: 1.45% / 2.95% on VoiceBank, 5.38% on DNS. Neither mode is trained on
-VoiceBank, VCTK or DEMAND. The two modes are one graph with different weights: their
-cost differs only by the run it was measured in.) Every WER here is on the
+VoiceBank, VCTK or DEMAND. Since 2026-10-30 the quality mode is the larger graph, 256
+units with per-bin levels and gains, distilled from a GPU model that removes background
+noise and keeps every voice, `Scicom-intl/Clearline-NC-GPU`; it costs about half of
+GTCRN's CPU per stream, the ASR mode about a third.) Every WER here is on the
 benchmark's harness as fixed: a streaming filter's output is flushed and aligned
 before Whisper hears it (`../noise_cancellation/benchmark/README.md`); before
 2026-10-27 the harness cut each utterance's last 32 ms for every streaming filter.
@@ -131,11 +133,11 @@ Whisper's WER after each filter:
 
 | | unprocessed | GTCRN | `mode="quality"` | `mode="asr"` |
 |---|---|---|---|---|
-| G.711 | 3.25% | 10.72% | 5.20% | **3.20%** |
-| GSM | 7.41% | 15.60% | 11.07% | **6.96%** |
-| Opus | 4.94% | 13.46% | 7.57% | **4.81%** |
-| AMR-NB* | 4.83% | 13.66% | 7.63% | **5.24%** |
-| G.723.1* | 7.72% | 16.62% | 11.96% | **7.78%** |
+| G.711 | 3.25% | 10.72% | 4.64% | **3.20%** |
+| GSM | 7.41% | 15.60% | 9.10% | **6.96%** |
+| Opus | 4.94% | 13.46% | 7.32% | **4.81%** |
+| AMR-NB* | 4.83% | 13.66% | 6.99% | **5.24%** |
+| G.723.1* | 7.72% | 16.62% | 9.89% | **7.78%** |
 
 `mode="asr"` is the model trained to keep noise 20 dB down rather than remove it,
 with 70% of the input mixed back (`mix_back`), chosen on development data: a robust
@@ -143,8 +145,9 @@ recogniser is hurt by a filter's artifacts more than by the noise it leaves, and
 that share Whisper's word error rate stays where the unprocessed input has it (over
 eight test conditions, 1.00 times the unprocessed input's on average; GTCRN 2.17).
 It is the default for agents. The price is quality: it leaves most of the noise in.
-`mode="quality"` removes all the noise it can, for a human listener, and costs
-Whisper more on most lines.
+`mode="quality"` removes background noise for a human listener and keeps every voice
+(a second talker loses about 1 dB, crowd babble about 25 dB); it costs Whisper more on
+most lines.
 
 ```bash
 python -m stt_api.livekit_plugin.noise_cancellation.benchmark --corpus voicebank \
@@ -167,6 +170,6 @@ python -m stt_api.livekit_plugin.noise_cancellation.benchmark --corpus voicebank
 - **One `ClearlineNC` per audio stream.** The recurrent state is per instance (the
   ONNX session is shared); the `lambda params: ClearlineNC()` factory is what
   LiveKit calls once per stream.
-- **The download happens at load, not on the first frame.** A missing token raises
+- **The download happens at load, not on the first frame.** A failed download raises
   `FileNotFoundError` from `load()` / `ClearlineNC()`, with what to do about it,
   rather than an agent that hears nothing or a filter that passes audio through.

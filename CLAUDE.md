@@ -155,11 +155,11 @@ speaker stops, so no text detector can beat that. That is the reason
 
 ### `clearline/`
 
-- **The weights are not vendored**: 1.4 MB (VAD) and 1.6 MB (NC) are over the 1 MB
-  pre-commit limit, so `hub.py` fetches them from `Scicom-intl/Clearline-VAD` (public)
-  and `Scicom-intl/Clearline-NC` (private: `HF_TOKEN` needed, or
-  `CLEARLINE_NC_ONNX_PATH`) at a **pinned revision**. A missing token raises at
-  construction, never on the first frame.
+- **The weights are not vendored**: 1.4 MB (VAD) and 1.6 / 5.3 MB (NC's two modes) are
+  over the 1 MB pre-commit limit, so `hub.py` fetches them from `Scicom-intl/Clearline-VAD`
+  and `Scicom-intl/Clearline-NC-CPU` (both public; the latter was `Clearline-NC` until
+  2026-10-30, an id that redirects; or `CLEARLINE_NC_ONNX_PATH`) at a **pinned
+  revision**. A failed download raises at construction, never on the first frame.
 - **The VAD's default threshold is 0.80 with the filter at 0.35** for the release at
   512-sample windows, 0.85 for the other three graphs: the operating points chosen on
   development data for the pinned weights, one per (variant, window) in

@@ -26,10 +26,9 @@ Two things that fail silently when wrong, both in README.md:
   value (1.0 freezes the filter, so it is refused) — the opposite reading of
   `PulseVAD`'s option of the same name.
 
-The weights live in Hugging Face repositories (`hub.VAD_REPO`, public, and
-`hub.NC_REPO`, private), pinned by revision: the noise filter needs an `HF_TOKEN`
-that can read its repository, or a local copy via `CLEARLINE_NC_ONNX_PATH` (the VAD's
-is `CLEARLINE_VAD_ONNX_PATH`).
+The weights live in public Hugging Face repositories (`hub.VAD_REPO`, `hub.NC_REPO`),
+pinned by revision; a local copy overrides the download via `CLEARLINE_NC_ONNX_PATH`
+(the VAD's is `CLEARLINE_VAD_ONNX_PATH`).
 """
 
 from .hub import NC_REPO, OPERATING_POINT, VAD_REPO, nc_model_path, vad_model_path
