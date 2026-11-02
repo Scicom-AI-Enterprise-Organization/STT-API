@@ -225,6 +225,8 @@ class TestBuiltWheel:
         assert "stt_api/livekit_plugin/noise_cancellation/resources/gtcrn_simple.onnx" in names
         assert "stt_api/livekit_plugin/noise_cancellation/resources/LICENSE.gtcrn" in names
         assert "stt_api/livekit_plugin/dummy/audio/tawaran.wav" in names
+        assert "stt_api/livekit_plugin/voice_isolator/resources/voicebot_decoy.npy" in names
+        assert "stt_api/livekit_plugin/voice_isolator/resources/LICENSE.voicebot_decoy" in names
 
     def test_plugin_modules_are_in_the_wheel(self, wheel):
         names = set(wheel.namelist())

@@ -25,6 +25,8 @@ EXPOSE 8765
 # LocalIsolator runs; --chunk-hops 4: 40 ms steps, for LiveKit's 50 ms frames (the
 # WavLM branch needs 20 ms multiples). With agents set to 20 ms frames
 # (AudioInputOptions(frame_size_ms=20)), --chunk-hops 2 halves the delay (50 ms
-# median at 32 calls) for fewer calls per GPU.
+# median at 32 calls) for fewer calls per GPU. A call opened by
+# RemoteIsolator(voicebot=True) (the URL's ?voicebot=1) runs the voicebot mode, for
+# agents that speak first; --voicebot makes it every call's default.
 CMD ["python", "-m", "vi.server_mp", "--ckpt", "/model", "--port", "8765", \
      "--workers", "8", "--enroll-loud", "--chunk-hops", "4", "--max-streams", "128"]

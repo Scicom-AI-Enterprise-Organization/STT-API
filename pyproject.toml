@@ -110,6 +110,9 @@ markers = [
 # at prewarm on an installed copy while working fine from a source checkout —
 # the same trap the noise_cancellation entry above exists to avoid.
 "stt_api.livekit_plugin.pulse_vad" = ["resources/*.onnx", "resources/*.npy", "resources/LICENSE.*"]
+# The voice isolator's voicebot mode reads its decoy voice (LibriTTS-R, CC BY 4.0)
+# from here; without it LocalIsolator(voicebot=True) raises on an installed copy.
+"stt_api.livekit_plugin.voice_isolator" = ["resources/*.npy", "resources/LICENSE.*"]
 
 [tool.setuptools.packages.find]
 include = ["stt_api*"]

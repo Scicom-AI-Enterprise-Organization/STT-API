@@ -1,0 +1,13 @@
+voicebot_decoy.npy: 4 s of one utterance of LibriTTS-R (train-clean-100), 16 kHz,
+16-bit PCM, scaled to a peak of half of full scale. The voice isolator's voicebot
+mode tells the model to keep this voice, which is in no call, until the caller is
+enrolled.
+
+LibriTTS-R: Yuma Koizumi, Heiga Zen, Shigeki Karita, Yifan Ding, Kohei Yatabe,
+Nobuyuki Morioka, Michiel Bacchiani, Yu Zhang, Wei Han, Ankur Bapna, "LibriTTS-R:
+A Restored Multi-Speaker Text-to-Speech Corpus", Interspeech 2023.
+https://www.openslr.org/141/
+
+Licensed under the Creative Commons Attribution 4.0 International licence
+(CC BY 4.0): https://creativecommons.org/licenses/by/4.0/
+Changes: cut to 4 s, resampled to 16 kHz, scaled, stored as 16-bit PCM.

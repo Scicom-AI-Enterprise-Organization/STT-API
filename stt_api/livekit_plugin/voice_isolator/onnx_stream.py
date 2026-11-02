@@ -24,6 +24,13 @@ is at most 15.5 s old, then fixed. Before 3 s the model runs with its learned "n
 enrollment" vector. Runs of the step never cross a half second, so the vector
 changes exactly where the offline rule changes it: the export is checked against
 the PyTorch model running that rule (124-134 dB on real calls, float rounding).
+
+The voicebot mode (`voicebot=True`), for an agent that speaks first: until the
+first enrollment the model is told to keep a decoy, a voice that is in no call
+(`resources/voicebot_decoy.npy`), so it keeps no voice while the agent greets, and
+the first enrollment waits until the loudest 3 s heard is `jump_db` (6 dB) over the
+call's first 3 s, or the call is `jump_max` (10 s) old. Voice-Isolator's
+`vi/infer.py` mode "selflv" is the same rule in PyTorch.
 """
 
 from __future__ import annotations
@@ -35,6 +42,22 @@ from pathlib import Path
 import numpy as np
 
 SAMPLE_RATE = 16000
+
+DECOY = Path(__file__).parent / "resources" / "voicebot_decoy.npy"
+"""4 s of one LibriTTS-R train-clean-100 utterance (CC BY 4.0, see
+resources/LICENSE.voicebot_decoy), 16 kHz int16 at half of full scale."""
+JUMP_DB, JUMP_MAX = 6.0, 10.0
+"""The voicebot mode's first enrollment: a voice this many dB over the call's first
+3 s, or the call this many seconds old. Chosen on the voice-interrupt bench's
+development calls."""
+
+_DECOY_EMB: dict[tuple[str, int], np.ndarray] = {}  # per model: the decoy's vector
+
+
+@lru_cache(maxsize=1)
+def decoy_clip() -> np.ndarray:
+    """The voicebot mode's decoy voice, 16 kHz float32."""
+    return np.load(DECOY).astype(np.float32) / 32768.0
 
 
 @lru_cache(maxsize=8)
@@ -81,7 +104,14 @@ class OnnxStream:
         loud_s: float = 3.0,
         loud_within: float = 15.0,
         step_s: float = 0.5,
+        voicebot: bool = False,
+        jump_db: float = JUMP_DB,
+        jump_max: float = JUMP_MAX,
     ) -> None:
+        if voicebot and not live_enroll:
+            raise ValueError(
+                "voicebot=True holds back the live enrollment, so it needs live_enroll=True"
+            )
         self.cfg, self.step, self.enc = load_model(str(model_dir), num_threads)
         c = self.cfg
         self.win, self.hop = c["win"], c["hop"]
@@ -102,6 +132,13 @@ class OnnxStream:
         self.live = live_enroll
         self.loud_s, self.loud_until = loud_s, loud_within + step_s
         self.step_n = int(step_s * SAMPLE_RATE)
+        self.voicebot, self.jump_db, self.jump_max = voicebot, jump_db, jump_max
+        self.start = self.null
+        if voicebot:  # the decoy's vector, once per model and process
+            key = (str(model_dir), num_threads)
+            if key not in _DECOY_EMB:
+                _DECOY_EMB[key] = self.embed(decoy_clip())
+            self.start = _DECOY_EMB[key]
         self.reset()
 
     def reset(self) -> None:
@@ -116,7 +153,7 @@ class OnnxStream:
         self.states = {
             s["name"]: np.zeros(s["shape"], np.float32) for s in self.cfg["states"]
         }
-        self.emb = self.null.copy()
+        self.emb = self.start.copy()  # no enrollment, or the voicebot mode's decoy
         self.enrolled_at: float | None = None  # seconds in, first enrollment
         self.pending = np.zeros(0, np.float32)
         self.n_in = 0  # input samples stepped
@@ -179,7 +216,15 @@ class OnnxStream:
         # float32 energies and a running sum by convolution, exactly as the
         # evaluated rule computes them: ties included, it picks the same window
         e = (self.hist[: m * self.hop].reshape(m, self.hop) ** 2).mean(1)
-        st = int(np.convolve(e, np.ones(w), "valid").argmax())
+        S = np.convolve(e, np.ones(w), "valid")
+        st = int(S.argmax())
+        if (
+            self.voicebot
+            and self.loud_st is None
+            and t < self.jump_max
+            and 10 * np.log10((S[st] + 1e-12) / (S[0] + 1e-12)) < self.jump_db
+        ):
+            return  # nothing heard yet is clearly louder than the call's first 3 s
         if (st, w) != self.loud_st:
             self.emb = self.embed(self.hist[st * self.hop : (st + w) * self.hop])
             self.loud_st = (st, w)

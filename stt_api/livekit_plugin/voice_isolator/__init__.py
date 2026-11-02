@@ -8,6 +8,7 @@ the noise, before the VAD, the turn detector and the STT hear the call.
 
     backend = LocalIsolator()                          # CPU, in the agent
     backend = RemoteIsolator("ws://gpu-host:8765")     # GPU release, on a server
+    backend = LocalIsolator(voicebot=True)             # an agent that speaks first
 
     room_io.AudioInputOptions(
         sample_rate=16000,

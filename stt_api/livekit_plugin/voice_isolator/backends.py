@@ -25,6 +25,12 @@ Both enroll the caller from the call itself: from 3 s in, the loudest 3 s heard
 so far, re-made every half second, fixed once the call is 15.5 s old. Pass
 `enrollment=` (16 kHz float32, a few seconds of the caller alone) to lock a known
 voice in from the first frame instead.
+
+`voicebot=True` (both) is for an agent that speaks first: until the caller is
+enrolled the model keeps no voice at all, rather than every voice, and the first
+enrollment waits for a voice clearly louder than the call's first 3 s (6 dB, or
+10 s in). Noise and other voices on the line then interrupt the agent's greeting
+less often; a caller who talks from the first second loses part of that first turn.
 """
 
 from __future__ import annotations
@@ -37,6 +43,7 @@ import os
 import threading
 from pathlib import Path
 from typing import Protocol, runtime_checkable
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import numpy as np
 
@@ -77,7 +84,7 @@ class LocalIsolator:
     The CPU model in the agent process, on onnxruntime.
 
     `model` is a Hugging Face repository (default `Scicom-intl/voice-isolator-cpu`,
-    private: an `HF_TOKEN` that can read it) or a local directory with
+    public) or a local directory with
     `config.json`, `step.onnx` and `enroll.onnx`; `VOICE_ISOLATOR_MODEL` overrides
     the default. `quantized=True` takes the 8-bit export from the repository's
     `int8/` folder: about 1.4x cheaper per call, at the price of agreeing with the
@@ -85,6 +92,9 @@ class LocalIsolator:
 
     One instance per process is enough: the sessions are shared and each `open()`
     starts a call from a clean state.
+
+    `voicebot=True`: the voicebot mode (see the module's notes and README.md), for
+    an agent that speaks first.
     """
 
     REPO = "Scicom-intl/voice-isolator-cpu"
@@ -97,7 +107,14 @@ class LocalIsolator:
         num_threads: int = 1,
         live_enroll: bool = True,
         enrollment: np.ndarray | None = None,
+        voicebot: bool = False,
     ) -> None:
+        if voicebot and (enrollment is not None or not live_enroll):
+            raise ValueError(
+                "voicebot=True holds back the live enrollment until the caller is "
+                "heard: it needs live_enroll=True and no enrollment="
+            )
+        self.voicebot = voicebot
         self.model_dir = self._resolve(
             model or os.environ.get("VOICE_ISOLATOR_MODEL") or self.REPO, quantized
         )
@@ -131,11 +148,24 @@ class LocalIsolator:
 
     def open(self) -> OnnxStream:
         s = OnnxStream(
-            self.model_dir, num_threads=self.num_threads, live_enroll=self.live_enroll
+            self.model_dir,
+            num_threads=self.num_threads,
+            live_enroll=self.live_enroll,
+            voicebot=self.voicebot,
         )
         if self.enrollment is not None:
             s.set_enrollment(self.enrollment)
         return s
+
+
+def _with_query(url: str, **params) -> str:
+    """`url` with `params` in its query, replacing any of the same names."""
+    u = urlsplit(url)
+    q = [
+        (k, v) for k, v in parse_qsl(u.query, keep_blank_values=True) if k not in params
+    ]
+    q += [(k, str(v)) for k, v in params.items()]
+    return urlunsplit(u._replace(path=u.path or "/", query=urlencode(q)))
 
 
 # One event loop on one daemon thread carries the WebSockets of every remote call
@@ -174,6 +204,11 @@ class RemoteIsolator:
     at 40 ms steps; `wait_ms=0, max_lag_ms=250` is the old, non-blocking behaviour:
     about 90 ms behind).
 
+    `voicebot=True` asks the server for the voicebot mode on every call (the URL's
+    `?voicebot=1`; `False` sends `?voicebot=0`, `None` leaves it to the server's
+    `--voicebot` default). The server must run `--enroll-loud`; a server older than
+    the mode ignores the request.
+
     `url` defaults to `VOICE_ISOLATOR_URL`. An unreachable server raises at
     `open()`. A connection lost mid-call logs one warning and passes the caller's
     audio through untouched for the rest of the call, so the agent keeps hearing
@@ -190,6 +225,7 @@ class RemoteIsolator:
         enrollment: np.ndarray | None = None,
         wait_ms: float = 30.0,
         max_lag_ms: float = 40.0,
+        voicebot: bool | None = None,
     ) -> None:
         url = url or os.environ.get("VOICE_ISOLATOR_URL")
         self.wait_ms, self.max_lag_ms = wait_ms, max_lag_ms
@@ -197,7 +233,13 @@ class RemoteIsolator:
             raise ValueError(
                 "RemoteIsolator needs url= or VOICE_ISOLATOR_URL (ws://host:port)"
             )
-        self.url = url
+        if voicebot and enrollment is not None:
+            raise ValueError(
+                "voicebot=True holds back the live enrollment until the caller is "
+                "heard: it does not go with enrollment="
+            )
+        self.voicebot = voicebot
+        self.url = url if voicebot is None else _with_query(url, voicebot=int(voicebot))
         self.headers = headers or {}
         self.connect_timeout = connect_timeout
         self.enrollment = (

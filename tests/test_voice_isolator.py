@@ -57,6 +57,20 @@ def with_silences(seconds: float, seed: int = 0, rate: int = 16000) -> np.ndarra
     return np.where(np.sin(2 * np.pi * 1.3 * t) > -0.2, x, 0.0).astype(np.float32)
 
 
+def steady(
+    seconds: float, level: float, seed: int = 0, rate: int = 16000
+) -> np.ndarray:
+    """speechlike() at a steady level: no 3 s of it is much louder than any other."""
+    rng = np.random.default_rng(seed)
+    t = np.arange(int(seconds * rate)) / rate
+    f0 = 140 + 40 * np.sin(2 * np.pi * 0.7 * t)
+    x = sum(np.sin(2 * np.pi * k * np.cumsum(f0) / rate) / k for k in range(1, 6))
+    x = level * (
+        x * (np.sin(2 * np.pi * 1.3 * t) > -0.2) + 0.05 * rng.standard_normal(len(t))
+    )
+    return np.clip(np.rint(x * 32768), -32768, 32767).astype(np.float32) / 32768
+
+
 def frames(x: np.ndarray, rate: int, ms: int):
     n = rate * ms // 1000
     for i in range(0, len(x) - n + 1, n):
@@ -140,6 +154,56 @@ class TestLocal:
         run(vi, speechlike(1.0, seed=4), ms=50, close=False)
         assert vi.enrolled_at == 3.0
 
+    def test_voicebot_starts_on_the_decoy(self):
+        # Until the caller is enrolled the model is told to keep a voice that is in
+        # no call, rather than nothing: another vector, another output.
+        from stt_api.livekit_plugin.voice_isolator.onnx_stream import OnnxStream
+
+        assert not np.allclose(
+            OnnxStream(TINY).emb, OnnxStream(TINY, voicebot=True).emb
+        )
+        x = speechlike(2.0, seed=16)
+        a = run(VoiceIsolator(backend=LocalIsolator(TINY)), x)
+        b = run(VoiceIsolator(backend=LocalIsolator(TINY, voicebot=True)), x)
+        assert np.abs(a - b).max() > 10 * LSB
+
+    def test_voicebot_waits_for_a_voice_over_the_start(self):
+        # One level throughout (the greeting's bed and nobody else): nothing is 6 dB
+        # over the first 3 s, so the first enrollment waits for the 10 s cap; the
+        # default rule takes the same audio at 3 s.
+        x = steady(11.0, 0.05, seed=17)
+        vb = VoiceIsolator(backend=LocalIsolator(TINY, voicebot=True))
+        run(vb, x, close=False)
+        assert vb.enrolled_at == 10.0
+        vb._close()
+        default = VoiceIsolator(backend=LocalIsolator(TINY))
+        run(default, x, close=False)
+        assert default.enrolled_at == 3.0
+        default._close()
+
+    def test_voicebot_enrolls_a_caller_who_comes_in_louder(self):
+        # A bed for 4 s, then a voice 12 dB over it: enrolled within about a second
+        # of the voice, at a half second, once a 3 s window holding it is 6 dB up.
+        x = np.concatenate([steady(4.0, 0.05, seed=18), steady(4.0, 0.2, seed=19)])
+        vi = VoiceIsolator(backend=LocalIsolator(TINY, voicebot=True))
+        run(vi, x, close=False)
+        assert vi.enrolled_at is not None and 4.5 <= vi.enrolled_at <= 6.0
+        vi._close()
+
+    def test_voicebot_needs_the_live_rule(self):
+        with pytest.raises(ValueError):
+            LocalIsolator(TINY, voicebot=True, enrollment=speechlike(3.0))
+        with pytest.raises(ValueError):
+            LocalIsolator(TINY, voicebot=True, live_enroll=False)
+
+    def test_the_decoy_ships_with_the_plugin(self):
+        from stt_api.livekit_plugin.voice_isolator.onnx_stream import DECOY
+
+        d = np.load(DECOY)
+        assert d.dtype == np.int16 and d.shape == (64000,)  # 4 s at 16 kHz
+        assert np.abs(d).max() == 16384  # half of full scale
+        assert (DECOY.parent / "LICENSE.voicebot_decoy").is_file()
+
     def test_a_known_voice_from_the_first_frame(self):
         x = speechlike(2.0, seed=5)
         live = run(VoiceIsolator(backend=LocalIsolator(TINY)), x)
@@ -173,9 +237,16 @@ def halving_server():
     aiohttp = pytest.importorskip("aiohttp")
     from aiohttp import web
 
-    state = {"enroll": [], "close_after": None, "delay": 0.0, "stall": None}
+    state = {
+        "enroll": [],
+        "close_after": None,
+        "delay": 0.0,
+        "stall": None,
+        "query": [],
+    }
 
     async def handler(request):
+        state["query"].append(request.query_string)
         ws = web.WebSocketResponse(max_msg_size=0)
         await ws.prepare(request)
         loop = asyncio.get_running_loop()
@@ -332,6 +403,22 @@ class TestRemote:
         time.sleep(0.1)
         vi._close()
         assert len(state["enroll"]) == 1
+
+    def test_voicebot_rides_on_the_url(self, halving_server):
+        # The server reads the mode from the call's URL when the call opens, so it
+        # holds from the first chunk.
+        url, state = halving_server
+        x = speechlike(0.5, seed=20)
+        run(VoiceIsolator(backend=RemoteIsolator(url, voicebot=True)), x, ms=20)
+        run(VoiceIsolator(backend=RemoteIsolator(url)), x, ms=20)
+        assert state["query"] == ["voicebot=1", ""]
+        assert RemoteIsolator("ws://h:1", voicebot=True).url == "ws://h:1/?voicebot=1"
+        assert (
+            RemoteIsolator("ws://h:1/x?a=b&voicebot=1", voicebot=False).url
+            == "ws://h:1/x?a=b&voicebot=0"
+        )
+        with pytest.raises(ValueError):
+            RemoteIsolator(url, voicebot=True, enrollment=speechlike(3.0))
 
     def test_an_unreachable_server_raises_at_once(self):
         with pytest.raises(ConnectionError):

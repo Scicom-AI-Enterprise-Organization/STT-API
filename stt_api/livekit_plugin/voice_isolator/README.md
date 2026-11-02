@@ -50,12 +50,12 @@ connection, are its own. The backend is shared.
 
 Models:
 
-- `LocalIsolator()` reads `Scicom-intl/voice-isolator-cpu` (private: an `HF_TOKEN` that
-  can read it), or a local directory: `LocalIsolator("/models/voice-isolator-cpu")` or
-  `VOICE_ISOLATOR_MODEL`. `quantized=True` takes the 8-bit export from the repository's
-  `int8/`: about 1.4x cheaper per call (1.6x in 10 ms frames), but it agrees with the
-  float model to about 50 dB, and with itself across frame sizes to about 40 dB, rather
-  than to float rounding, so measure it on your calls before you switch.
+- `LocalIsolator()` reads `Scicom-intl/voice-isolator-cpu` (public), or a local
+  directory: `LocalIsolator("/models/voice-isolator-cpu")` or `VOICE_ISOLATOR_MODEL`.
+  `quantized=True` takes the 8-bit export from the repository's `int8/`: about 1.4x
+  cheaper per call (1.6x in 10 ms frames), but it agrees with the float model to about
+  50 dB, and with itself across frame sizes to about 40 dB, rather than to float
+  rounding, so measure it on your calls before you switch.
 - `RemoteIsolator(url)` or `VOICE_ISOLATOR_URL` points at the GPU server. Build and run it
   from this directory's `Dockerfile`; it serves the release with the model repository's
   own server (`python -m vi.server_mp --enroll-loud --chunk-hops 4`: 40 ms steps for
@@ -91,7 +91,62 @@ The one place context runs short is the start of a call: before 3 s there is no
 speaker vector, and the model runs with its learned "no enrollment" vector. The live
 enrollment counts from the stream's first frame and is fixed at 15.5 s, so a caller who
 says nothing in that time (a long greeting from the agent, a hold) is enrolled on
-whatever the line carried; pass `enrollment=` when you have a clip of the caller.
+whatever the line carried; pass `enrollment=` when you have a clip of the caller, and
+see the voicebot mode below for an agent that speaks first.
+
+## Agents that speak first: the voicebot mode
+
+An agent that greets the caller is interrupted by noise most often during its greeting.
+On a voice-agent benchmark (LiveKit agents with Silero VAD at a deployed agent's
+settings, holding whole conversations with simulated phone callers over babble, street,
+home sounds, music or another voice, through an 8 kHz telephone line; 816 held-out
+calls), the agent's speech before the caller's first word is 11% of its speech but holds
+about half of the false interruptions behind this plugin (57% with `RemoteIsolator`, 48%
+with `LocalIsolator`). In its first second the model lets any voice through, and at 3 s
+the live enrollment takes the loudest 3 s heard so far, which during a greeting is the
+TV, the music or the other person.
+
+`voicebot=True` changes only the start of each call:
+
+- until the caller is enrolled, the model is told to keep a voice that is in no call (a
+  decoy: `resources/voicebot_decoy.npy`, 4 s of LibriTTS-R), so it keeps no voice rather
+  than every voice;
+- the first enrollment waits until the loudest 3 s heard is 6 dB over the call's first
+  3 s (what the line carried during the greeting), or until the call is 10 s old.
+
+```python
+LocalIsolator(voicebot=True)
+RemoteIsolator("ws://gpu-host:8765", voicebot=True)   # each call opens as ?voicebot=1
+```
+
+False interruptions per minute of agent speech on that benchmark, the same 816 calls
+through each; the change with its paired 90% interval over call plans:
+
+| | default | `voicebot=True` | change |
+|---|---|---|---|
+| `RemoteIsolator` (the GPU release) | 1.02 | 0.78 | -0.24 (-0.37 to -0.13) |
+| `LocalIsolator()` | 1.36 | 1.13 | -0.23 (-0.34 to -0.13) |
+| `LocalIsolator(quantized=True)` | 1.36 | 1.13 | -0.23 (-0.34 to -0.14) |
+
+No filter: 2.77. NVIDIA's Real-time RE-USE on a GPU: 0.95, which the GPU release in the
+voicebot mode beats by 0.17 (0.03 to 0.31).
+
+The mode removes 42% of the greeting's false interruptions on the GPU (308 to 180) and
+36% on the CPU (342 to 220), and leaves the rest of the call as it was: after the
+caller's first word the count is the same (233 and 233 on the GPU, 376 and 378 on the
+CPU), and so are the caller's turns the agent never hears (0.6% on the GPU, 0.3% on the
+CPU), the cut-ins it catches (91%) and Whisper's word error rate on the caller's turns
+(13.4% on the GPU; 11.9% and 11.8% on the CPU). The cost falls on a caller who talks
+before the enrollment: one who starts in the first second (an outbound call answered
+with "hello?") loses about a quarter of that first turn on a clean line and nearly a
+third over background noise, against 0-1% by default, and one who cuts into the greeting
+is not heard until their voice is 6 dB over the call's start. So it is for agents that
+speak first, not for agents that wait for the caller.
+
+`RemoteIsolator(voicebot=True)` needs a server that knows the mode: the model
+repository's server has it from 2026-11-02 (rebuild the `Dockerfile`'s image); an older
+one ignores the request and runs the default. `--voicebot` on the server makes it every
+call's default (`voicebot=False` sends `?voicebot=0`).
 
 ## What it does to the agent's VAD
 
