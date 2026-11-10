@@ -20,7 +20,7 @@ Module-scoped notes live beside their code — see
 | `stt_api/livekit_plugin/whisper_stt/` | Whisper STT client that stops silence interrupting the agent |
 | `stt_api/livekit_plugin/noise_cancellation/` | GTCRN filter + `benchmark/` harness |
 | `stt_api/livekit_plugin/voice_isolator/` | voice isolation filter: `LocalIsolator` (CPU, ONNX) / `RemoteIsolator` (GPU server) |
-| `stt_api/livekit_plugin/clearline/` | `ClearlineVAD` (silero drop-in) and `ClearlineNC` (GTCRN drop-in), weights from a pinned private HF revision |
+| `stt_api/livekit_plugin/clearline/` | `ClearlineVAD` (silero drop-in) and `ClearlineNC` (GTCRN drop-in), weights from a pinned HF revision |
 | `stt_api/livekit_plugin/dummy/` | no-op STT/LLM/TTS, useful for agent tests |
 
 ## Repo-wide traps
@@ -160,18 +160,34 @@ speaker stops, so no text detector can beat that. That is the reason
   and `Scicom-intl/Clearline-NC-CPU` (both public; the latter was `Clearline-NC` until
   2026-10-30, an id that redirects; or `CLEARLINE_NC_ONNX_PATH`) at a **pinned
   revision**. A failed download raises at construction, never on the first frame.
-- **The VAD's default threshold is 0.80 with the filter at 0.35** for the release at
-  512-sample windows, 0.85 for the other three graphs: the operating points chosen on
-  development data for the pinned weights, one per (variant, window) in
-  `hub.OPERATING_POINT`, not silero's 0.5. Bump `hub.VAD_REVISION` and
+- **The VAD's default threshold is 0.825 with the filter at 0.35** for the release at
+  512-sample windows (0.875 at 256; the distilled variant 0.825 / 0.35, and 0.75 / 0.5
+  at 256): the operating points chosen on development data for the pinned weights, one
+  per (variant, window) in `hub.OPERATING_POINT`, not silero's 0.5. Bump `hub.VAD_REVISION` and
   `hub.OPERATING_POINT` together; the wrong pair fails silently.
 - **`smoothing_alpha` is LiveKit's `ExpFilter` alpha, the weight of the previous
   value**: 1.0 freezes it and `load()` refuses it, 0 turns it off. This is the
   opposite of how `pulse_vad/`'s option is documented; never copy a value between them.
-- `vad.py` is `livekit-plugins-silero` 1.8.9's stream with the model swapped
-  (Apache-2.0 header kept); keep it in step with upstream rather than editing the
-  state machine. Inference runs inline: the thread-pool hop costs more than the model.
-- `ClearlineNC` defaults to `mode="asr"` (noise kept 20 dB down, 10% of the input mixed
+- `vad.py` began as `livekit-plugins-silero` 1.8.9's stream with the model swapped
+  (Apache-2.0 header kept). Since 2026-11-11 the stream is its own: pending samples in
+  one numpy buffer, a numpy resampler for 8 / 24 / 32 / 48 kHz input, and **one
+  inference for streams of a VAD that are pushed the same frame objects** (an
+  `AgentSession` with a non-streaming STT pushes its own VAD stream and its
+  `StreamAdapter`'s: upstream ran the model twice per window). `_on_window` is
+  upstream's bookkeeping and state machine line for line: keep *that* in step with
+  upstream. `_legacy_task` is upstream's whole loop (other rates, stereo,
+  `inline=False`, `legacy_stream=True`). The code is carried over from the Clearline
+  repo by its `scripts/port_vad_stream.py`; edit there, not here, or the two drift.
+- **The NC plugin's `_out16` is read only at 16 kHz.** Both `GTCRN` and `ClearlineNC`
+  once appended every 16 kHz sample to it on the resampled path too, where nothing
+  took it back: a call at 8 / 24 / 48 kHz got slower every minute. Any new frame path
+  needs a long-call test (`test_a_long_call_holds_no_more_than_a_short_one`,
+  `test_a_resampled_call_keeps_nothing_it_has_handed_back`).
+- `ClearlineNC` reads two graphs of the same function: the fused one the pin ships
+  (first input `ri`, rows of real and imaginary parts, up to 16 hops a call) and the
+  plain one (`spec`; the Hub repo's `plain/`). An older plugin cannot read the fused
+  graph: bump `NC_REVISION` only together with this code.
+- `ClearlineNC` defaults to `mode="asr"` (noise kept 20 dB down, 70% of the input mixed
   back): it costs Whisper less than GTCRN; `mode="quality"` removes more noise and
   costs Whisper more through a phone path. Both are registered in the NC benchmark as
   `clearline` / `clearline_quality`.

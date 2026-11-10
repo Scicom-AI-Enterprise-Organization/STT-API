@@ -226,6 +226,125 @@ def test_streams_do_not_share_state(vad_weights):
     assert _events(vad, x, RATE) == _events(vad, x, RATE)
 
 
+def _all_events(vad, x: np.ndarray, rate: int, streams: int = 1, frame_ms: int = 10):
+    """Every event of `streams` streams of one VAD pushed the same frame objects, as an
+    AgentSession pushes its own VAD stream and its StreamAdapter's."""
+
+    async def go():
+        ss = [vad.stream() for _ in range(streams)]
+        rows: list[list[tuple]] = [[] for _ in ss]
+
+        async def drain(i):
+            async for ev in ss[i]:
+                rows[i].append(
+                    (
+                        ev.type.value,
+                        ev.samples_index,
+                        round(ev.timestamp, 6),
+                        round(ev.speech_duration, 6),
+                        round(ev.silence_duration, 6),
+                        round(float(ev.probability), 6),
+                        ev.speaking,
+                    )
+                )
+
+        tasks = [asyncio.create_task(drain(i)) for i in range(streams)]
+        n = rate * frame_ms // 1000
+        pcm = np.clip(np.rint(x * 32767.0), -32768, 32767).astype(np.int16)
+        for k in range(0, len(pcm) - n + 1, n):
+            f = rtc.AudioFrame(pcm[k : k + n].tobytes(), rate, 1, n)
+            for s in ss:
+                s.push_frame(f)
+            await asyncio.sleep(0)
+        for s in ss:
+            s.end_input()
+        await asyncio.gather(*tasks)
+        for s in ss:
+            await s.aclose()
+        return rows
+
+    return asyncio.run(go())
+
+
+@pytest.mark.parametrize("variant", ["release", "distilled"])
+def test_a_sessions_two_streams_run_the_model_once(vad_weights, variant):
+    # A non-streaming STT gets a StreamAdapter, which opens a second stream of the
+    # session's VAD on the same frames. Upstream's loop runs the model for each; here
+    # they share one inference, and each must still emit exactly what it would alone.
+    x = np.concatenate(
+        [np.zeros(24000, np.float32), load_speech(24000), np.zeros(24000, np.float32)]
+    )
+    one = _vad(variant=variant)
+    alone = _all_events(one, x, 24000)[0]
+    two = _vad(variant=variant)
+    a, b = _all_events(two, x, 24000, streams=2)
+    assert a == alone and b == alone
+    assert any(r[0] == "start_of_speech" for r in alone)
+    assert two.windows_inferred == one.windows_inferred
+    old = _vad(variant=variant, legacy_stream=True)
+    _all_events(old, x, 24000, streams=2)
+    assert old.windows_inferred == 2 * one.windows_inferred
+
+
+def test_at_16k_the_stream_is_upstreams_loop_value_for_value(vad_weights):
+    # At the model's own rate nothing is resampled, so the rewritten stream must give
+    # upstream's events exactly; at other rates the resampler is this plugin's own
+    # (numpy) and the probabilities differ in the third decimal.
+    x = np.concatenate(
+        [np.zeros(RATE, np.float32), load_speech(RATE), np.zeros(RATE, np.float32)]
+    )
+    new = _all_events(_vad(), x, RATE)[0]
+    assert len(new) > 100
+    assert new == _all_events(_vad(legacy_stream=True), x, RATE)[0]
+
+
+def test_unrelated_streams_share_nothing_and_keep_their_books_small(vad_weights):
+    # Streams of different calls on one VAD object get their own frame objects, so each
+    # runs its own model. Each still asks every older engine, now and then, whether it
+    # hears the same frames: two dictionary lookups (a scan of each engine's last 128
+    # frames cost 9% more CPU than upstream's loop at 32 streams), in dictionaries that
+    # hold no more than the frames they index, also when one frame object is pushed
+    # again and again (a cached frame of silence).
+    vad = _vad()
+    speech = load_speech(RATE)
+    pcm = np.clip(np.rint(np.tile(speech, 8) * 32767.0), -32768, 32767).astype(np.int16)
+    n, calls, turns = 320, 5, 700
+    silent = rtc.AudioFrame(bytes(2 * n), RATE, 1, n)
+    seen: dict[str, int] = {}
+
+    async def go():
+        ss = [vad.stream() for _ in range(calls)]
+
+        async def drain(s):
+            async for _ in s:
+                pass
+
+        tasks = [asyncio.create_task(drain(s)) for s in ss]
+        for k in range(turns):
+            for i, s in enumerate(ss):
+                if i == 0 and 200 <= k < 500:
+                    s.push_frame(silent)  # one object, three hundred times
+                else:
+                    a = (k + 37 * i) * n
+                    s.push_frame(rtc.AudioFrame(pcm[a : a + n].tobytes(), RATE, 1, n))
+            await asyncio.sleep(0)
+        seen["engines"] = len(vad._engines)
+        seen["at"] = max(len(e.at) for e in vad._engines)
+        seen["ring"] = max(e.RING for e in vad._engines)
+        seen["recent"] = max(len(s._recent_at) for s in ss)
+        for s in ss:
+            s.end_input()
+        await asyncio.gather(*tasks)
+        for s in ss:
+            await s.aclose()
+
+    asyncio.run(go())
+    assert seen["engines"] == calls
+    assert vad.windows_inferred == calls * (turns * n // 512)
+    assert seen["at"] <= seen["ring"] and seen["recent"] <= 64
+    assert not vad._engines  # every engine went with its stream
+
+
 # --- the noise filter -----------------------------------------------------------
 
 
@@ -352,3 +471,44 @@ def test_disabled_flag_is_honoured(nc_weights):
 def test_streams_do_not_share_recurrent_state(nc_weights):
     x = load_speech(RATE)[: 2 * RATE]
     assert np.array_equal(run(_nc(), x, RATE), run(_nc(), x, RATE))
+
+
+@pytest.mark.parametrize("mode", ["asr", "quality"])
+@pytest.mark.parametrize("rate", [16000, 24000, 48000, 8000])
+def test_a_long_call_holds_no_more_than_a_short_one(nc_weights, mode, rate):
+    # The first version appended every 16 kHz sample it produced to a buffer that only
+    # the 16 kHz path ever read: at any other room rate it grew for the whole call and
+    # was rebuilt on every frame, so a ten-minute 48 kHz call cost seven times more per
+    # frame at its end than at its start.
+    nc = _nc(mode=mode)
+    x = np.tile(load_speech(rate), 6)[: 20 * rate]
+    run(nc, x[: 2 * rate], rate)
+    held = (nc._in16.n, nc._out16.n, nc._out_native.n)
+    cap = (nc._in16.a.size, nc._out16.a.size, nc._out_native.a.size)
+    run(nc, x[2 * rate :], rate)
+    assert max(nc._in16.n, nc._out16.n) <= 2 * 512
+    assert nc._out_native.n <= max(held[2], rate // 10)
+    assert (nc._in16.a.size, nc._out16.a.size, nc._out_native.a.size) == cap
+
+
+@pytest.mark.parametrize("mode", ["asr", "quality"])
+def test_the_pin_ships_fused_graphs_and_the_plain_ones_still_read(nc_weights, mode):
+    # Since 2026-11-11 the pinned files are fused graphs (first input "ri": the same
+    # weights and function with a third of the operators). The plain graphs, which a
+    # plugin before that date needs, are in the repository's plain/ folder; this
+    # plugin reads either and they must give the same samples, within one step of the
+    # 16-bit scale.
+    import onnxruntime as ort
+
+    first = ort.InferenceSession(
+        nc_weights[mode], providers=["CPUExecutionProvider"]
+    ).get_inputs()[0]
+    assert first.name == "ri"
+    plain = _weights_or_skip(
+        lambda: hub._fetch(hub.NC_REPO, f"plain/{hub.NC_FILES[mode]}", hub.NC_REVISION)
+    )
+    x = load_speech(RATE)[: 3 * RATE]
+    a = run(_nc(mode=mode), x, RATE)
+    b = run(_nc(mode=mode, model_path=plain), x, RATE)
+    assert a.shape == b.shape
+    assert np.max(np.abs(a - b)) <= 1.01 / 32768.0

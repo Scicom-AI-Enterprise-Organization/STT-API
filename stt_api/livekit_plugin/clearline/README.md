@@ -39,7 +39,7 @@ await session.start(
 )
 ```
 
-Tested (`tests/test_clearline.py`, 49 tests) on `livekit-agents` 1.2.18, 1.3.11 and
+Tested (`tests/test_clearline.py`, 63 tests) on `livekit-agents` 1.2.18, 1.3.11 and
 1.8.9, the range the `scicom-livekit-plugin` extra allows.
 
 The weights live in public Hugging Face repositories, `Scicom-intl/Clearline-VAD` and
@@ -64,6 +64,7 @@ Xeon server through ONNX Runtime with one thread. `load()` takes silero's option
 | `smoothing_alpha` | 0.35 | LiveKit's ExpFilter alpha (0.5 for the distilled variant at 256 samples); **0 turns it off, 1 is refused** (see below) |
 | `variant` | `"release"` | `"distilled"`: the better frame classifier (96 units; ahead of silero through all five telephone codecs and in noisy rooms), ends turns a little later |
 | `inline` | True | run the model on the event loop: the call costs less than the thread-pool hop |
+| `legacy_stream` | False | upstream's stream loop for every stream (LiveKit's resampler once per frame, one inference per stream); see "The stream" |
 | `onnx_file_path`, `revision` | | a local graph, or another Hugging Face revision |
 
 Against silero v6 on thirteen test sets (meetings, broadcast, films, earnings calls,
@@ -102,6 +103,33 @@ behind (0.924). The distilled variant misses distant talkers in far-field meetin
 its mean onset delay above is mostly CHiME-6's dinner parties, where it catches 6% of
 turns, 2.7 s late (silero v6 15%, at 0.5 s). Use the release for meetings.
 
+### The stream
+
+Until 2026-11-11 the stream around the model was `livekit-plugins-silero`'s with the
+model swapped, and most of what a call's VAD cost was that loop, not the model: 60 us
+of a 303 us window at 24 kHz. Now pending samples sit in one numpy buffer, a window is
+resampled in numpy (8, 24, 32 and 48 kHz input; any other rate, stereo, or
+`inline=False` takes upstream's loop), and **streams of one VAD that are pushed the
+same frame objects share one inference**. An `AgentSession` with a non-streaming STT
+(ours: `WhisperSTT`) pushes every frame to its own VAD stream and to its
+`StreamAdapter`'s, so upstream's loop ran the model twice per window. Each stream
+keeps its own filter, state machine, speech buffer and events; at 16 kHz the events
+are upstream's value for value, at the other rates the same turns within two windows.
+`vad.windows_inferred` counts model calls.
+
+| CPU for a call's VAD, us per 32 ms of audio | silero v6 | Clearline, upstream's loop | Clearline |
+|---|---|---|---|
+| one stream, 16 kHz room | 307 | 178 | **155** |
+| one stream, 24 kHz room (LiveKit's default) | 459 | 303 | **168** |
+| the agent's two streams, 16 kHz | 588 | 323 | **182** |
+| the agent's two streams, 24 kHz | 887 | 569 | **197** |
+
+Inside a `livekit-agents` 1.3.11 agent with the dummy STT, LLM and TTS (each call its
+own process, 50 calls per VAD side by side) the VAD's part of a call falls from 3.0%
+of a core to 1.6% (silero v6 4.3%; 1.8.9: 2.8% to 1.8%, silero 5.7%), and an
+eight-core worker holds about 83 calls at LiveKit's 0.7 load limit, where it held
+about 71 (silero v6 about 58).
+
 ## `ClearlineNC`
 
 A band-gain and deep-filter enhancer on GTCRN's STFT (512-point sqrt-Hann, 256 hop,
@@ -114,15 +142,16 @@ A band-gain and deep-filter enhancer on GTCRN's STFT (512-point sqrt-Hann, 256 h
 |---|---|---|---|
 | VoiceBank+DEMAND PESQ / SI-SDR | 2.535 / 14.6 dB | **2.575 / 17.4 dB** | 2.135 / 10.5 dB |
 | DNS 2020 synthetic PESQ / ESTOI | 2.293 / 0.872 | **2.389 / 0.886** | 1.697 / 0.827 |
-| real-time factor; p99 per 20 ms frame | 0.064; 3.24 ms | 0.025; 0.72 ms | **0.016; 0.46 ms** |
+| CPU per 20 ms frame at 16 kHz, one core (paired, quiet server) | 1.09 ms | 0.38 ms | **0.19 ms** |
+| plugin CPU per stream at real-time pace, 8 streams, 16 kHz / 48 kHz room (% of a core) | 6.20 / 6.83 | 2.50 / 3.28 | **1.51 / 2.49** |
 | Whisper large-v3 WER, all 824 VoiceBank utterances, wideband / phone path | 2.65% / 4.26% | 2.32% / 5.79% | **1.55% / 2.90%** |
 | Whisper large-v3 WER, DNS 2020 synthetic (150 clips) | 5.30% | 6.48% | **5.02%** |
 
 (Unprocessed: 1.45% / 2.95% on VoiceBank, 5.38% on DNS. Neither mode is trained on
 VoiceBank, VCTK or DEMAND. Since 2026-10-30 the quality mode is the larger graph, 256
 units with per-bin levels and gains, distilled from a GPU model that removes background
-noise and keeps every voice, `Scicom-intl/Clearline-NC-GPU`; it costs about half of
-GTCRN's CPU per stream, the ASR mode about a third.) Every WER here is on the
+noise and keeps every voice, `Scicom-intl/Clearline-NC-GPU`; a frame of it costs about
+a third of GTCRN's CPU, of the ASR mode about a sixth.) Every WER here is on the
 benchmark's harness as fixed: a streaming filter's output is flushed and aligned
 before Whisper hears it (`../noise_cancellation/benchmark/README.md`); before
 2026-10-27 the harness cut each utterance's last 32 ms for every streaming filter.
@@ -154,6 +183,26 @@ python -m stt_api.livekit_plugin.noise_cancellation.benchmark --corpus voicebank
     --models gtcrn,clearline,clearline_quality --limit 0
 ```
 
+### The graphs and the buffers (2026-11-11)
+
+The pinned revision ships both models as **fused graphs**: the same function with a
+third of the operators (the plain graph spent two thirds of a call on bookkeeping for
+calls of any length), equal to the plain graphs within one LSB through the plugin and
+to the fourth decimal on the three test corpora. The plain graphs are in the
+repository's `plain/` folder and the plugin reads either (the fused graph's first
+input is named `ri`, the plain one's `spec`). The plugin also keeps its samples in
+arrays written in place now. Together a 20 ms frame of the quality mode costs 0.35 of
+GTCRN's CPU where it cost 0.44, and of the ASR mode 0.17 where it cost 0.27; the
+output is the first version's, sample for sample.
+
+And a fault is gone. At any room rate but 16 kHz the plugin kept every 16 kHz sample
+it had already resampled and rebuilt that array on every frame, so a call's frames
+cost more the longer it ran: at 48 kHz, 0.69 ms a frame in a call's first minute and
+4.8 ms in its tenth (now 0.46 ms throughout). `GTCRN`, whose frame path this plugin
+was adapted from, had the same fault (1.5 ms in the first minute, 2.9 ms in the
+sixth) and is fixed with it. At 16 kHz, which the snippet above asks for, nothing
+grew.
+
 ## Traps
 
 - **The default threshold is 0.825, not silero's 0.5.** The models are calibrated
@@ -167,6 +216,12 @@ python -m stt_api.livekit_plugin.noise_cancellation.benchmark --corpus voicebank
   previous value, so silero's 0.35 keeps 65% of each new probability and 1.0 would
   freeze the filter on the first window. `load()` refuses 1.0. `PulseVAD`'s option
   of the same name is documented the other way round: do not copy a value across.
+- **A room that is not 16 kHz.** Before 2026-11-11 both noise filters slowed down
+  through every call at 8, 24 or 48 kHz (above). Fixed; 16 kHz is still the cheapest
+  rate for both plugins, since nothing is resampled.
+- **Two streams share a model only on the same frame objects.** The VAD's shared
+  inference keys on identity: a wrapper that copies frames before one of the two
+  streams gets them gives each stream its own model again (correct, twice the cost).
 - **One `ClearlineNC` per audio stream.** The recurrent state is per instance (the
   ONNX session is shared); the `lambda params: ClearlineNC()` factory is what
   LiveKit calls once per stream.

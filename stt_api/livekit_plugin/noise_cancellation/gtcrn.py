@@ -219,7 +219,12 @@ class GTCRN(rtc.FrameProcessor[rtc.AudioFrame]):
         if rate == MODEL_SAMPLE_RATE:
             pcm = np.frombuffer(frame.data, dtype=np.int16, count=n)
             self._in16 = np.concatenate((self._in16, pcm.astype(np.float32) / 32768.0))
-            self._run_hops()
+            # Only this path reads `_out16`. The resampled path hands its 16 kHz
+            # output to the up-resampler instead; appended there as well (as
+            # `_run_hops` used to do on every path) nothing ever took it back, so the
+            # buffer grew for the whole call and was rebuilt on every frame: a 48 kHz
+            # call cost 1.5 ms a frame in its first minute and 2.9 ms in its sixth.
+            self._out16 = np.concatenate((self._out16, self._run_hops()))
             y = self._take(n, at_native_rate=False)
         else:
             self._ensure_resamplers(rate)
@@ -319,9 +324,7 @@ class GTCRN(rtc.FrameProcessor[rtc.AudioFrame]):
 
         if not out:
             return np.zeros(0, dtype=np.float32)
-        produced = np.concatenate(out)
-        self._out16 = np.concatenate((self._out16, produced))
-        return produced
+        return np.concatenate(out)
 
     def _take(self, n: int, *, at_native_rate: bool) -> np.ndarray:
         buf = self._out_native if at_native_rate else self._out16

@@ -25,6 +25,14 @@ GPU model (Scicom-intl/Clearline-NC-GPU) that removes background noise and keeps
 voice: VoiceBank+DEMAND PESQ 2.575 and DNS 2020 synthetic 2.389, against GTCRN's 2.535
 and 2.293, at about half GTCRN's CPU. Neither mode is trained on VoiceBank, VCTK or
 DEMAND.
+
+The model file is one of two graphs of the same function: the fused graph (a third of
+the operators; its first input is named "ri"), which the pinned revision ships, or the
+plain one (first input "spec"). The samples around the model sit in arrays written in
+place: the first version joined a new array for every buffer on every frame, and at any
+room rate but 16 kHz it never let go of the 16 kHz output it had already resampled, so
+a call's frames grew slower the longer it ran. The output is the first version's,
+sample for sample.
 """
 
 from __future__ import annotations
@@ -48,6 +56,49 @@ _MIX_BACK = {"asr": 0.7, "quality": 0.0}
 _PRIME_16K = _HOP
 _NATIVE_SLACK_MS = 5
 _MAX_PRIME_ROUNDS = 40
+
+
+_INV = np.float32(
+    1.0 / 32768.0
+)  # int16 -> [-1, 1): a power of two, so the product is the quotient exactly
+_EMPTY = np.zeros(0, dtype=np.float32)
+
+
+class _Fifo:
+    """float32 samples in at the end, out at the front, in one array."""
+
+    __slots__ = ("a", "n")
+
+    def __init__(self, primed: int = 0, cap: int = 4096) -> None:
+        self.a = np.zeros(max(cap, primed), dtype=np.float32)
+        self.n = primed  # samples held (the first `primed` are zeros)
+
+    def room(self, k: int) -> np.ndarray:
+        """The next k samples to write; `self.n += k` once they are written."""
+        if self.n + k > self.a.size:
+            a = np.zeros(max(2 * self.a.size, self.n + k), dtype=np.float32)
+            a[: self.n] = self.a[: self.n]
+            self.a = a
+        return self.a[self.n : self.n + k]
+
+    def push(self, x: np.ndarray) -> None:
+        self.room(x.size)[:] = x
+        self.n += x.size
+
+    def push_int16(self, pcm: np.ndarray) -> None:
+        np.multiply(pcm, _INV, out=self.room(pcm.size))
+        self.n += pcm.size
+
+    def drop(self, k: int) -> None:
+        rest = self.n - k
+        if rest > 0:
+            self.a[:rest] = self.a[k : self.n]
+        self.n = max(rest, 0)
+
+    def take(self, k: int) -> np.ndarray:
+        head = self.a[:k].copy()
+        self.drop(k)
+        return head
 
 
 def _sqrt_hann(n: int) -> np.ndarray:
@@ -102,8 +153,14 @@ class ClearlineNC(rtc.FrameProcessor[rtc.AudioFrame]):
             hub.nc_model_path(mode, model_path, revision), num_threads
         )
         ins = self._sess.get_inputs()
+        self._fast = (
+            ins[0].name == "ri"
+        )  # the fused graph: each hop's spectrum as a real row and an imaginary row
         self._state_names = [i.name for i in ins[1:]]
         meta = self._sess.get_modelmeta().custom_metadata_map
+        self._max_hops = (
+            int(meta.get("max_hops", "1")) if self._fast else 0
+        )  # hops one call of that graph takes
         init = {
             "band_m": float(meta.get("band_m0", -60.0)),
             "df_m": float(meta.get("df_m0", 1e-3)),
@@ -115,14 +172,21 @@ class ClearlineNC(rtc.FrameProcessor[rtc.AudioFrame]):
             for i in ins[1:]
         }
         self._win = _sqrt_hann(_N_FFT)
-        self._analysis = np.zeros(_N_FFT - _HOP, dtype=np.float32)  # the previous hop
-        self._ola = np.zeros(_N_FFT, dtype=np.float32)
-        self._in16 = np.zeros(0, dtype=np.float32)
-        self._out16 = np.zeros(_PRIME_16K, dtype=np.float32)
+        self._prev = np.zeros(
+            _N_FFT - _HOP, dtype=np.float32
+        )  # the previous hop: the first half of the next frame
+        self._tail = np.zeros(
+            _HOP, dtype=np.float32
+        )  # the second half of the last synthesis frame, still to be added
+        self._frames: dict[
+            int, np.ndarray
+        ] = {}  # work arrays [T, 512], one per number of hops in a call
+        self._in16 = _Fifo()
+        self._out16 = _Fifo(primed=_PRIME_16K)
         self._native_rate: int | None = None
         self._down: rtc.AudioResampler | None = None
         self._up: rtc.AudioResampler | None = None
-        self._out_native = np.zeros(0, dtype=np.float32)
+        self._out_native = _Fifo()
         self._warned_channels = False
         self._warned_underrun = False
 
@@ -149,9 +213,8 @@ class ClearlineNC(rtc.FrameProcessor[rtc.AudioFrame]):
                 )
             return frame
         if rate == MODEL_SAMPLE_RATE:
-            pcm = np.frombuffer(frame.data, dtype=np.int16, count=n)
-            self._in16 = np.concatenate((self._in16, pcm.astype(np.float32) / 32768.0))
-            self._run_hops()
+            self._in16.push_int16(np.frombuffer(frame.data, dtype=np.int16, count=n))
+            self._out16.push(self._run_hops())
             y = self._take(n, native=False)
         else:
             self._ensure_resamplers(rate)
@@ -162,47 +225,67 @@ class ClearlineNC(rtc.FrameProcessor[rtc.AudioFrame]):
         return rtc.AudioFrame(pcm_out.tobytes(), rate, channels, n)
 
     def _run_hops(self) -> np.ndarray:
-        """Every whole hop in the input buffer, through one model call."""
-        T = self._in16.size // _HOP
+        """Every whole hop in the input buffer, through one model call: the 16 kHz samples they produce."""
+        T = self._in16.n // _HOP
         if T == 0:
-            return np.zeros(0, dtype=np.float32)
-        new, self._in16 = self._in16[: T * _HOP], self._in16[T * _HOP :]
-        buf = np.concatenate((self._analysis, new))  # 256 + T * 256
-        idx = np.arange(_N_FFT)[None, :] + _HOP * np.arange(T)[:, None]
-        spec = np.fft.rfft(buf[idx] * self._win, axis=-1)  # [T, 257]
-        feed = {
-            "spec": np.stack((spec.real, spec.imag), -1).astype(np.float32),
-            **self._state,
-        }
-        out, *st = self._sess.run(None, feed)
-        self._state = dict(zip(self._state_names, st))
+            return _EMPTY
+        fr = self._frames.get(T)
+        if fr is None:
+            fr = self._frames[T] = np.empty((T, _N_FFT), dtype=np.float32)
+        fr[:, _HOP:] = self._in16.a[: T * _HOP].reshape(
+            T, _HOP
+        )  # frame t: the hop before it, then its own
+        fr[0, :_HOP] = self._prev
+        if T > 1:
+            fr[1:, :_HOP] = fr[:-1, _HOP:]
+        self._prev[:] = fr[-1, _HOP:]
+        self._in16.drop(T * _HOP)
+        spec = np.fft.rfft(fr * self._win, axis=-1)  # [T, 257]
+        if self._fast:
+            ri = np.empty((T, 2, spec.shape[1]), dtype=np.float32)
+            ri[:, 0], ri[:, 1] = spec.real, spec.imag
+            feed, names, outs = self._state, self._state_names, []
+            for a in range(0, T, self._max_hops):
+                feed["ri"] = ri[a : a + self._max_hops]
+                out, *st = self._sess.run(None, feed)
+                for k, v in zip(names, st):
+                    feed[k] = v
+                outs.append(out)
+            del feed["ri"]
+            out = outs[0] if len(outs) == 1 else np.concatenate(outs)
+            enh = np.empty((T, out.shape[2]), dtype=np.complex64)
+            enh.real, enh.imag = out[:, 0], out[:, 1]
+        else:
+            feed = {
+                "spec": np.stack((spec.real, spec.imag), -1).astype(
+                    np.float32, copy=False
+                ),
+                **self._state,
+            }
+            out, *st = self._sess.run(None, feed)
+            self._state = dict(zip(self._state_names, st))
+            enh = np.empty(out.shape[:2], dtype=np.complex64)
+            enh.real, enh.imag = out[..., 0], out[..., 1]
         wave = (
-            np.fft.irfft(out[..., 0] + 1j * out[..., 1], n=_N_FFT, axis=-1).astype(
-                np.float32
-            )
+            np.fft.irfft(enh, n=_N_FFT, axis=-1).astype(np.float32, copy=False)
             * self._win
         )
         if self._mix:
-            wave = (1 - self._mix) * wave + self._mix * buf[idx] * self._win * self._win
-        produced = np.empty(T * _HOP, dtype=np.float32)
-        ola = self._ola
-        for t in range(T):  # overlap-add, one hop out per frame
-            ola += wave[t]
-            produced[t * _HOP : (t + 1) * _HOP] = ola[:_HOP]
-            ola = np.concatenate((ola[_HOP:], np.zeros(_HOP, dtype=np.float32)))
-        self._ola = ola
-        self._analysis = buf[-(_N_FFT - _HOP) :]
-        self._out16 = np.concatenate((self._out16, produced))
-        return produced
+            wave = (1 - self._mix) * wave + self._mix * fr * self._win * self._win
+        # overlap-add at half a window: each hop out is the first half of its frame over the second half of the one
+        # before
+        produced = np.empty((T, _HOP), dtype=np.float32)
+        np.add(self._tail, wave[0, :_HOP], out=produced[0])
+        if T > 1:
+            np.add(wave[:-1, _HOP:], wave[1:, :_HOP], out=produced[1:])
+        self._tail[:] = wave[-1, _HOP:]
+        return produced.reshape(-1)
 
     # ----------------------------------------------------------------- rate conversion (as GTCRN's plugin)
     def _feed_down(self, data) -> None:
         for out in self._down.push(data):  # type: ignore[union-attr]
-            chunk = np.frombuffer(
-                out.data, dtype=np.int16, count=out.samples_per_channel
-            )
-            self._in16 = np.concatenate(
-                (self._in16, chunk.astype(np.float32) / 32768.0)
+            self._in16.push_int16(
+                np.frombuffer(out.data, dtype=np.int16, count=out.samples_per_channel)
             )
 
     def _emit_up(self, produced: np.ndarray) -> None:
@@ -210,11 +293,8 @@ class ClearlineNC(rtc.FrameProcessor[rtc.AudioFrame]):
             return
         pcm = np.clip(np.rint(produced * 32768.0), -32768, 32767).astype(np.int16)
         for out in self._up.push(bytearray(pcm.tobytes())):  # type: ignore[union-attr]
-            chunk = np.frombuffer(
-                out.data, dtype=np.int16, count=out.samples_per_channel
-            )
-            self._out_native = np.concatenate(
-                (self._out_native, chunk.astype(np.float32) / 32768.0)
+            self._out_native.push_int16(
+                np.frombuffer(out.data, dtype=np.int16, count=out.samples_per_channel)
             )
 
     def _ensure_resamplers(self, rate: int) -> None:
@@ -227,41 +307,37 @@ class ClearlineNC(rtc.FrameProcessor[rtc.AudioFrame]):
         self._up = rtc.AudioResampler(
             MODEL_SAMPLE_RATE, rate, num_channels=1, quality=AudioResamplerQuality.QUICK
         )
-        self._out_native = np.zeros(0, dtype=np.float32)
+        self._out_native = _Fifo()
         target = _HOP * rate // MODEL_SAMPLE_RATE + rate * _NATIVE_SLACK_MS // 1000
         silence = bytearray(np.zeros(rate // 100, dtype=np.int16).tobytes())
         for _ in range(_MAX_PRIME_ROUNDS):
-            if self._out_native.size >= target:
+            if self._out_native.n >= target:
                 break
             self._feed_down(silence)
             self._emit_up(self._run_hops())
 
     def _take(self, n: int, *, native: bool) -> np.ndarray:
         buf = self._out_native if native else self._out16
-        if buf.size < n:
-            if native:
+        if buf.n < n:
+            if native:  # the resamplers are behind: silence in front of what there is, with some slack
                 rate = self._native_rate or MODEL_SAMPLE_RATE
                 slack = (
                     _HOP * rate // MODEL_SAMPLE_RATE + rate * _NATIVE_SLACK_MS // 1000
                 )
-                buf = np.concatenate(
-                    (np.zeros(n - buf.size + slack, dtype=np.float32), buf)
-                )
+                have = buf.a[: buf.n].copy()
+                buf.n = 0
+                buf.push(np.zeros(n - have.size + slack, dtype=np.float32))
+                buf.push(have)
             else:
                 if not self._warned_underrun:
                     self._warned_underrun = True
                     logger.warning(
-                        "Clearline-NC output underrun (%d < %d): padding", buf.size, n
+                        "Clearline-NC output underrun (%d < %d): padding", buf.n, n
                     )
-                buf = np.concatenate((buf, np.zeros(n - buf.size, dtype=np.float32)))
-        head, rest = buf[:n], buf[n:]
-        if native:
-            self._out_native = rest
-        else:
-            self._out16 = rest
-        return head
+                buf.push(np.zeros(n - buf.n, dtype=np.float32))
+        return buf.take(n)
 
     def _close(self) -> None:
         self._state = {}
-        self._in16 = self._out16 = self._out_native = np.zeros(0, dtype=np.float32)
+        self._in16, self._out16, self._out_native = _Fifo(), _Fifo(), _Fifo()
         self._down = self._up = None
