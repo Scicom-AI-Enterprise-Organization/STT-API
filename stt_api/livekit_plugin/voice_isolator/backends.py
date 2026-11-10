@@ -47,7 +47,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import numpy as np
 
-from .onnx_stream import OnnxStream, load_model
+from .onnx_stream import OnnxStream, load_model, parse_gate
 
 __all__ = ["Backend", "LocalIsolator", "RemoteIsolator", "Stream"]
 
@@ -84,7 +84,8 @@ class LocalIsolator:
     The CPU model in the agent process, on onnxruntime.
 
     `model` is a Hugging Face repository (default `Scicom-intl/voice-isolator-cpu`,
-    public) or a local directory with
+    public), a folder of one (`Scicom-intl/voice-isolator-cpu/agent`: the agent
+    model) or a local directory with
     `config.json`, `step.onnx` and `enroll.onnx`; `VOICE_ISOLATOR_MODEL` overrides
     the default. `quantized=True` takes the 8-bit export from the repository's
     `int8/` folder: about 1.4x cheaper per call, at the price of agreeing with the
@@ -95,6 +96,10 @@ class LocalIsolator:
 
     `voicebot=True`: the voicebot mode (see the module's notes and README.md), for
     an agent that speaks first.
+
+    `gate`: the agent model's presence gate (see onnx_stream.py). "auto" (default)
+    takes the model's own setting, none for a model without a presence head; "off"
+    runs the agent model without it; "THETA:HOLD:THETA_OFF:KEEP_DB" sets another.
     """
 
     REPO = "Scicom-intl/voice-isolator-cpu"
@@ -108,6 +113,7 @@ class LocalIsolator:
         live_enroll: bool = True,
         enrollment: np.ndarray | None = None,
         voicebot: bool = False,
+        gate: str | None = "auto",
     ) -> None:
         if voicebot and (enrollment is not None or not live_enroll):
             raise ValueError(
@@ -115,6 +121,7 @@ class LocalIsolator:
                 "heard: it needs live_enroll=True and no enrollment="
             )
         self.voicebot = voicebot
+        self.gate = gate
         self.model_dir = self._resolve(
             model or os.environ.get("VOICE_ISOLATOR_MODEL") or self.REPO, quantized
         )
@@ -125,7 +132,12 @@ class LocalIsolator:
         )
         # Open the sessions now: a model that cannot load fails at session start,
         # not as audio passed through untouched on the first frame.
-        load_model(self.model_dir, num_threads)
+        cfg = load_model(self.model_dir, num_threads)[0]
+        if gate != "auto" and parse_gate(gate) is not None and not cfg.get("gate_out"):
+            raise ValueError(
+                f"gate={gate!r} needs a model exported with its presence head (the "
+                f"agent model); {self.model_dir} has none"
+            )
 
     @staticmethod
     def _resolve(model: str, quantized: bool) -> str:
@@ -133,10 +145,17 @@ class LocalIsolator:
         if not d.is_dir():
             from huggingface_hub import snapshot_download
 
+            # ORG/REPO, or ORG/REPO/FOLDER for a model in a folder of the repository
+            parts = model.strip("/").split("/")
+            repo, sub = "/".join(parts[:2]), "/".join(parts[2:])
             files = ["config.json", "step.onnx", "enroll.onnx"]
             if quantized:
                 files = [f"int8/{f}" for f in files]
-            d = Path(snapshot_download(model, allow_patterns=files))
+            if sub:
+                files = [f"{sub}/{f}" for f in files]
+            d = Path(snapshot_download(repo, allow_patterns=files))
+            if sub:
+                d = d / sub
         if quantized and (d / "int8" / "config.json").is_file():
             d = d / "int8"
         if not (d / "config.json").is_file():
@@ -152,6 +171,7 @@ class LocalIsolator:
             num_threads=self.num_threads,
             live_enroll=self.live_enroll,
             voicebot=self.voicebot,
+            gate=self.gate,
         )
         if self.enrollment is not None:
             s.set_enrollment(self.enrollment)

@@ -31,6 +31,17 @@ first enrollment the model is told to keep a decoy, a voice that is in no call
 the first enrollment waits until the loudest 3 s heard is `jump_db` (6 dB) over the
 call's first 3 s, or the call is `jump_max` (10 s) old. Voice-Isolator's
 `vi/infer.py` mode "selflv" is the same rule in PyTorch.
+
+The agent model's presence gate (a model exported with its presence head: the
+step's extra output `gate`, one logit per frame, and `config.json` "serve"
+"gate"): every 10 ms frame is open or closed. A closed gate opens at a frame whose
+probability is `theta` or over; an open one counts a frame at `theta_off` or over as
+the caller and stays open `hold` frames after the last one; a frame the model kept
+within `keep_db` of the line counts as the caller whatever the head says. Output hop
+t is multiplied by g[t-1] w^2[hop:] + g[t] w^2[:hop] (w^2 the periodic Hann, whose
+shifts by a hop sum to one), so a closed run leaves as exact digital silence, with
+no added delay. Voice-Isolator's `vi/model.py` (`gate_frames`, `_gate_out`) is the
+same rule in PyTorch; `gate="auto"` takes the model's own setting.
 """
 
 from __future__ import annotations
@@ -52,6 +63,20 @@ JUMP_DB, JUMP_MAX = 6.0, 10.0
 development calls."""
 
 _DECOY_EMB: dict[tuple[str, int], np.ndarray] = {}  # per model: the decoy's vector
+
+
+def parse_gate(spec) -> dict | None:
+    """'THETA[:HOLD[:THETA_OFF[:KEEP_DB]]]' -> the presence gate's settings; None,
+    "" or "off" -> no gate. HOLD is in 10 ms frames (default 10)."""
+    if spec is None or str(spec) in ("", "off"):
+        return None
+    f = str(spec).split(":")
+    return dict(
+        theta=float(f[0]),
+        hold=int(f[1]) if len(f) > 1 and f[1] else 10,
+        theta_off=float(f[2]) if len(f) > 2 and f[2] else None,
+        keep_db=float(f[3]) if len(f) > 3 and f[3] else None,
+    )
 
 
 @lru_cache(maxsize=1)
@@ -107,6 +132,7 @@ class OnnxStream:
         voicebot: bool = False,
         jump_db: float = JUMP_DB,
         jump_max: float = JUMP_MAX,
+        gate: str | None = "auto",
     ) -> None:
         if voicebot and not live_enroll:
             raise ValueError(
@@ -133,6 +159,22 @@ class OnnxStream:
         self.loud_s, self.loud_until = loud_s, loud_within + step_s
         self.step_n = int(step_s * SAMPLE_RATE)
         self.voicebot, self.jump_db, self.jump_max = voicebot, jump_db, jump_max
+        # the presence gate: the model's own setting ("auto"), another, or none
+        self.n_states = len(c["states"])
+        self.gate_out = bool(c.get("gate_out"))
+        if gate == "auto":
+            gate = (c.get("serve") or {}).get("gate")
+        self.gate = parse_gate(gate)
+        if self.gate is not None:
+            if not self.gate_out:
+                raise ValueError(
+                    "gate= needs a model exported with its presence head (the agent "
+                    "model); this one has none"
+                )
+            g = self.gate
+            self.g_th = np.float32(g["theta"])
+            self.g_th_off = np.float32(g["theta_off"] or g["theta"])
+            self.w2 = self.w * self.w
         self.start = self.null
         if voicebot:  # the decoy's vector, once per model and process
             key = (str(model_dir), num_threads)
@@ -157,6 +199,8 @@ class OnnxStream:
         self.enrolled_at: float | None = None  # seconds in, first enrollment
         self.pending = np.zeros(0, np.float32)
         self.n_in = 0  # input samples stepped
+        self.g_since = 1 << 30  # frames since the gate last heard the caller
+        self.g_prev = np.float32(0.0)  # the last frame's gate: a call starts closed
         n_hist = int(self.loud_until * SAMPLE_RATE) + self.step_n
         self.hist = np.zeros(n_hist, np.float32) if self.live else None
         self.loud_st = None
@@ -255,7 +299,9 @@ class OnnxStream:
         }
         for i in range(self.L):
             feed[f"k{i}"], feed[f"v{i}"] = self.k[i], self.v[i]
-        yre, yim, knew, vnew, *st = self.step.run(None, feed)
+        outs = self.step.run(None, feed)
+        yre, yim, knew, vnew = outs[:4]
+        st = outs[4 : 4 + self.n_states]
         self.states = {s["name"]: v for s, v in zip(self.cfg["states"], st)}
         slots = p % R
         for i in range(self.L):
@@ -270,7 +316,45 @@ class OnnxStream:
         for c in range(C):
             acc[c * hop : c * hop + win] += y[c]
         self.outbuf = acc[C * hop :].copy()
-        return acc[: C * hop]
+        out = acc[: C * hop]
+        if self.gate is not None:
+            out = self._gate_out(out, x[: C * hop], outs[4 + self.n_states][0])
+        return out
+
+    def _gate_out(
+        self, out: np.ndarray, line: np.ndarray, logit: np.ndarray
+    ) -> np.ndarray:
+        """The presence gate on one step's output: hop t of `out` and of `line`
+        (the input under frame t's first half) and frame t's logit."""
+        hop, g = self.hop, self.gate
+        C = len(out) // hop
+        keep = None
+        if g["keep_db"] is not None:  # float32, as the PyTorch rule measures it
+            eo = (out.reshape(C, hop) ** 2).mean(1)
+            ei = (line.astype(np.float32).reshape(C, hop) ** 2).mean(1)
+            q = np.float32(32768.0**-2)
+            e = np.float32(1e-3) * q
+            keep = (ei > q) & (
+                10 * np.log10((eo + e) / (ei + e)) >= -np.float32(g["keep_db"])
+            )
+        with np.errstate(over="ignore"):  # a very sure "no": exp overflows, p = 0
+            z = np.exp(-np.asarray(logit, np.float32))
+            p = (np.float32(1.0) / (np.float32(1.0) + z)).astype(np.float32)
+        o = np.empty(C, np.float32)
+        since, hold = self.g_since, g["hold"]
+        is_open = since <= hold
+        for t in range(C):
+            heard = p[t] >= (self.g_th_off if is_open else self.g_th)
+            if keep is not None and keep[t]:
+                heard = True
+            since = 0 if heard else since + 1
+            is_open = since <= hold
+            o[t] = 1.0 if is_open else 0.0
+        self.g_since = since
+        gp = np.concatenate([[self.g_prev], o[:-1]]).astype(np.float32)
+        self.g_prev = o[-1]
+        env = gp[:, None] * self.w2[hop:] + o[:, None] * self.w2[:hop]
+        return out * env.reshape(-1)
 
 
 def isolate(model_dir: str | Path, x: np.ndarray, chunk: int = 800, **kw) -> np.ndarray:

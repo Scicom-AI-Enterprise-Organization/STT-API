@@ -3,7 +3,9 @@
 The CPU path runs on a tiny model with random weights and the released architecture
 (band LSTMs, a frame LSTM, a ring of keys and values, the enrollment encoder):
 tests/fixtures/voice_isolator_tiny, written by Voice-Isolator's
-scripts/tiny_fixture.py through the same export as the real models. The remote path
+scripts/tiny_fixture.py through the same export as the real models; the agent
+model's presence gate on tests/fixtures/voice_isolator_tiny_gate, the same with a
+presence head (its scale set so that its gate opens and closes on a real call). The remote path
 runs against a stand-in server that speaks the GPU server's protocol and halves
 whatever it is sent.
 
@@ -34,6 +36,7 @@ from stt_api.livekit_plugin.voice_isolator import (  # noqa: E402
 )
 
 TINY = str(Path(__file__).parent / "fixtures" / "voice_isolator_tiny")
+TINY_GATE = str(Path(__file__).parent / "fixtures" / "voice_isolator_tiny_gate")
 LSB = 1 / 32768
 
 
@@ -227,6 +230,101 @@ class TestLocal:
     def test_a_missing_model_raises_at_once(self, tmp_path):
         with pytest.raises(FileNotFoundError):
             LocalIsolator(str(tmp_path))
+
+
+def closed_hops(y: np.ndarray, hop: int = 160) -> np.ndarray:
+    n = len(y) // hop
+    return np.all(y[: n * hop].reshape(n, hop) == 0, 1)
+
+
+def logit(p) -> np.ndarray:
+    p = np.asarray(p, np.float64)
+    return np.log(p / (1 - p)).astype(np.float32)
+
+
+class TestGate:
+    """The agent model's presence gate: closed frames leave as digital silence."""
+
+    def test_takes_the_models_own_setting(self):
+        s = LocalIsolator(TINY_GATE).open()
+        assert s.gate == {"theta": 0.6, "hold": 3, "theta_off": None, "keep_db": None}
+
+    def test_off_and_other_settings(self):
+        assert LocalIsolator(TINY_GATE, gate="off").open().gate is None
+        assert LocalIsolator(TINY_GATE, gate="0.9:100:0.2:1").open().gate == {
+            "theta": 0.9,
+            "hold": 100,
+            "theta_off": 0.2,
+            "keep_db": 1.0,
+        }
+
+    def test_a_model_without_a_head_has_none(self, local):
+        assert local.open().gate is None
+
+    def test_a_gate_needs_a_head(self):
+        with pytest.raises(ValueError, match="presence head"):
+            LocalIsolator(TINY, gate="0.6:3")
+
+    def test_it_opens_and_closes(self):
+        x = speechlike(6.0, seed=5)
+        closed = closed_hops(isolate(TINY_GATE, x))
+        assert 0.02 < closed.mean() < 0.98
+        assert not closed_hops(isolate(TINY_GATE, x, gate="off")).any()
+
+    def test_a_gate_that_never_closes_is_the_model_itself(self):
+        x = speechlike(4.0, seed=6)
+        y, y0 = isolate(TINY_GATE, x, gate="0:3"), isolate(TINY_GATE, x, gate="off")
+        assert np.abs(y[160:] - y0[160:]).max() <= 1e-6
+
+    def test_a_gate_that_never_opens_is_silence(self):
+        assert not np.any(isolate(TINY_GATE, speechlike(3.0), gate="1.01:3"))
+
+    def test_same_output_whatever_the_frame_size(self):
+        x = speechlike(6.0, seed=7)
+        out = [
+            run(VoiceIsolator(backend=LocalIsolator(TINY_GATE)), x, ms=ms)
+            for ms in (10, 20, 50)
+        ]
+        assert closed_hops(out[2]).any()
+        for y in out[:2]:
+            assert (closed_hops(y) == closed_hops(out[2])).all()
+            assert np.abs(y - out[2]).max() <= 2 * LSB
+
+    def test_the_rule(self):
+        # Opens at theta, stays open while the head is at theta_off or over and
+        # `hold` frames after; hop t is weighted g[t-1] w^2[hop:] + g[t] w^2[:hop].
+        from stt_api.livekit_plugin.voice_isolator.onnx_stream import OnnxStream
+
+        s = OnnxStream(TINY_GATE, gate="0.5:2:0.3")
+        p = [0.1, 0.6, 0.4, 0.2, 0.2, 0.2, 0.2, 0.6]  # open: 0 1 1 1 1 0 0 1
+        y = s._gate_out(
+            np.ones(8 * 160, np.float32), np.ones(8 * 160, np.float32), logit(p)
+        )
+        h = y.reshape(8, 160).mean(1)
+        assert h[0] == 0 and h[6] == 0
+        assert np.allclose(h[2:5], 1.0, atol=1e-6)
+        assert h[1] == pytest.approx(0.5, abs=0.01) and h[5] == pytest.approx(
+            0.5, abs=0.01
+        )
+        assert h[7] == pytest.approx(0.5, abs=0.01)
+        # the state carries over to the next step: still open there
+        y = s._gate_out(
+            np.ones(160, np.float32), np.ones(160, np.float32), logit([0.2])
+        )
+        assert np.allclose(y, 1.0, atol=1e-6)
+
+    def test_a_kept_frame_counts_as_the_caller(self):
+        # keep_db: a frame the model kept within that many dB of the line is open
+        # whatever the head says; one it turned down 20 dB is not.
+        from stt_api.livekit_plugin.voice_isolator.onnx_stream import OnnxStream
+
+        line = np.full(4 * 160, 0.1, np.float32)
+        low = logit([0.01] * 4)
+        s = OnnxStream(TINY_GATE, gate="0.99:0:0.99:1")
+        kept = s._gate_out(line.copy(), line, low).reshape(4, 160).mean(1)
+        assert np.allclose(kept[1:], 0.1, atol=1e-6)
+        s = OnnxStream(TINY_GATE, gate="0.99:0:0.99:1")
+        assert not np.any(s._gate_out(0.1 * line, line, low))
 
 
 @pytest.fixture

@@ -1,0 +1,112 @@
+{
+ "win": 320,
+ "hop": 160,
+ "window": 50,
+ "layers": 2,
+ "heads": 2,
+ "head_dim": 16,
+ "rope_base": 10000.0,
+ "null": [
+  0.14662154018878937,
+  -0.06070014461874962,
+  -0.05465229973196983,
+  -0.03363444283604622,
+  0.052169062197208405,
+  0.03612171858549118,
+  0.021914463490247726,
+  -0.0573333278298378,
+  -0.07084242254495621,
+  -0.13356223702430725,
+  -0.09096213430166245,
+  0.070116326212883,
+  0.08807054907083511,
+  -0.013683932833373547,
+  0.22074761986732483,
+  0.21005141735076904
+ ],
+ "states": [
+  {
+   "name": "hb0",
+   "shape": [
+    1,
+    32,
+    8
+   ]
+  },
+  {
+   "name": "cb0",
+   "shape": [
+    1,
+    32,
+    8
+   ]
+  },
+  {
+   "name": "hb1",
+   "shape": [
+    1,
+    32,
+    8
+   ]
+  },
+  {
+   "name": "cb1",
+   "shape": [
+    1,
+    32,
+    8
+   ]
+  },
+  {
+   "name": "hm0",
+   "shape": [
+    1,
+    1,
+    16
+   ]
+  },
+  {
+   "name": "cm0",
+   "shape": [
+    1,
+    1,
+    16
+   ]
+  }
+ ],
+ "step_file": "step.onnx",
+ "enroll_file": "enroll.onnx",
+ "params": 124993,
+ "source": "tiny_gate_ckpt",
+ "model": {
+  "arch": "frameformer",
+  "win": 320,
+  "hop": 160,
+  "n": 8,
+  "d": 32,
+  "layers": 2,
+  "heads": 2,
+  "window": 50,
+  "ff": 2.0,
+  "emb": 16,
+  "enroll": true,
+  "compress": 0.5,
+  "mask_hidden": 4,
+  "sr": 16000,
+  "band_rnn": 8,
+  "mem_rnn": 16,
+  "mem_at": null,
+  "spk_ssl": false,
+  "ssl_head": 0,
+  "ssl_branch": null,
+  "ssl_mix": "last",
+  "ssl_train": 0.0,
+  "enroll_ch": 16,
+  "gate_head": 8
+ },
+ "gate_out": true,
+ "serve": {
+  "gate": "0.6:3",
+  "enroll": "loud"
+ }
+}

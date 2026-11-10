@@ -52,6 +52,8 @@ Models:
 
 - `LocalIsolator()` reads `Scicom-intl/voice-isolator-cpu` (public), or a local
   directory: `LocalIsolator("/models/voice-isolator-cpu")` or `VOICE_ISOLATOR_MODEL`.
+  `LocalIsolator("Scicom-intl/voice-isolator-cpu/agent")` is
+  [the agent model](#agents-that-talk-back-the-agent-model) on a CPU.
   `quantized=True` takes the 8-bit export from the repository's `int8/`: about 1.4x
   cheaper per call (1.6x in 10 ms frames), but it agrees with the float model to about
   50 dB, and with itself across frame sizes to about 40 dB, rather than to float
@@ -173,7 +175,23 @@ docker run --gpus all -p 8765:8765 voice-isolator-gpu python -m vi.server_mp \
 
 The server reads the gate's setting from `agent/config.json` (`--gate off` serves the
 model without it). It was chosen and measured in the default mode, so leave `voicebot`
-off. It is GPU-only for now: `LocalIsolator` has no gate yet.
+off.
+
+On a CPU, inside the agent: `Scicom-intl/voice-isolator-cpu/agent` is the CPU student
+trained the same way, with this model as its teacher. `LocalIsolator` applies its gate
+itself (`gate="auto"` reads `agent/config.json`; `gate="off"` runs the model without it):
+
+```python
+proc.userdata["isolator"] = LocalIsolator("Scicom-intl/voice-isolator-cpu/agent")
+# 8 bits: LocalIsolator("Scicom-intl/voice-isolator-cpu/agent", quantized=True)
+```
+
+On the same 816 held-out calls, in 8 bits on one thread, it paused the agent by mistake
+0.48 times a minute of agent speech (RE-USE 0.95, this plugin's default CPU model 1.36),
+and kept about as much of the caller as RE-USE: the VAD missed 2.4% of the caller's
+turns (2.6%), Whisper got 16.2% of the caller's words wrong (16.9%), and the agent
+stopped for 87.9% of the caller's cut-ins (87.4%). It costs the same CPU as the default
+model: 12.5% of one core per call in 8 bits, 50 ms frames.
 
 ## What it does to the agent's VAD
 
