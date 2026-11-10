@@ -26,8 +26,8 @@ voice: VoiceBank+DEMAND PESQ 2.575 and DNS 2020 synthetic 2.389, against GTCRN's
 and 2.293, at about half GTCRN's CPU. Neither mode is trained on VoiceBank, VCTK or
 DEMAND.
 
-The model file is one of two graphs of the same function: the fused graph (a third of
-the operators; its first input is named "ri"), which the pinned revision ships, or the
+The model file is one of two graphs of the same function: the fused graph (two fifths
+of the operators; its first input is named "ri"), which the pinned revision ships, or the
 plain one (first input "spec"). The samples around the model sit in arrays written in
 place: the first version joined a new array for every buffer on every frame, and at any
 room rate but 16 kHz it never let go of the 16 kHz output it had already resampled, so

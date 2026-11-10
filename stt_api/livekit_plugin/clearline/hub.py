@@ -18,8 +18,8 @@ too often, or late). Bump `VAD_REVISION` and `OPERATING_POINT` together, never
 one without the other.
 
 `NC_REVISION` and `nc.py` move together as well. Since 2026-11-11 the two noise
-canceller files at the pin are fused graphs (the same weights and function with a
-third of the operators; their first input is named `ri`), which a plugin older than
+canceller files at the pin are fused graphs (the same weights and function with
+two fifths of the operators; their first input is named `ri`), which a plugin older than
 that cannot read; the plain graphs it could read are in the repository's `plain/`
 folder, and this plugin reads either. The VAD's weights at the pin are the files of
 the revision before it (`da8f290b`), byte for byte: only the plugin code changed.

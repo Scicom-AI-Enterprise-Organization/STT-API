@@ -185,8 +185,8 @@ python -m stt_api.livekit_plugin.noise_cancellation.benchmark --corpus voicebank
 
 ### The graphs and the buffers (2026-11-11)
 
-The pinned revision ships both models as **fused graphs**: the same function with a
-third of the operators (the plain graph spent two thirds of a call on bookkeeping for
+The pinned revision ships both models as **fused graphs**: the same function with
+two fifths of the operators (the plain graph spent two thirds of a call on bookkeeping for
 calls of any length), equal to the plain graphs within one LSB through the plugin and
 to the fourth decimal on the three test corpora. The plain graphs are in the
 repository's `plain/` folder and the plugin reads either (the fused graph's first
