@@ -10,6 +10,12 @@
 #   docker run --gpus all -p 8765:8765 voice-isolator-gpu
 #
 # Agents then use RemoteIsolator("ws://<host>:8765") or VOICE_ISOLATOR_URL.
+#
+# The agent model (Scicom-intl/voice-isolator/agent, for agents that talk back: README)
+# is in the same image:
+#
+#   docker run --gpus all -p 8765:8765 voice-isolator-gpu python -m vi.server_mp \
+#       --ckpt /model/agent --port 8765 --workers 8 --enroll-loud --chunk-hops 4 --max-streams 128
 FROM pytorch/pytorch:2.8.0-cuda12.8-cudnn9-runtime
 
 RUN pip install --no-cache-dir numpy soundfile safetensors huggingface_hub websockets uvloop

@@ -13,7 +13,7 @@ Two backends, like `../semantic_vad/`:
 
 | | `LocalIsolator()` | `RemoteIsolator(url)` |
 |---|---|---|
-| model | `Scicom-intl/voice-isolator-cpu`, distilled for one CPU thread | `Scicom-intl/voice-isolator`, the release: M + a causal WavLM-Large, 555M |
+| model | `Scicom-intl/voice-isolator-cpu`, distilled for one CPU thread | `Scicom-intl/voice-isolator`, the release: M + a causal WavLM-Large, 555M; or its `agent/` model, for agents that talk back ([below](#agents-that-talk-back-the-agent-model)) |
 | runs | in the agent process: onnxruntime + numpy, no torch, no GPU | on a GPU server (`Dockerfile`), one WebSocket per call |
 | delay in an agent | 10 ms (the STFT look-ahead) | 40 ms median at 32 calls, 50 ms at 64 (LiveKit's 50 ms frames, the server at 40 ms steps, each frame waiting up to 30 ms for its reply); 30 ms with 20 ms frames and steps |
 | cost | one thread per call on the agent's audio loop: 17% of a core in 50 ms frames, 33% in 20 ms (8-bit 12% and 22%) | each frame waits on the agent's audio loop for its reply: 15 ms median, 30 ms at most, no CPU (`wait_ms=0` only queues it: 0.4 ms, but 90 ms behind); 64 calls on one GPU measured |
@@ -147,6 +147,33 @@ speak first, not for agents that wait for the caller.
 repository's server has it from 2026-11-02 (rebuild the `Dockerfile`'s image); an older
 one ignores the request and runs the default. `--voicebot` on the server makes it every
 call's default (`voicebot=False` sends `?voicebot=0`).
+
+## Agents that talk back: the agent model
+
+`Scicom-intl/voice-isolator/agent` is the GPU release fine-tuned further for agents,
+with a head that says every 20 ms whether the caller is talking. Where the caller is
+not, the server's step sends exact digital silence instead of what the mask left of the
+noise or another voice, so the agent's VAD has nothing to fire on. It adds no delay. On
+the same benchmark (816 held-out calls) it paused the agent by mistake 0.54 times a
+minute of agent speech, against 0.95 behind NVIDIA's Real-time RE-USE, and it kept about
+as much of the caller: the VAD missed 2.7% of the caller's turns (RE-USE 2.6%), Whisper
+got 15.6% of the caller's words wrong (16.9%), and the agent stopped for 84.8% of the
+caller's cut-ins (87.4%).
+
+Only the server changes; the agent's code stays `RemoteIsolator(url)`:
+
+```bash
+python -m vi.server_mp --ckpt Scicom-intl/voice-isolator/agent --port 8765 \
+    --workers 8 --enroll-loud --chunk-hops 4 --max-streams 128
+# or with this directory's Docker image (it holds the whole model repository; rebuild
+# an image built before 2026-11-10):
+docker run --gpus all -p 8765:8765 voice-isolator-gpu python -m vi.server_mp \
+    --ckpt /model/agent --port 8765 --workers 8 --enroll-loud --chunk-hops 4 --max-streams 128
+```
+
+The server reads the gate's setting from `agent/config.json` (`--gate off` serves the
+model without it). It was chosen and measured in the default mode, so leave `voicebot`
+off. It is GPU-only for now: `LocalIsolator` has no gate yet.
 
 ## What it does to the agent's VAD
 
