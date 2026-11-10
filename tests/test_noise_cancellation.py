@@ -186,6 +186,22 @@ def test_missing_model_raises_instead_of_silently_degrading():
         GTCRN(model_path="/nonexistent/gtcrn.onnx")
 
 
+@pytest.mark.parametrize("rate", [24000, 48000, 8000])
+def test_a_resampled_call_keeps_nothing_it_has_handed_back(rate):
+    # `_run_hops` used to append its 16 kHz output to `_out16` on every path, and only
+    # the 16 kHz path takes from it: at any other rate the buffer grew for the whole
+    # call and was rebuilt on every frame (1.5 ms a frame in a 48 kHz call's first
+    # minute, 2.9 ms in its sixth).
+    nc = GTCRN()
+    x = np.tile(load_speech(rate), 4)[: 12 * rate]
+    for f in to_frames(x[: 2 * rate], rate, 20):
+        nc._process(f)
+    held = nc._out16.size
+    for f in to_frames(x[2 * rate :], rate, 20):
+        nc._process(f)
+    assert nc._out16.size == held
+
+
 def test_streams_do_not_share_recurrent_state():
     """Two instances must denoise identically; shared caches would diverge."""
     x = load_speech(MODEL_SAMPLE_RATE)[: MODEL_SAMPLE_RATE * 2]

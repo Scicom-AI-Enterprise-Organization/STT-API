@@ -17,6 +17,13 @@ calibrated differently, and the wrong threshold fails silently (a VAD that fires
 too often, or late). Bump `VAD_REVISION` and `OPERATING_POINT` together, never
 one without the other.
 
+`NC_REVISION` and `nc.py` move together as well. Since 2026-11-11 the two noise
+canceller files at the pin are fused graphs (the same weights and function with a
+third of the operators; their first input is named `ri`), which a plugin older than
+that cannot read; the plain graphs it could read are in the repository's `plain/`
+folder, and this plugin reads either. The VAD's weights at the pin are the files of
+the revision before it (`da8f290b`), byte for byte: only the plugin code changed.
+
 A local file overrides the download: pass `model_path=` / `onnx_file_path=`, or
 set `CLEARLINE_VAD_ONNX_PATH` / `CLEARLINE_NC_ONNX_PATH`.
 """
@@ -27,8 +34,8 @@ import os
 
 VAD_REPO = "Scicom-intl/Clearline-VAD"
 NC_REPO = "Scicom-intl/Clearline-NC-CPU"
-VAD_REVISION = "da8f290b566938ee1b1ce30f211b9be94ebf3836"
-NC_REVISION = "7355439a484a87af343628c28f945183fb599a46"
+VAD_REVISION = "72a942e5ac9f68465215580da7fbc0deabcd03d7"
+NC_REVISION = "52f4167074d507303a0277e15f00cd93fbc63876"
 
 VAD_FILES = {
     ("release", 512): "clearline_vad.onnx",

@@ -299,6 +299,12 @@ python -m stt_api.livekit_plugin.noise_cancellation.benchmark \
   silent passthrough — that quiet degradation is the exact failure mode of the Cloud
   plugin this replaces. If `_process` itself ever throws, LiveKit catches it and
   passes the frame through (`rtc/audio_stream.py`), so a bad frame cannot kill a call.
+- **Off-rate rooms cost the same from a call's first minute to its last.** Until
+  2026-11-11 they did not: `_run_hops` appended the 16 kHz output to a buffer that
+  only the 16 kHz path ever read, and the array was rebuilt on every frame, so at
+  8, 24 or 48 kHz a call's frames grew dearer the longer it ran (48 kHz: 1.5 ms a
+  frame in the first minute, 2.9 ms in the sixth, 23 MB held). At 16 kHz nothing
+  grew. `test_a_resampled_call_keeps_nothing_it_has_handed_back` holds it.
 - **`enabled` is live.** Set `nc.enabled = False` to bypass mid-session; the frame is
   then returned untouched.
 - `GTCRN_ONNX_PATH` overrides the bundled model.
