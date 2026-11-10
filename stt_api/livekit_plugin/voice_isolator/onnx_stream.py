@@ -25,12 +25,24 @@ enrollment" vector. Runs of the step never cross a half second, so the vector
 changes exactly where the offline rule changes it: the export is checked against
 the PyTorch model running that rule (124-134 dB on real calls, float rounding).
 
+A model says in its `config.json` "serve" how it was chosen to be served, and the
+stream takes that unless told otherwise (for the voicebot mode, with what the
+block's own "voicebot" block changes). `"enroll": "none"`: no live enrollment,
+the model keeps the caller by itself (`live_enroll=None`, the default, follows the
+model; True and False override it). `loud_within`: the seconds the rule runs for
+instead of 15. `arrive_db` with `arrive_hold`: the caller has arrived at the first
+half second at which the loudest 3 s heard is `arrive_db` over the call's first
+3 s, and the rule then ends `arrive_hold` seconds after that, so a caller who
+answers late is still enrolled on their own voice, not on what was on the line
+before they spoke.
+
 The voicebot mode (`voicebot=True`), for an agent that speaks first: until the
 first enrollment the model is told to keep a decoy, a voice that is in no call
 (`resources/voicebot_decoy.npy`), so it keeps no voice while the agent greets, and
 the first enrollment waits until the loudest 3 s heard is `jump_db` (6 dB) over the
-call's first 3 s, or the call is `jump_max` (10 s) old. Voice-Isolator's
-`vi/infer.py` mode "selflv" is the same rule in PyTorch.
+call's first 3 s, or the call is `jump_max` (10 s) old. A model served with no
+enrollment waits the same way and then drops the decoy for no enrollment.
+Voice-Isolator's `vi/infer.py` mode "selflv" is the same rule in PyTorch.
 
 The agent model's presence gate (a model exported with its presence head: the
 step's extra output `gate`, one logit per frame, and `config.json` "serve"
@@ -41,7 +53,11 @@ within `keep_db` of the line counts as the caller whatever the head says. Output
 t is multiplied by g[t-1] w^2[hop:] + g[t] w^2[:hop] (w^2 the periodic Hann, whose
 shifts by a hop sum to one), so a closed run leaves as exact digital silence, with
 no added delay. Voice-Isolator's `vi/model.py` (`gate_frames`, `_gate_out`) is the
-same rule in PyTorch; `gate="auto"` takes the model's own setting.
+same rule in PyTorch; `gate="auto"` takes the model's own setting. While the
+voicebot mode's decoy holds, the model is told to keep nobody, so a frame it kept
+is a weaker sign of the caller than after the first enrollment. A model says what
+it counts for there in "serve" "wait_keep": 1 as ever (the default), 0 nothing
+(only the head opens the gate), N only from the N-th kept frame in a row.
 """
 
 from __future__ import annotations
@@ -57,6 +73,10 @@ SAMPLE_RATE = 16000
 DECOY = Path(__file__).parent / "resources" / "voicebot_decoy.npy"
 """4 s of one LibriTTS-R train-clean-100 utterance (CC BY 4.0, see
 resources/LICENSE.voicebot_decoy), 16 kHz int16 at half of full scale."""
+LOUD_WITHIN, ARRIVE_HOLD = 15.0, 15.0
+"""The live rule runs for the call's first `LOUD_WITHIN` seconds unless the model's
+config.json says otherwise ("serve" "loud_within"), and where a model names an
+arrival (`arrive_db`), for `ARRIVE_HOLD` seconds after it."""
 JUMP_DB, JUMP_MAX = 6.0, 10.0
 """The voicebot mode's first enrollment: a voice this many dB over the call's first
 3 s, or the call this many seconds old. Chosen on the voice-interrupt bench's
@@ -110,6 +130,17 @@ def load_model(model_dir: str, num_threads: int = 1):
     return cfg, step, enroll
 
 
+def serve_settings(cfg: dict, voicebot: bool = False) -> dict:
+    """How a model asks to be served: its config.json "serve" block, and for the
+    voicebot mode that block with what its "voicebot" block changes of it (the
+    agent model: another enrollment rule once the caller has been heard)."""
+    serve = dict(cfg.get("serve") or {})
+    mode = serve.pop("voicebot", None) or {}
+    if voicebot:
+        serve.update(mode)
+    return serve
+
+
 def sqrt_hann(n: int) -> np.ndarray:
     """Periodic Hann (`torch.hann_window`), square-rooted: analysis and synthesis."""
     w = 0.5 - 0.5 * np.cos(2.0 * np.pi * np.arange(n, dtype=np.float64) / n)
@@ -124,17 +155,19 @@ class OnnxStream:
         model_dir: str | Path,
         *,
         num_threads: int = 1,
-        live_enroll: bool = True,
+        live_enroll: bool | None = None,
         max_frames: int = 8,
         loud_s: float = 3.0,
-        loud_within: float = 15.0,
+        loud_within: float | None = None,
         step_s: float = 0.5,
         voicebot: bool = False,
         jump_db: float = JUMP_DB,
         jump_max: float = JUMP_MAX,
         gate: str | None = "auto",
+        arrive_db: float | str | None = "auto",
+        arrive_hold: float | None = None,
     ) -> None:
-        if voicebot and not live_enroll:
+        if voicebot and live_enroll is False:
             raise ValueError(
                 "voicebot=True holds back the live enrollment, so it needs live_enroll=True"
             )
@@ -155,7 +188,29 @@ class OnnxStream:
         )
         self.null = np.asarray(c["null"], np.float32)[None]
         self.max_frames = max_frames
-        self.live = live_enroll
+        # how the model asks to be served: its "serve" block, and in the voicebot
+        # mode what its "voicebot" block changes of that
+        serve = serve_settings(c, voicebot)
+        # the live rule: the caller's own say, else the model's, else the loudest
+        # 3 s of the first 15 s. `clip`: the rule enrolls the model on that audio; a
+        # model served with no enrollment runs the rule only as the voicebot mode's
+        # wait, and then gets no enrollment
+        self.clip = (
+            serve.get("enroll", "loud") != "none"
+            if live_enroll is None
+            else bool(live_enroll)
+        )
+        self.live = self.clip or voicebot
+        if loud_within is None:
+            loud_within = float(serve.get("loud_within", LOUD_WITHIN))
+        if not self.clip:
+            loud_within = min(loud_within, jump_max)  # the wait is all it is for
+        if arrive_db == "auto":
+            arrive_db = serve.get("arrive_db")
+        if arrive_hold is None:
+            arrive_hold = float(serve.get("arrive_hold", ARRIVE_HOLD))
+        self.arrive_db = None if arrive_db is None else float(arrive_db)
+        self.arrive_hold = arrive_hold
         self.loud_s, self.loud_until = loud_s, loud_within + step_s
         self.step_n = int(step_s * SAMPLE_RATE)
         self.voicebot, self.jump_db, self.jump_max = voicebot, jump_db, jump_max
@@ -163,7 +218,7 @@ class OnnxStream:
         self.n_states = len(c["states"])
         self.gate_out = bool(c.get("gate_out"))
         if gate == "auto":
-            gate = (c.get("serve") or {}).get("gate")
+            gate = serve.get("gate")
         self.gate = parse_gate(gate)
         if self.gate is not None:
             if not self.gate_out:
@@ -175,6 +230,8 @@ class OnnxStream:
             self.g_th = np.float32(g["theta"])
             self.g_th_off = np.float32(g["theta_off"] or g["theta"])
             self.w2 = self.w * self.w
+            # kept frames on the voicebot mode's decoy: as ever, never, or in runs
+            self.wait_keep = int(serve.get("wait_keep", 1))
         self.start = self.null
         if voicebot:  # the decoy's vector, once per model and process
             key = (str(model_dir), num_threads)
@@ -197,10 +254,13 @@ class OnnxStream:
         }
         self.emb = self.start.copy()  # no enrollment, or the voicebot mode's decoy
         self.enrolled_at: float | None = None  # seconds in, first enrollment
+        self.arrived_at: float | None = None  # seconds in, the caller's arrival
+        self.waiting = self.voicebot  # still on the decoy: the first enrollment to come
         self.pending = np.zeros(0, np.float32)
         self.n_in = 0  # input samples stepped
         self.g_since = 1 << 30  # frames since the gate last heard the caller
         self.g_prev = np.float32(0.0)  # the last frame's gate: a call starts closed
+        self.g_krun = 0  # frames in a row the model has kept
         n_hist = int(self.loud_until * SAMPLE_RATE) + self.step_n
         self.hist = np.zeros(n_hist, np.float32) if self.live else None
         self.loud_st = None
@@ -214,6 +274,7 @@ class OnnxStream:
         alone, a few seconds); the live rule then stays off for this call."""
         self.emb = self.embed(clip)
         self.live = False
+        self.waiting = False
 
     def embed(self, clip: np.ndarray) -> np.ndarray:
         """The speaker vector of a clip, computed as the model's `embed` does."""
@@ -253,6 +314,8 @@ class OnnxStream:
         t = self.n_in / SAMPLE_RATE
         if not (self.loud_s <= t <= self.loud_until):
             return
+        if self.arrived_at is not None and t > self.arrived_at + self.arrive_hold:
+            return  # settled: the caller has been on the line this long
         m = self.n_in // self.hop
         w = int(min(self.loud_s, t) * SAMPLE_RATE / self.hop)
         if m < w:
@@ -262,16 +325,28 @@ class OnnxStream:
         e = (self.hist[: m * self.hop].reshape(m, self.hop) ** 2).mean(1)
         S = np.convolve(e, np.ones(w), "valid")
         st = int(S.argmax())
+        jump = 10 * np.log10((S[st] + 1e-12) / (S[0] + 1e-12))
+        if (
+            self.arrive_db is not None
+            and self.arrived_at is None
+            and jump >= self.arrive_db
+        ):
+            self.arrived_at = t  # a voice clearly over the call's first 3 s
         if (
             self.voicebot
             and self.loud_st is None
             and t < self.jump_max
-            and 10 * np.log10((S[st] + 1e-12) / (S[0] + 1e-12)) < self.jump_db
+            and jump < self.jump_db
         ):
             return  # nothing heard yet is clearly louder than the call's first 3 s
+        if not self.clip:  # served with no enrollment: the wait is over, once
+            self.emb = self.null.copy()
+            self.waiting, self.live, self.enrolled_at = False, False, t
+            return
         if (st, w) != self.loud_st:
             self.emb = self.embed(self.hist[st * self.hop : (st + w) * self.hop])
             self.loud_st = (st, w)
+            self.waiting = False
             if self.enrolled_at is None:
                 self.enrolled_at = t
 
@@ -343,10 +418,14 @@ class OnnxStream:
         o = np.empty(C, np.float32)
         since, hold = self.g_since, g["hold"]
         is_open = since <= hold
+        # on the decoy a kept frame counts from the wait_keep-th in a row (0: never)
+        need = 1 if not self.waiting else (self.wait_keep or (1 << 30))
         for t in range(C):
             heard = p[t] >= (self.g_th_off if is_open else self.g_th)
-            if keep is not None and keep[t]:
-                heard = True
+            if keep is not None:
+                self.g_krun = self.g_krun + 1 if keep[t] else 0
+                if self.g_krun >= need:
+                    heard = True
             since = 0 if heard else since + 1
             is_open = since <= hold
             o[t] = 1.0 if is_open else 0.0

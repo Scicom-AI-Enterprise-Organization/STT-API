@@ -94,7 +94,9 @@ speaker vector, and the model runs with its learned "no enrollment" vector. The 
 enrollment counts from the stream's first frame and is fixed at 15.5 s, so a caller who
 says nothing in that time (a long greeting from the agent, a hold) is enrolled on
 whatever the line carried; pass `enrollment=` when you have a clip of the caller, and
-see the voicebot mode below for an agent that speaks first.
+see the voicebot mode below for an agent that speaks first. A model can ask for another
+rule in its `config.json` ("serve": `loud_within`, `arrive_db`, `arrive_hold`, or
+`"enroll": "none"`), and `live_enroll=True` / `False` overrides it.
 
 ## Agents that speak first: the voicebot mode
 
@@ -174,8 +176,7 @@ docker run --gpus all -p 8765:8765 voice-isolator-gpu python -m vi.server_mp \
 ```
 
 The server reads the gate's setting from `agent/config.json` (`--gate off` serves the
-model without it). It was chosen and measured in the default mode, so leave `voicebot`
-off.
+model without it).
 
 On a CPU, inside the agent: `Scicom-intl/voice-isolator-cpu/agent` is the CPU student
 trained the same way, with this model as its teacher. `LocalIsolator` applies its gate
@@ -192,6 +193,47 @@ and kept about as much of the caller as RE-USE: the VAD missed 2.4% of the calle
 turns (2.6%), Whisper got 16.2% of the caller's words wrong (16.9%), and the agent
 stopped for 87.9% of the caller's cut-ins (87.4%). It costs the same CPU as the default
 model: 12.5% of one core per call in 8 bits, 50 ms frames.
+
+### The agent models in the voicebot mode
+
+For an agent that greets first, `voicebot=True` with either agent model. Most of what
+still pauses an agent behind them is in its greeting, before the caller has said a word
+(three quarters of their false interruptions on development calls), and the mode takes
+most of that. Held out, the same 816 calls, false interruptions per minute of agent
+speech with the paired 90% interval of the change:
+
+| | default | `voicebot=True` | change | RE-USE |
+|---|---|---|---|---|
+| `LocalIsolator(".../voice-isolator-cpu/agent", quantized=True)` | 0.48 | 0.26 | -0.22 (-0.34 to -0.12) | 0.95 |
+| `RemoteIsolator`, the server on `voice-isolator/agent` | 0.54 | 0.32 | -0.22 (-0.33 to -0.12) | 0.95 |
+
+| the caller, in the mode (default; RE-USE) | CPU agent model, 8 bits | GPU agent model |
+|---|---|---|
+| turns the VAD missed | 1.7% (2.4%; 2.6%) | 2.5% (2.7%; 2.6%) |
+| Whisper's word errors | 16.8% (16.2%; 16.9%) | 16.5% (15.6%; 16.9%) |
+| cut-ins the agent stopped for | 88.3% (87.9%; 87.4%) | 85.5% (84.8%; 87.4%) |
+
+What the mode does for these two models is in their `config.json` ("serve",
+"voicebot"), and the plugin and the server read it from there:
+
+- after the wait the live enrollment runs until the caller has arrived (a voice 6 dB over
+  the call's first 3 s, then 15 s more, at most 60 s) instead of stopping when the call
+  is 15 s old, so a caller who answers late is enrolled on their own voice;
+- while the decoy holds, a frame the model kept is a weaker sign of the caller than
+  later, so it opens the gate only from the third in a row on the GPU model and not at
+  all on the CPU model (there the head alone opens it).
+
+The cost is the mode's own: a caller who talks in the agent's first second loses about a
+quarter of that turn on a clean line (a third over noise on the CPU model, a sixth on
+the GPU model), as before these changes. It needs this plugin from 2026-11-11 on and,
+for `RemoteIsolator`, the model repository's server code of that date; older code
+serves these models as before (0.34 and 0.39 on development calls, against 0.26 and
+0.32 with it).
+
+More of the caller instead of fewer pauses, by default, on the CPU agent model:
+`LocalIsolator(".../agent", live_enroll=False, gate="0.9:50:0.3:1")` runs it with no
+enrollment. Held out it missed 1.4% of the caller's turns and got 14.8% of the words
+wrong, for 0.53 false interruptions a minute against 0.48.
 
 ## What it does to the agent's VAD
 

@@ -193,6 +193,123 @@ class TestLocal:
         assert vi.enrolled_at is not None and 4.5 <= vi.enrolled_at <= 6.0
         vi._close()
 
+    def test_a_longer_rule_enrolls_a_caller_who_answers_late(self):
+        # A bed for 17 s, then a voice 12 dB over it. The rule ends at 15.5 s, on
+        # the bed; asked to run for 60 s it moves to the voice.
+        from stt_api.livekit_plugin.voice_isolator.onnx_stream import OnnxStream
+
+        x = np.concatenate([steady(17.0, 0.05, seed=20), steady(5.0, 0.2, seed=21)])
+        short, long = OnnxStream(TINY), OnnxStream(TINY, loud_within=60.0)
+        for i in range(0, len(x), 800):
+            short.push(x[i : i + 800])
+            long.push(x[i : i + 800])
+        assert (short.loud_st[0] + 300) / 100 <= 15.5  # a window of the bed
+        assert long.loud_st[0] / 100 >= 16.5  # one that holds the voice
+
+    def test_an_arrival_ends_the_rule(self):
+        # arrive_db: a voice 6 dB over the call's first 3 s is the caller arriving,
+        # and the rule ends arrive_hold seconds later. Something louder after that
+        # (here from 12 s) no longer moves the enrollment; without an arrival it does.
+        from stt_api.livekit_plugin.voice_isolator.onnx_stream import OnnxStream
+
+        x = np.concatenate(
+            [
+                steady(4.0, 0.03, seed=22),
+                steady(8.0, 0.12, seed=23),
+                steady(4.0, 0.5, seed=24),
+            ]
+        )
+        held = OnnxStream(TINY, loud_within=60.0, arrive_db=6.0, arrive_hold=5.0)
+        free = OnnxStream(TINY, loud_within=60.0)
+        for i in range(0, len(x), 800):
+            held.push(x[i : i + 800])
+            free.push(x[i : i + 800])
+        assert held.arrived_at is not None and 4.5 <= held.arrived_at <= 6.0
+        assert (held.loud_st[0] + 300) / 100 <= 12.0  # the caller, not the shout
+        assert free.arrived_at is None and free.loud_st[0] / 100 >= 11.5
+
+    def test_a_model_names_its_own_rule(self, tmp_path):
+        # config.json "serve": the agent model asks for the longer rule itself.
+        import shutil
+
+        from stt_api.livekit_plugin.voice_isolator.onnx_stream import OnnxStream
+
+        d = tmp_path / "model"
+        shutil.copytree(TINY, d)
+        cfg = json.loads((d / "config.json").read_text())
+        cfg["serve"] = {
+            "enroll": "loud",
+            "loud_within": 60,
+            "arrive_db": 6,
+            "arrive_hold": 15,
+        }
+        (d / "config.json").write_text(json.dumps(cfg))
+        s = LocalIsolator(str(d)).open()
+        assert (s.loud_until, s.arrive_db, s.arrive_hold) == (60.5, 6.0, 15.0)
+        s = OnnxStream(str(d), loud_within=15.0, arrive_db=None)  # the caller's say
+        assert (s.loud_until, s.arrive_db) == (15.5, None)
+        s = OnnxStream(TINY)  # a model that asks for nothing: the first 15 s
+        assert (s.loud_until, s.arrive_db) == (15.5, None)
+
+    def test_a_model_names_another_rule_for_the_voicebot_mode(self, tmp_path):
+        # "serve" "voicebot": what the model changes of its serving in that mode.
+        # Here: no enrollment by default, the longer rule once a voicebot's caller
+        # has been heard.
+        import shutil
+
+        from stt_api.livekit_plugin.voice_isolator.onnx_stream import OnnxStream
+
+        d = tmp_path / "model"
+        shutil.copytree(TINY, d)
+        cfg = json.loads((d / "config.json").read_text())
+        cfg["serve"] = {
+            "enroll": "none",
+            "voicebot": {"enroll": "loud", "loud_within": 60, "arrive_db": 6},
+        }
+        (d / "config.json").write_text(json.dumps(cfg))
+        s = OnnxStream(str(d))
+        assert not s.live and not s.clip
+        s = OnnxStream(str(d), voicebot=True)
+        assert s.clip and (s.loud_until, s.arrive_db) == (60.5, 6.0)
+        x = np.concatenate([steady(4.0, 0.05, seed=29), steady(4.0, 0.2, seed=30)])
+        for i in range(0, len(x), 800):
+            s.push(x[i : i + 800])
+        assert 4.5 <= s.enrolled_at <= 6.0 and not np.array_equal(s.emb, s.null)
+        assert s.arrived_at is not None
+
+    def test_a_model_served_with_no_enrollment(self, tmp_path):
+        # "serve" "enroll": "none": no live rule, the learned no-enrollment vector
+        # for the whole call; live_enroll=True still enrolls it. In the voicebot
+        # mode it waits on the decoy as any model does, then drops to no enrollment.
+        import shutil
+
+        from stt_api.livekit_plugin.voice_isolator.onnx_stream import OnnxStream
+
+        d = tmp_path / "model"
+        shutil.copytree(TINY, d)
+        cfg = json.loads((d / "config.json").read_text())
+        cfg["serve"] = {"enroll": "none"}
+        (d / "config.json").write_text(json.dumps(cfg))
+        x = np.concatenate([steady(4.0, 0.05, seed=27), steady(4.0, 0.2, seed=28)])
+        none, off = OnnxStream(str(d)), OnnxStream(TINY, live_enroll=False)
+        loud, vb = (
+            OnnxStream(str(d), live_enroll=True),
+            OnnxStream(str(d), voicebot=True),
+        )
+        decoy = vb.emb.copy()
+        outs = [[], []]
+        for i in range(0, len(x), 800):
+            outs[0].append(none.push(x[i : i + 800]))
+            outs[1].append(off.push(x[i : i + 800]))
+            loud.push(x[i : i + 800])
+            vb.push(x[i : i + 800])
+        assert none.enrolled_at is None and np.array_equal(none.emb, none.null)
+        assert np.array_equal(np.concatenate(outs[0]), np.concatenate(outs[1]))
+        assert loud.enrolled_at == 3.0
+        assert not np.allclose(decoy, vb.null)
+        assert 4.5 <= vb.enrolled_at <= 6.0 and np.array_equal(vb.emb, vb.null)
+        assert not vb.waiting and not vb.live
+
     def test_voicebot_needs_the_live_rule(self):
         with pytest.raises(ValueError):
             LocalIsolator(TINY, voicebot=True, enrollment=speechlike(3.0))
@@ -325,6 +442,43 @@ class TestGate:
         assert np.allclose(kept[1:], 0.1, atol=1e-6)
         s = OnnxStream(TINY_GATE, gate="0.99:0:0.99:1")
         assert not np.any(s._gate_out(0.1 * line, line, low))
+
+    def test_what_a_kept_frame_counts_for_while_the_decoy_holds(self, tmp_path):
+        # The voicebot mode: until the first enrollment the model is told to keep
+        # nobody. A model says what a kept frame counts for there ("serve"
+        # "wait_keep"): as ever (the default), nothing, or only in runs; once a
+        # caller is enrolled it counts as ever again.
+        import shutil
+
+        from stt_api.livekit_plugin.voice_isolator.onnx_stream import OnnxStream
+
+        def model(wait_keep):
+            d = tmp_path / f"wk{wait_keep}"
+            if not d.exists():
+                shutil.copytree(TINY_GATE, d)
+                cfg = json.loads((d / "config.json").read_text())
+                cfg["serve"] = dict(cfg.get("serve") or {}, wait_keep=wait_keep)
+                (d / "config.json").write_text(json.dumps(cfg))
+            return str(d)
+
+        line = np.full(6 * 160, 0.1, np.float32)
+        low = logit([0.01] * 6)
+        g = dict(gate="0.99:0:0.99:1", voicebot=True)
+        s = OnnxStream(TINY_GATE, **g)  # no word from the model: as ever
+        assert s.waiting and s.wait_keep == 1
+        assert np.allclose(s._gate_out(line.copy(), line, low)[160:], 0.1, atol=1e-6)
+        s = OnnxStream(model(0), **g)  # nothing: only the head opens the gate
+        assert not np.any(s._gate_out(line.copy(), line, low))
+        s = OnnxStream(model(3), **g)  # from the third kept frame in a row
+        h = s._gate_out(line.copy(), line, low).reshape(6, 160).mean(1)
+        assert not np.any(h[:2]) and np.allclose(h[3:], 0.1, atol=1e-6)
+        s = OnnxStream(model(0), **g)  # enrolled: a kept frame counts again
+        x = np.concatenate([steady(4.0, 0.05, seed=25), steady(3.0, 0.2, seed=26)])
+        for i in range(0, len(x), 800):
+            s.push(x[i : i + 800])
+        assert s.enrolled_at is not None and not s.waiting
+        kept = s._gate_out(line[:640].copy(), line[:640], low[:4]).reshape(4, 160)
+        assert np.allclose(kept.mean(1)[1:], 0.1, atol=1e-6)
 
 
 @pytest.fixture

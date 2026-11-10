@@ -94,6 +94,11 @@ class LocalIsolator:
     One instance per process is enough: the sessions are shared and each `open()`
     starts a call from a clean state.
 
+    `live_enroll`: the live enrollment (see onnx_stream.py). None (default) serves
+    the model as it asks to be served in its config.json: the agent model with no
+    enrollment, the others enrolled on the loudest 3 s of the call's start. True
+    and False set it whatever the model says.
+
     `voicebot=True`: the voicebot mode (see the module's notes and README.md), for
     an agent that speaks first.
 
@@ -110,12 +115,12 @@ class LocalIsolator:
         *,
         quantized: bool = False,
         num_threads: int = 1,
-        live_enroll: bool = True,
+        live_enroll: bool | None = None,
         enrollment: np.ndarray | None = None,
         voicebot: bool = False,
         gate: str | None = "auto",
     ) -> None:
-        if voicebot and (enrollment is not None or not live_enroll):
+        if voicebot and (enrollment is not None or live_enroll is False):
             raise ValueError(
                 "voicebot=True holds back the live enrollment until the caller is "
                 "heard: it needs live_enroll=True and no enrollment="
