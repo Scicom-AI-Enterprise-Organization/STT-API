@@ -186,7 +186,10 @@ speaker stops, so no text detector can beat that. That is the reason
 - `ClearlineNC` reads two graphs of the same function: the fused one the pin ships
   (first input `ri`, rows of real and imaginary parts, up to 16 hops a call) and the
   plain one (`spec`; the Hub repo's `plain/`). An older plugin cannot read the fused
-  graph: bump `NC_REVISION` only together with this code.
+  graph: bump `NC_REVISION` only together with this code. Since 2026-11-12 the quality
+  mode's pinned graph is a third kind: 8-bit weights, one hop per call (its `max_hops`
+  metadata), no plain twin; its numbers were measured on that file, and on x86 it
+  gives the same samples with or without VNNI wherever there is AVX2.
 - `ClearlineNC` defaults to `mode="asr"` (noise kept 20 dB down, 70% of the input mixed
   back): it costs Whisper less than GTCRN; `mode="quality"` removes more noise and
   costs Whisper more through a phone path. Both are registered in the NC benchmark as

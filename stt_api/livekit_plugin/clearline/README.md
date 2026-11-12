@@ -140,18 +140,21 @@ A band-gain and deep-filter enhancer on GTCRN's STFT (512-point sqrt-Hann, 256 h
 
 | | GTCRN | `mode="quality"` | `mode="asr"` (default) |
 |---|---|---|---|
-| VoiceBank+DEMAND PESQ / SI-SDR | 2.535 / 14.6 dB | **2.575 / 17.4 dB** | 2.135 / 10.5 dB |
-| DNS 2020 synthetic PESQ / ESTOI | 2.293 / 0.872 | **2.389 / 0.886** | 1.697 / 0.827 |
-| CPU per 20 ms frame at 16 kHz, one core (paired, quiet server) | 1.09 ms | 0.38 ms | **0.19 ms** |
-| plugin CPU per stream at real-time pace, 8 streams, 16 kHz / 48 kHz room (% of a core) | 6.20 / 6.83 | 2.50 / 3.28 | **1.51 / 2.49** |
-| Whisper large-v3 WER, all 824 VoiceBank utterances, wideband / phone path | 2.65% / 4.26% | 2.32% / 5.79% | **1.55% / 2.90%** |
-| Whisper large-v3 WER, DNS 2020 synthetic (150 clips) | 5.30% | 6.48% | **5.02%** |
+| VoiceBank+DEMAND PESQ / SI-SDR | 2.535 / 14.6 dB | **2.597 / 16.8 dB** | 2.135 / 10.5 dB |
+| DNS 2020 synthetic PESQ / ESTOI | 2.293 / 0.872 | **2.550 / 0.898** | 1.697 / 0.827 |
+| DNS 2020 real recordings, DNSMOS overall | 2.75 | **2.77** | 2.34 |
+| CPU per 20 ms frame at 16 kHz, one core (paired, quiet server) | 1.11 ms | 0.53 ms | **0.19 ms** |
+| plugin CPU per stream at real-time pace, 8 streams, 16 kHz / 48 kHz room (% of a core) | 5.71 / 6.87 | 2.79 / 3.91 | **1.22 / 2.30** |
+| Whisper large-v3 WER, all 824 VoiceBank utterances, wideband / phone path | 2.65% / 4.26% | 2.45% / 5.93% | **1.55% / 2.90%** |
+| Whisper large-v3 WER, DNS 2020 synthetic (150 clips) | 5.30% | 6.07% | **5.02%** |
 
 (Unprocessed: 1.45% / 2.95% on VoiceBank, 5.38% on DNS. Neither mode is trained on
-VoiceBank, VCTK or DEMAND. Since 2026-10-30 the quality mode is the larger graph, 256
-units with per-bin levels and gains, distilled from a GPU model that removes background
-noise and keeps every voice, `Scicom-intl/Clearline-NC-GPU`; a frame of it costs about
-a third of GTCRN's CPU, of the ASR mode about a sixth.) Every WER here is on the
+VoiceBank, VCTK or DEMAND. Since 2026-11-12 the quality mode is a wider graph, a
+384-unit core with per-bin levels and gains and a small path shared by every bin, its
+large matrices in 8 bits, distilled from a GPU model that removes background noise and
+keeps every voice, `Scicom-intl/Clearline-NC-GPU`; a frame of it costs about half of
+GTCRN's CPU (the quality mode before it: about a third), of the ASR mode under a
+fifth.) Every WER here is on the
 benchmark's harness as fixed: a streaming filter's output is flushed and aligned
 before Whisper hears it (`../noise_cancellation/benchmark/README.md`); before
 2026-10-27 the harness cut each utterance's last 32 ms for every streaming filter.
@@ -162,11 +165,11 @@ Whisper's WER after each filter:
 
 | | unprocessed | GTCRN | `mode="quality"` | `mode="asr"` |
 |---|---|---|---|---|
-| G.711 | 3.25% | 10.72% | 4.64% | **3.20%** |
+| G.711 | 3.25% | 10.72% | 4.88% | **3.20%** |
 | GSM | 7.41% | 15.60% | 9.10% | **6.96%** |
-| Opus | 4.94% | 13.46% | 7.32% | **4.81%** |
-| AMR-NB* | 4.83% | 13.66% | 6.99% | **5.24%** |
-| G.723.1* | 7.72% | 16.62% | 9.89% | **7.78%** |
+| Opus | 4.94% | 13.46% | 6.86% | **4.81%** |
+| AMR-NB* | 4.83% | 13.66% | 6.69% | **5.24%** |
+| G.723.1* | 7.72% | 16.62% | 10.11% | **7.78%** |
 
 `mode="asr"` is the model trained to keep noise 20 dB down rather than remove it,
 with 70% of the input mixed back (`mix_back`), chosen on development data: a robust
@@ -175,7 +178,7 @@ that share Whisper's word error rate stays where the unprocessed input has it (o
 eight test conditions, 1.00 times the unprocessed input's on average; GTCRN 2.17).
 It is the default for agents. The price is quality: it leaves most of the noise in.
 `mode="quality"` removes background noise for a human listener and keeps every voice
-(a second talker loses about 1 dB, crowd babble about 25 dB); it costs Whisper more on
+(a second talker loses about 1 dB, crowd babble about 27 dB); it costs Whisper more on
 most lines.
 
 ```bash
@@ -185,15 +188,15 @@ python -m stt_api.livekit_plugin.noise_cancellation.benchmark --corpus voicebank
 
 ### The graphs and the buffers (2026-11-11)
 
-The pinned revision ships both models as **fused graphs**: the same function with
-two fifths of the operators (the plain graph spent two thirds of a call on bookkeeping for
-calls of any length), equal to the plain graphs within one LSB through the plugin and
-to the fourth decimal on the three test corpora. The plain graphs are in the
-repository's `plain/` folder and the plugin reads either (the fused graph's first
-input is named `ri`, the plain one's `spec`). The plugin also keeps its samples in
-arrays written in place now. Together a 20 ms frame of the quality mode costs 0.35 of
-GTCRN's CPU where it cost 0.44, and of the ASR mode 0.17 where it cost 0.27; the
-output is the first version's, sample for sample.
+Since 2026-11-11 the pin ships **fused graphs**: the same function with two fifths of
+the operators (the plain graph spent two thirds of a call on bookkeeping for calls of
+any length), equal to the plain graphs within one LSB through the plugin and to the
+fourth decimal on the three test corpora. The plugin reads either kind (the fused
+graph's first input is named `ri`, the plain one's `spec`), and the ASR mode's plain
+graph is in the repository's `plain/` folder. The plugin also keeps its samples in
+arrays written in place now. Together a 20 ms frame of the ASR mode costs 0.17 of
+GTCRN's CPU where it cost 0.27 (the quality mode of that day 0.35 where it cost 0.44);
+the output is the first version's, sample for sample.
 
 And a fault is gone. At any room rate but 16 kHz the plugin kept every 16 kHz sample
 it had already resampled and rebuilt that array on every frame, so a call's frames
@@ -202,6 +205,24 @@ cost more the longer it ran: at 48 kHz, 0.69 ms a frame in a call's first minute
 was adapted from, had the same fault (1.5 ms in the first minute, 2.9 ms in the
 sixth) and is fixed with it. At 16 kHz, which the snippet above asks for, nothing
 grew.
+
+### The quality mode's graph (2026-11-12)
+
+The quality mode at the pin is a new model and a new kind of graph. Its large
+matrices are 8-bit integers (ONNX Runtime's dynamic quantisation), and it takes
+exactly one hop per call, which the plugin reads from the graph's `max_hops`
+metadata. Eight-bit weights are another function
+than the float ones, so every number above was measured on this very file, and there
+is no plain graph of it. A frame costs 0.48 of GTCRN's CPU, where the fused graph of
+the quality mode before it cost 0.37 in the same sessions: the gain on DNS 2020 and
+the lead on its real recordings are bought with that.
+
+ONNX Runtime picks its integer kernels by what the CPU has, so the file was run on
+other x86 processors under Intel's emulator and compared with the server's own
+output: the same, sample for sample, on every one with AVX2, with VNNI or without
+(Haswell, Skylake-X, Cascade Lake, Ice Lake, Alder Lake, Sapphire Rapids); on the two
+without AVX2 (Sandy Bridge, Nehalem) it differs by 59 dB under the signal. It was
+not run on ARM.
 
 ## Traps
 

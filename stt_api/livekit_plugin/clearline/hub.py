@@ -2,7 +2,7 @@
 Where the Clearline weights come from.
 
 The ONNX graphs are over the repo's 1 MB pre-commit limit (1.4 MB for the VAD,
-1.6 and 5.3 MB for the noise canceller's two modes), so they are not vendored: they are fetched from
+1.6 and 3.5 MB for the noise canceller's two modes), so they are not vendored: they are fetched from
 the Hugging Face repositories below on first use, **pinned to the revision this
 plugin was tested against**, and cached by `huggingface_hub` as usual.
 Both repositories are public, so no token is needed: Clearline-VAD and
@@ -18,10 +18,14 @@ too often, or late). Bump `VAD_REVISION` and `OPERATING_POINT` together, never
 one without the other.
 
 `NC_REVISION` and `nc.py` move together as well. Since 2026-11-11 the two noise
-canceller files at the pin are fused graphs (the same weights and function with
-two fifths of the operators; their first input is named `ri`), which a plugin older than
-that cannot read; the plain graphs it could read are in the repository's `plain/`
-folder, and this plugin reads either. The VAD's weights at the pin are the files of
+canceller files at the pin are fused graphs (two fifths of a plain graph's operators;
+their first input is named `ri`), which a plugin older than that cannot read. Since
+2026-11-12 the quality mode's file is a new model (a 384-unit core and a small path
+shared by every bin, distilled from Clearline-NC-GPU v2) whose large matrices are
+8-bit integers and which takes one hop per call (the graph's `max_hops` metadata,
+which this plugin reads); 8-bit weights are another function than the float ones, so
+it has no plain graph. The ASR mode's file is unchanged, and its plain graph is still
+in the repository's `plain/` folder. The VAD's weights at its pin are the files of
 the revision before it (`da8f290b`), byte for byte: only the plugin code changed.
 
 A local file overrides the download: pass `model_path=` / `onnx_file_path=`, or
@@ -35,7 +39,7 @@ import os
 VAD_REPO = "Scicom-intl/Clearline-VAD"
 NC_REPO = "Scicom-intl/Clearline-NC-CPU"
 VAD_REVISION = "72a942e5ac9f68465215580da7fbc0deabcd03d7"
-NC_REVISION = "52f4167074d507303a0277e15f00cd93fbc63876"
+NC_REVISION = "b8dcab3f491eec259a2cb40df5926a8f0b24c4e9"
 
 VAD_FILES = {
     ("release", 512): "clearline_vad.onnx",

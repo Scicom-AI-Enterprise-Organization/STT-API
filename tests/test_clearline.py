@@ -439,7 +439,9 @@ def test_asr_mode_cleans_up(nc_weights, in_snr):
     clean, noisy = _noisy(in_snr)
     y = run(_nc(mode="asr"), noisy, RATE)
     before, after = snr_db(clean, noisy), snr_db(clean, y, best_lag(clean, y, 1200))
-    assert before + 1.0 < after < before + 6.0, f"asr: {before:.1f} dB -> {after:.1f} dB"
+    assert (
+        before + 1.0 < after < before + 6.0
+    ), f"asr: {before:.1f} dB -> {after:.1f} dB"
 
 
 def test_asr_mode_keeps_some_of_the_input(nc_weights):
@@ -491,24 +493,46 @@ def test_a_long_call_holds_no_more_than_a_short_one(nc_weights, mode, rate):
     assert (nc._in16.a.size, nc._out16.a.size, nc._out_native.a.size) == cap
 
 
-@pytest.mark.parametrize("mode", ["asr", "quality"])
-def test_the_pin_ships_fused_graphs_and_the_plain_ones_still_read(nc_weights, mode):
-    # Since 2026-11-11 the pinned files are fused graphs (first input "ri": the same
-    # weights and function with a third of the operators). The plain graphs, which a
-    # plugin before that date needs, are in the repository's plain/ folder; this
-    # plugin reads either and they must give the same samples, within one step of the
-    # 16-bit scale.
+def _graph_meta(path):
     import onnxruntime as ort
 
-    first = ort.InferenceSession(
-        nc_weights[mode], providers=["CPUExecutionProvider"]
-    ).get_inputs()[0]
-    assert first.name == "ri"
+    sess = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
+    return sess.get_inputs()[0].name, sess.get_modelmeta().custom_metadata_map
+
+
+@pytest.mark.parametrize("mode", ["asr", "quality"])
+def test_the_pin_ships_fused_graphs(nc_weights, mode):
+    # Since 2026-11-11 the pinned files are fused graphs (first input "ri"), which a
+    # plugin older than that cannot read: NC_REVISION and nc.py move together.
+    first, meta = _graph_meta(nc_weights[mode])
+    assert first == "ri"
+    assert meta.get("graph") == {"asr": "fast", "quality": "fast-q8"}[mode]
+
+
+def test_the_asr_graph_is_its_plain_graph(nc_weights):
+    # The ASR model's fused graph is the same weights and function with two fifths of
+    # the operators. Its plain graph, which a plugin before 2026-11-11 needs, is in
+    # the repository's plain/ folder; this plugin reads either and they must give the
+    # same samples, within one step of the 16-bit scale.
     plain = _weights_or_skip(
-        lambda: hub._fetch(hub.NC_REPO, f"plain/{hub.NC_FILES[mode]}", hub.NC_REVISION)
+        lambda: hub._fetch(hub.NC_REPO, f"plain/{hub.NC_FILES['asr']}", hub.NC_REVISION)
     )
+    assert _graph_meta(plain)[0] == "spec"
     x = load_speech(RATE)[: 3 * RATE]
-    a = run(_nc(mode=mode), x, RATE)
-    b = run(_nc(mode=mode, model_path=plain), x, RATE)
+    a = run(_nc(mode="asr"), x, RATE)
+    b = run(_nc(mode="asr", model_path=plain), x, RATE)
     assert a.shape == b.shape
     assert np.max(np.abs(a - b)) <= 1.01 / 32768.0
+
+
+def test_the_quality_graph_takes_one_hop_a_call_at_any_frame_size(nc_weights):
+    # Since 2026-11-12 the quality graph holds its large matrices in 8 bits and takes
+    # exactly one hop per call (metadata max_hops = 1), so a 50 ms frame, which
+    # carries three hops, is three calls. The samples must not depend on how the
+    # audio was cut into frames: integer arithmetic, the same hops in the same order.
+    _, meta = _graph_meta(nc_weights["quality"])
+    assert meta.get("max_hops") == "1"
+    x = load_speech(RATE)[: 3 * RATE]
+    n = (len(x) // 800) * 800  # whole 10 ms and 50 ms frames
+    a, b = (run(_nc(mode="quality"), x[:n], RATE, ms) for ms in (10, 50))
+    assert np.array_equal(a, b)
