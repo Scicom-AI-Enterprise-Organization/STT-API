@@ -20,15 +20,19 @@ input mixed back, chosen on development data. On the benchmark's harness (stream
 output flushed and aligned) over all 824 VoiceBank test utterances, Whisper large-v3
 scores 1.55% WER after it against 1.45% unprocessed and GTCRN's 2.65% (wideband), and
 2.90% against 2.95% and 4.26% through a G.711 phone path. "quality": for a human
-listener, a larger graph (256 units with per-bin levels and gains) distilled from a
-GPU model (Scicom-intl/Clearline-NC-GPU) that removes background noise and keeps every
-voice: VoiceBank+DEMAND PESQ 2.575 and DNS 2020 synthetic 2.389, against GTCRN's 2.535
-and 2.293, at about half GTCRN's CPU. Neither mode is trained on VoiceBank, VCTK or
-DEMAND.
+listener, a larger graph (a 384-unit core with per-bin levels and gains and a small
+path shared by every bin, its large matrices in 8 bits) distilled from a GPU model
+(Scicom-intl/Clearline-NC-GPU) that removes background noise and keeps every voice:
+VoiceBank+DEMAND PESQ 2.597 and DNS 2020 synthetic 2.550, against GTCRN's 2.535 and
+2.293, and DNSMOS 2.77 against 2.75 on DNS 2020's real recordings, at about half
+GTCRN's CPU. Neither mode is trained on VoiceBank, VCTK or DEMAND.
 
 The model file is one of two graphs of the same function: the fused graph (two fifths
 of the operators; its first input is named "ri"), which the pinned revision ships, or the
-plain one (first input "spec"). The samples around the model sit in arrays written in
+plain one (first input "spec"). The quality mode's pinned graph is a third kind:
+fused, with 8-bit weights, one hop per call (read from its `max_hops` metadata), and
+no plain twin, since 8-bit weights are another function than the float ones. The
+samples around the model sit in arrays written in
 place: the first version joined a new array for every buffer on every frame, and at any
 room rate but 16 kHz it never let go of the 16 kHz output it had already resampled, so
 a call's frames grew slower the longer it ran. The output is the first version's,
