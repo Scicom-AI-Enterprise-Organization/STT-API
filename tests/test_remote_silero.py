@@ -343,6 +343,125 @@ def test_a_server_that_never_answers_counts_as_gone():
         s.close()
 
 
+def _stalling_app(stall_every: float, stall_for: float, hold: float):
+    """Upstream silero per connection, whose replies are held `hold` s while a stall
+    is on (`stall_for` s of every `stall_every`), in order, as a congested path does."""
+    from livekit.plugins.silero import onnx_model
+
+    session = onnx_model.new_inference_session(True)
+
+    def app():
+        async def ws(request):
+            w = web.WebSocketResponse()
+            await w.prepare(request)
+            await w.send_str(
+                json.dumps({"model": "stalling", "sample_rate": 16000, "window": 512})
+            )
+            model = onnx_model.OnnxModel(onnx_session=session, sample_rate=16000)
+            loop = asyncio.get_running_loop()
+            start = loop.time()
+            replies: asyncio.Queue = asyncio.Queue()
+
+            async def send():
+                while True:
+                    due, payload = await replies.get()
+                    await asyncio.sleep(max(0.0, due - loop.time()))
+                    await w.send_bytes(payload)
+
+            sender = asyncio.create_task(send())
+            async for msg in w:
+                if msg.type != web.WSMsgType.BINARY:
+                    continue
+                x = np.frombuffer(msg.data, np.int16).astype(np.float32) / 32767.0
+                p = [model(x[k : k + 512]) for k in range(0, len(x), 512)]
+                stalled = (loop.time() - start) % stall_every >= stall_every - stall_for
+                replies.put_nowait(
+                    (
+                        loop.time() + (hold if stalled else 0.0),
+                        np.array(p, "<f4").tobytes(),
+                    )
+                )
+            sender.cancel()
+            return w
+
+        application = web.Application()
+        application.router.add_get("/{tail:.*}", ws)
+        return application
+
+    return app
+
+
+def test_a_late_server_costs_at_most_max_lag():
+    s = Server(app_factory=_stalling_app(stall_every=0.6, stall_for=0.25, hold=0.6))
+    try:
+        x = np.concatenate([padded(RATE), padded(RATE)])
+        vad = RemoteSileroVAD.load(s.url, max_lag=0.2, reply_timeout=5.0)
+        rows: list[tuple] = []
+        delays: list[float] = []
+
+        async def drive():
+            stream = vad.stream()
+
+            async def drain():
+                async for ev in stream:
+                    rows.append(_row(ev))
+                    if ev.type == agents.vad.VADEventType.INFERENCE_DONE:
+                        delays.append(ev.inference_duration)
+
+            task = asyncio.create_task(drain())
+            pcm = np.clip(np.rint(x * 32767.0), -32768, 32767).astype(np.int16)
+            for k in range(0, len(pcm) - 320 + 1, 320):
+                stream.push_frame(
+                    rtc.AudioFrame(pcm[k : k + 320].tobytes(), RATE, 1, 320)
+                )
+                await asyncio.sleep(0.02)
+            stream.end_input()
+            await task
+            await stream.aclose()
+
+        asyncio.run(drive())
+        ref = turns(events(silero.VAD.load(), x, RATE))
+        assert sum(r[0] == "inference_done" for r in rows) == len(x) // 320 * 320 // 512
+        assert max(delays) < 0.2 + 0.05, f"a window waited {max(delays):.3f} s"
+        assert vad.windows_late > 0 and vad.windows_remote > 0
+        assert vad.windows_local == vad.windows_late, "late is not lost: no failover"
+        got = turns(rows)
+        assert [k for k, _ in got] == [k for k, _ in ref]
+        assert all(abs(a - b) < 0.07 for (_, a), (_, b) in zip(got, ref))
+    finally:
+        s.close()
+
+
+def test_after_an_outage_every_window_is_upstream_silero():
+    # The CPU model takes over warmed on the second before, and the server comes back
+    # warmed on it too (its replies to the warm-up dropped): neither starts cold.
+    s = Server()
+    try:
+        x = np.concatenate([padded(RATE), padded(RATE), padded(RATE)])
+        vad = RemoteSileroVAD.load(s.url)
+        n_frames = len(x) // (RATE // 50)
+        speech = int(2.0 * RATE) // (RATE // 50)  # a second into the first utterance
+
+        def on_frame(i):
+            if i == speech:
+                s.stop()
+            elif i == n_frames // 2 + speech:
+                s.start()
+
+        got = events(vad, x, RATE, pace=0.004, on_frame=on_frame)
+        ref = events(silero.VAD.load(), x, RATE)
+        assert vad.windows_local > 0 and vad.windows_remote > 0
+        p_got = [r[5] for r in got if r[0] == "inference_done"]
+        p_ref = [r[5] for r in ref if r[0] == "inference_done"]
+        assert len(p_got) == len(p_ref)
+        assert max(abs(a - b) for a, b in zip(p_got, p_ref)) < 0.05
+        assert [(k, round(t, 2)) for k, t in turns(got)] == [
+            (k, round(t, 2)) for k, t in turns(ref)
+        ]
+    finally:
+        s.close()
+
+
 def test_update_options_reaches_open_streams(server):
     vad = RemoteSileroVAD.load(server.url)
 

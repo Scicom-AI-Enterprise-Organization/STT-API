@@ -14,6 +14,14 @@ window for `reply_timeout` seconds, fails over to LiveKit's own silero on this C
 (`fallback=True`, the default) for the windows still in flight and every window
 after, while the stream reconnects in the background. With `fallback=False` those
 windows score 0.0: the agent hears nobody until the server is back.
+
+Delay: a window the server has not answered `max_lag` seconds (0.2) after it was sent
+is scored here at once, and the server's late reply for it is dropped. The connection
+stays up, so the server keeps the call's state and its replies take over again once
+they are back within `max_lag`. Only a reply that comes on time resets
+`reply_timeout`'s clock, so a server answering slower and slower is not alive for ever.
+The CPU model takes over warmed on the second of audio before the window: started cold
+it is up to 0.94 off in p(speech), warmed on 1 s at most 0.04.
 """
 
 from __future__ import annotations
@@ -45,6 +53,7 @@ SAMPLE_RATE = 16000
 WINDOW = 512  # silero at 16 kHz: 32 ms
 WINDOW_DURATION = WINDOW / SAMPLE_RATE
 _BACKOFF = (0.5, 1.0, 2.0, 5.0)  # seconds between reconnects, the last repeating
+_WARMUP_WINDOWS = 32  # 1 s of audio run through the CPU model before it takes over
 
 
 @dataclass
@@ -103,9 +112,7 @@ def _handshake(url: str, headers: dict[str, str], timeout: float) -> dict:
         # The type, not repr: a handshake error's repr carries our request headers.
         raise ConnectionError(
             f"silero VAD server at {url} is unusable: {type(exc).__name__}"
-        ) from (
-            exc if isinstance(exc, BaseException) else None
-        )
+        ) from (exc if isinstance(exc, BaseException) else None)
     return box["hello"]
 
 
@@ -135,6 +142,7 @@ class RemoteSileroVAD(agents.vad.VAD):
         headers: dict[str, str] | None = None,
         connect_timeout: float = 5.0,
         reply_timeout: float = 0.5,
+        max_lag: float = 0.2,
         fallback: bool = True,
         check_server: bool = True,
     ) -> RemoteSileroVAD:
@@ -145,7 +153,8 @@ class RemoteSileroVAD(agents.vad.VAD):
                 defaults (deactivation defaults to max(activation - 0.15, 0.01)).
             headers: sent with every WebSocket handshake (an auth header, say).
             connect_timeout: seconds for a connection to open.
-            reply_timeout: a window unanswered this long counts as the server lost.
+            reply_timeout: no reply on time for this long counts as the server lost.
+            max_lag: a window unanswered this long is scored on this CPU at once.
             fallback: score windows with LiveKit's silero on this CPU while the server
                 is unreachable. Needs `livekit-plugins-silero`. False scores them 0.0.
             check_server: connect once now and raise if the server is unusable.
@@ -203,6 +212,7 @@ class RemoteSileroVAD(agents.vad.VAD):
             opts=opts,
             connect_timeout=connect_timeout,
             reply_timeout=reply_timeout,
+            max_lag=max_lag,
             fallback_session=session,
         )
         vad._server_model = hello.get("model", "silero")
@@ -216,6 +226,7 @@ class RemoteSileroVAD(agents.vad.VAD):
         opts: _VADOptions,
         connect_timeout: float,
         reply_timeout: float,
+        max_lag: float = 0.2,
         fallback_session=None,
     ) -> None:
         super().__init__(
@@ -223,6 +234,7 @@ class RemoteSileroVAD(agents.vad.VAD):
         )
         self._url, self._headers, self._opts = url, headers, opts
         self._connect_timeout, self._reply_timeout = connect_timeout, reply_timeout
+        self._max_lag = max_lag
         self._fallback_session = fallback_session
         self._streams = weakref.WeakSet[RemoteSileroVADStream]()
         self._server_model = "silero"
@@ -230,6 +242,8 @@ class RemoteSileroVAD(agents.vad.VAD):
         # scored here because it could not
         self.windows_remote = 0
         self.windows_local = 0
+        # of windows_local, those scored here because the server was late, not lost
+        self.windows_late = 0
 
     @property
     def model(self) -> str:
@@ -300,6 +314,13 @@ class RemoteSileroVADStream(agents.vad.VADStream):
         self._session = None
         self._gen = 0  # bumped on every connection, so a dead one's replies are dropped
         self._inflight: collections.deque = collections.deque()
+        # the oldest windows in _inflight were scored here for being late: their
+        # replies are still owed, and are dropped when they come
+        self._answered_here = 0
+        self._lag_timer: asyncio.TimerHandle | None = None
+        # the last second of windows scored, to warm the CPU model on
+        self._history: collections.deque = collections.deque(maxlen=_WARMUP_WINDOWS)
+        self._local_in_step = False  # the CPU model scored the window before this one
         self._drained = asyncio.Event()
         self._recv_task: asyncio.Task | None = None
         self._reconnect_task: asyncio.Task | None = None
@@ -435,27 +456,65 @@ class RemoteSileroVADStream(agents.vad.VADStream):
                 self._fail(TimeoutError("no reply within reply_timeout"))
         ws = self._ws
         if ws is None:
-            self._on_window(self._score_locally(x16), win, out, 0.0)
+            self._score_here(win, out, x16, 0.0)
             return
         self._inflight.append((win, out, now, x16))
         self._drained.clear()
+        self._arm_lag_timer()
         try:
             await ws.send_bytes(x16.tobytes())
         except Exception as exc:  # noqa: BLE001 - the window is scored by _fail
             if ws is self._ws:
                 self._fail(exc)
 
-    def _score_locally(self, x16: np.ndarray) -> float:
+    def _score_here(self, win, out, x16: np.ndarray, delay: float) -> None:
+        """Score one window on this CPU and emit it, `delay` s after it was sent."""
         self._vad.windows_local += 1
         if self._vad._fallback_session is None:
-            return 0.0  # fail closed: hold
-        if self._local is None:
-            from livekit.plugins.silero import onnx_model
+            p = 0.0  # fail closed: hold
+        else:
+            if self._local is None:
+                from livekit.plugins.silero import onnx_model
 
-            self._local = onnx_model.OnnxModel(
-                onnx_session=self._vad._fallback_session, sample_rate=SAMPLE_RATE
-            )
-        return self._local(x16.astype(np.float32) / 32767.0)
+                self._local = onnx_model.OnnxModel(
+                    onnx_session=self._vad._fallback_session, sample_rate=SAMPLE_RATE
+                )
+            if not self._local_in_step:
+                self._local.reset()
+                for earlier in self._history:
+                    self._local(earlier.astype(np.float32) / 32767.0)
+                self._local_in_step = True
+            p = self._local(x16.astype(np.float32) / 32767.0)
+        self._history.append(x16)
+        self._on_window(p, win, out, delay)
+
+    def _arm_lag_timer(self) -> None:
+        """Wake when the oldest window still owed a score turns `max_lag` old."""
+        if self._lag_timer is not None or len(self._inflight) <= self._answered_here:
+            return
+        sent = self._inflight[self._answered_here][2]
+        self._lag_timer = asyncio.get_running_loop().call_later(
+            max(0.0, sent + self._vad._max_lag - time.perf_counter()), self._on_lag
+        )
+
+    def _on_lag(self) -> None:
+        self._lag_timer = None
+        now = time.perf_counter()
+        while len(self._inflight) > self._answered_here:
+            win, out, sent, x16 = self._inflight[self._answered_here]
+            if now - sent < self._vad._max_lag:
+                break
+            self._vad.windows_late += 1
+            self._score_here(win, out, x16, now - sent)
+            self._answered_here += 1
+        if len(self._inflight) <= self._answered_here:
+            self._drained.set()
+        self._arm_lag_timer()
+
+    def _cancel_lag_timer(self) -> None:
+        if self._lag_timer is not None:
+            self._lag_timer.cancel()
+            self._lag_timer = None
 
     async def _flush(self) -> None:
         # upstream resets everything between two windows: let the windows already
@@ -468,6 +527,8 @@ class RemoteSileroVADStream(agents.vad.VADStream):
                 self._fail(exc)
         if self._local is not None:
             self._local.reset()
+        self._history.clear()
+        self._local_in_step = False
         self._n = 0
         self._exp_filter = utils.ExpFilter(alpha=0.35)
         self._speech_buffer_index = 0
@@ -477,7 +538,7 @@ class RemoteSileroVADStream(agents.vad.VADStream):
         self._reset_public_state()
 
     async def _wait_drained(self, timeout: float) -> None:
-        if not self._inflight:
+        if len(self._inflight) <= self._answered_here:
             return
         try:
             await asyncio.wait_for(self._drained.wait(), timeout)
@@ -505,6 +566,19 @@ class RemoteSileroVADStream(agents.vad.VADStream):
         self._session, self._ws = session, ws
         self._gen += 1
         self._recv_task = asyncio.create_task(self._recv(ws, self._gen))
+        if self._history:
+            # the server starts this call from zero: warm it on the last second, its
+            # replies dropped as a late window's are
+            sent = time.perf_counter()
+            for x16 in self._history:
+                self._inflight.append((None, None, sent, x16))
+            self._answered_here += len(self._history)
+            try:
+                await ws.send_bytes(b"".join(x16.tobytes() for x16 in self._history))
+            except Exception as exc:  # noqa: BLE001
+                if ws is self._ws:
+                    self._fail(exc)
+                return False
         if self._down_since is not None:
             logger.info(
                 "silero VAD server at %s is back after %.1f s",
@@ -522,15 +596,23 @@ class RemoteSileroVADStream(agents.vad.VADStream):
                 if gen != self._gen:
                     return
                 if msg.type == aiohttp.WSMsgType.BINARY:
-                    t = self._last_reply = time.perf_counter()
+                    t = time.perf_counter()
                     for p in np.frombuffer(msg.data, dtype="<f4"):
                         if not self._inflight:
                             break
-                        win, out, sent, _ = self._inflight.popleft()
+                        win, out, sent, x16 = self._inflight.popleft()
+                        if self._answered_here:
+                            self._answered_here -= 1
+                            continue
+                        # only a reply on time: one late for ever is not alive
+                        self._last_reply = t
                         self._vad.windows_remote += 1
+                        self._history.append(x16)
+                        self._local_in_step = False
                         self._on_window(float(p), win, out, t - sent)
-                    if not self._inflight:
+                    if len(self._inflight) <= self._answered_here:
                         self._drained.set()
+                    self._arm_lag_timer()
                 elif msg.type in (aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSED):
                     break
         except asyncio.CancelledError:
@@ -560,9 +642,14 @@ class RemoteSileroVADStream(agents.vad.VADStream):
                 if self._vad._fallback_session is not None
                 else "every window scores 0.0",
             )
+        self._cancel_lag_timer()
+        for _ in range(self._answered_here):
+            self._inflight.popleft()
+        self._answered_here = 0
+        now = time.perf_counter()
         while self._inflight:
-            win, out, _, x16 = self._inflight.popleft()
-            self._on_window(self._score_locally(x16), win, out, 0.0)
+            win, out, sent, x16 = self._inflight.popleft()
+            self._score_here(win, out, x16, now - sent)
         self._drained.set()
         if ws is not None:
             asyncio.ensure_future(self._close(ws, session))
@@ -575,8 +662,6 @@ class RemoteSileroVADStream(agents.vad.VADStream):
             await asyncio.sleep(_BACKOFF[min(k, len(_BACKOFF) - 1)])
             k += 1
             if not self._closing and await self._connect():
-                if self._local is not None:
-                    self._local.reset()  # the server starts this call from zero too
                 return
 
     @staticmethod
@@ -591,6 +676,7 @@ class RemoteSileroVADStream(agents.vad.VADStream):
         ws, session = self._ws, self._session
         self._ws = self._session = None
         self._gen += 1
+        self._cancel_lag_timer()
         if self._recv_task is not None:
             self._recv_task.cancel()
         if ws is not None:
