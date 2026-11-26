@@ -19,6 +19,20 @@ pip install "silero-vad==6.2.1" --no-deps   # 6.1 for livekit-agents 1.2 / 1.3
 CUDA_VISIBLE_DEVICES=0 python -m stt_api.livekit_plugin.remote_silero.server --port 8766
 ```
 
+## Deployed (tm-h20)
+
+```python
+RemoteSileroVAD.load(
+    "wss://serverlessgpu.aifoundry.scicom.dev/proxy/silero-vad/",
+    headers={"Authorization": f"Bearer {sgpu_key}"},   # an AI Foundry key
+)
+```
+
+Slurm job `silero-vad-1021` on 1021 GPU 1 (`ucc_slurm-ui-job` `jobs/tm-h20/silero-vad-1021.yaml`), silero-vad
+6.1 weights for livekit-agents 1.2 / 1.3, two workers. The gateway proxy `silero-vad` reaches it through the
+`h20-tunnel-silero-vad` tunnel (ai-foundry-poc) and adds the server's own key. A restart of the job deploys
+STT-API `main`.
+
 ## Pin the weights to the agents' LiveKit
 
 `livekit-plugins-silero` ships different silero weights by version: 1.2.x and 1.3.x
