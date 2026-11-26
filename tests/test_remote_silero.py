@@ -343,9 +343,10 @@ def test_a_server_that_never_answers_counts_as_gone():
         s.close()
 
 
-def _stalling_app(stall_every: float, stall_for: float, hold: float):
+def _stalling_app(stall_every: float, stall_for: float, hold: float, base: float = 0.0):
     """Upstream silero per connection, whose replies are held `hold` s while a stall
-    is on (`stall_for` s of every `stall_every`), in order, as a congested path does."""
+    is on (`stall_for` s of every `stall_every`), else `base` s, in order, as a
+    congested path does."""
     from livekit.plugins.silero import onnx_model
 
     session = onnx_model.new_inference_session(True)
@@ -377,7 +378,7 @@ def _stalling_app(stall_every: float, stall_for: float, hold: float):
                 stalled = (loop.time() - start) % stall_every >= stall_every - stall_for
                 replies.put_nowait(
                     (
-                        loop.time() + (hold if stalled else 0.0),
+                        loop.time() + (hold if stalled else base),
                         np.array(p, "<f4").tobytes(),
                     )
                 )
@@ -391,35 +392,40 @@ def _stalling_app(stall_every: float, stall_for: float, hold: float):
     return app
 
 
+def _in_real_time(vad, x: np.ndarray) -> tuple[list[tuple], list[float]]:
+    """Every event of one stream fed `x` in 20 ms frames on the wall clock, and each
+    window's inference_duration: how long after it was sent its score came."""
+    rows: list[tuple] = []
+    delays: list[float] = []
+
+    async def drive():
+        stream = vad.stream()
+
+        async def drain():
+            async for ev in stream:
+                rows.append(_row(ev))
+                if ev.type == agents.vad.VADEventType.INFERENCE_DONE:
+                    delays.append(ev.inference_duration)
+
+        task = asyncio.create_task(drain())
+        pcm = np.clip(np.rint(x * 32767.0), -32768, 32767).astype(np.int16)
+        for k in range(0, len(pcm) - 320 + 1, 320):
+            stream.push_frame(rtc.AudioFrame(pcm[k : k + 320].tobytes(), RATE, 1, 320))
+            await asyncio.sleep(0.02)
+        stream.end_input()
+        await asyncio.wait_for(task, 10.0)
+        await stream.aclose()
+
+    asyncio.run(drive())
+    return rows, delays
+
+
 def test_a_late_server_costs_at_most_max_lag():
     s = Server(app_factory=_stalling_app(stall_every=0.6, stall_for=0.25, hold=0.6))
     try:
         x = np.concatenate([padded(RATE), padded(RATE)])
         vad = RemoteSileroVAD.load(s.url, max_lag=0.2, reply_timeout=5.0)
-        rows: list[tuple] = []
-        delays: list[float] = []
-
-        async def drive():
-            stream = vad.stream()
-
-            async def drain():
-                async for ev in stream:
-                    rows.append(_row(ev))
-                    if ev.type == agents.vad.VADEventType.INFERENCE_DONE:
-                        delays.append(ev.inference_duration)
-
-            task = asyncio.create_task(drain())
-            pcm = np.clip(np.rint(x * 32767.0), -32768, 32767).astype(np.int16)
-            for k in range(0, len(pcm) - 320 + 1, 320):
-                stream.push_frame(
-                    rtc.AudioFrame(pcm[k : k + 320].tobytes(), RATE, 1, 320)
-                )
-                await asyncio.sleep(0.02)
-            stream.end_input()
-            await task
-            await stream.aclose()
-
-        asyncio.run(drive())
+        rows, delays = _in_real_time(vad, x)
         ref = turns(events(silero.VAD.load(), x, RATE))
         assert sum(r[0] == "inference_done" for r in rows) == len(x) // 320 * 320 // 512
         assert max(delays) < 0.2 + 0.05, f"a window waited {max(delays):.3f} s"
@@ -428,6 +434,50 @@ def test_a_late_server_costs_at_most_max_lag():
         got = turns(rows)
         assert [k for k, _ in got] == [k for k, _ in ref]
         assert all(abs(a - b) < 0.07 for (_, a), (_, b) in zip(got, ref))
+    finally:
+        s.close()
+
+
+def test_a_slow_server_that_keeps_answering_is_late_not_lost():
+    # Every reply is past max_lag (0.3 s), and a spike holds some 0.65 s, past the
+    # 0.5 s reply_timeout; replies never stop for that long, so it is not lost.
+    s = Server(
+        app_factory=_stalling_app(stall_every=1.0, stall_for=0.1, hold=0.65, base=0.3)
+    )
+    try:
+        x = padded(RATE)
+        vad = RemoteSileroVAD.load(s.url, max_lag=0.2)
+        _, delays = _in_real_time(vad, x)
+        assert max(delays) < 0.2 + 0.05, f"a window waited {max(delays):.3f} s"
+        assert vad.windows_local == vad.windows_late, "it reconnected"
+    finally:
+        s.close()
+
+
+def test_a_send_that_never_returns_does_not_hold_up_the_audio(monkeypatch):
+    import aiohttp
+
+    send_bytes = aiohttp.ClientWebSocketResponse.send_bytes
+    sends = 0
+
+    async def stalls_after_a_second(self, data, *args, **kwargs):
+        nonlocal sends
+        sends += 1
+        if sends > 31:
+            await asyncio.Event().wait()  # a connection whose sends stop going out
+        return await send_bytes(self, data, *args, **kwargs)
+
+    monkeypatch.setattr(
+        aiohttp.ClientWebSocketResponse, "send_bytes", stalls_after_a_second
+    )
+    s = Server()
+    try:
+        x = padded(RATE)
+        vad = RemoteSileroVAD.load(s.url, max_lag=0.2)
+        rows, delays = _in_real_time(vad, x)
+        assert sum(r[0] == "inference_done" for r in rows) == len(x) // 320 * 320 // 512
+        assert max(delays) < 0.2 + 0.05, f"a window waited {max(delays):.3f} s"
+        assert vad.windows_local > 0
     finally:
         s.close()
 
