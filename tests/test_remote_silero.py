@@ -358,3 +358,22 @@ def test_update_options_reaches_open_streams(server):
 def test_capabilities_report_the_window(server):
     assert RemoteSileroVAD.load(server.url).capabilities.update_interval == 0.032
     assert isinstance(RemoteSileroVAD.load(server.url), agents.vad.VAD)
+
+
+def test_a_keyed_server_refuses_a_call_without_the_key():
+    s = Server(
+        app_factory=lambda: srv.make_app(srv.OnnxBackend(None, "cpu"), api_key="k3y")
+    )
+    try:
+        with pytest.raises(ConnectionError):
+            RemoteSileroVAD.load(s.url, connect_timeout=2.0)
+        with pytest.raises(ConnectionError):
+            RemoteSileroVAD.load(
+                s.url, headers={"Authorization": "Bearer nope"}, connect_timeout=2.0
+            )
+        vad = RemoteSileroVAD.load(s.url, headers={"Authorization": "Bearer k3y"})
+        rows = events(vad, padded(RATE), RATE)
+        assert vad.windows_remote > 0 and vad.windows_local == 0
+        assert any(k == "start_of_speech" for k, _ in turns(rows))
+    finally:
+        s.close()

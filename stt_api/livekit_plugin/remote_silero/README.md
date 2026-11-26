@@ -93,3 +93,7 @@ problem.
 * TorchScript's optimizer is off: it recompiled on new batch sizes and stalled one
   batch for 182 ms.
 * `--workers N` runs N processes on one port (SO_REUSEPORT, Linux).
+* `SILERO_VAD_API_KEY` set on the server makes the WebSocket and `/stats` require
+  `Authorization: Bearer <key>`. Pass it as
+  `RemoteSileroVAD.load(url, headers={"Authorization": f"Bearer {key}"})`.
+  `/health` stays open.

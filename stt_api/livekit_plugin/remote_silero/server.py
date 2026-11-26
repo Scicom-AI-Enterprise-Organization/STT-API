@@ -34,6 +34,10 @@ Backends:
   exactly. The tests use it.
 
 `GET /health` answers `{"ok": true}`; `GET /stats` the counters since start.
+
+Auth: with `SILERO_VAD_API_KEY` set, the WebSocket and `/stats` need
+`Authorization: Bearer <key>` (`RemoteSileroVAD.load(url, headers=...)`); `/health`
+stays open for probes.
 """
 
 from __future__ import annotations
@@ -339,8 +343,21 @@ class Batcher:
                 self.wake.set()
 
 
-def make_app(backend, max_batch: int = 1024, max_wait_ms: float = 0.0):
+def make_app(
+    backend,
+    max_batch: int = 1024,
+    max_wait_ms: float = 0.0,
+    api_key: str | None = None,
+):
+    import hmac
+
     from aiohttp import WSMsgType, web
+
+    def allowed(request) -> bool:
+        if not api_key:
+            return True
+        got = request.headers.get("Authorization", "")
+        return hmac.compare_digest(got.encode(), f"Bearer {api_key}".encode())
 
     batcher = Batcher(backend, max_batch, max_wait_ms / 1000.0)
     hello = json.dumps(
@@ -353,6 +370,8 @@ def make_app(backend, max_batch: int = 1024, max_wait_ms: float = 0.0):
     )
 
     async def ws_handler(request):
+        if not allowed(request):
+            raise web.HTTPUnauthorized(text="Authorization: Bearer <key> required")
         ws = web.WebSocketResponse(max_msg_size=1 << 20)
         await ws.prepare(request)
         call = batcher.open(ws)
@@ -381,7 +400,9 @@ def make_app(backend, max_batch: int = 1024, max_wait_ms: float = 0.0):
     async def health(_request):
         return web.json_response({"ok": True, "model": backend.name})
 
-    async def stats(_request):
+    async def stats(request):
+        if not allowed(request):
+            raise web.HTTPUnauthorized(text="Authorization: Bearer <key> required")
         ru = resource.getrusage(resource.RUSAGE_SELF)
         b = sorted(batcher.batch_ms)
         w = sorted(batcher.wait_ms)
@@ -442,12 +463,22 @@ def _serve(args, reuse_port: bool) -> None:
     from aiohttp import web
 
     backend = build_backend(args.backend, args.device, args.model)
-    app = make_app(backend, args.max_batch, args.max_wait_ms)
+    app = make_app(
+        backend,
+        args.max_batch,
+        args.max_wait_ms,
+        api_key=os.environ.get("SILERO_VAD_API_KEY") or None,
+    )
     logger.info(
         "serving %s on %s:%d (pid %d)", backend.name, args.host, args.port, os.getpid()
     )
     web.run_app(
-        app, host=args.host, port=args.port, reuse_port=reuse_port or None, print=None
+        app,
+        host=args.host,
+        port=args.port,
+        reuse_port=reuse_port or None,
+        print=None,
+        access_log=None,  # a line per call is noise at a thousand calls
     )
 
 
