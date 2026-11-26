@@ -100,7 +100,10 @@ def _handshake(url: str, headers: dict[str, str], timeout: float) -> dict:
     t.join(timeout + 1.0)
     if "hello" not in box:
         exc = box.get("error", TimeoutError("no hello"))
-        raise ConnectionError(f"silero VAD server at {url} is unusable: {exc!r}") from (
+        # The type, not repr: a handshake error's repr carries our request headers.
+        raise ConnectionError(
+            f"silero VAD server at {url} is unusable: {type(exc).__name__}"
+        ) from (
             exc if isinstance(exc, BaseException) else None
         )
     return box["hello"]
@@ -550,9 +553,9 @@ class RemoteSileroVADStream(agents.vad.VADStream):
         if self._down_since is None:
             self._down_since = time.perf_counter()
             logger.warning(
-                "silero VAD server at %s lost (%r): %s until it is back",
+                "silero VAD server at %s lost (%s): %s until it is back",
                 self._vad._url,
-                exc,
+                type(exc).__name__,
                 "scoring on this CPU"
                 if self._vad._fallback_session is not None
                 else "every window scores 0.0",
