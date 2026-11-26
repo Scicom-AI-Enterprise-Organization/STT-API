@@ -29,7 +29,13 @@ RemoteSileroVAD.load(
 ```
 
 Slurm job `silero-vad-1021` on 1021 GPU 1 (`ucc_slurm-ui-job` `jobs/tm-h20/silero-vad-1021.yaml`), silero-vad
-6.1 weights for livekit-agents 1.2 / 1.3, two workers. The gateway proxy `silero-vad` reaches it through the
+6.2.1 weights, the ones livekit-agents 1.8.x bundles (`ucc_tm-voice-agent`), two workers. A livekit-agents 1.3
+agent (`ucc_tm-voice-assist`) bundles 6.0 / 6.1 and needs its own instance (`SILERO_VAD_VERSION=6.1`, another
+port); against this one its turns would differ from its local silero.
+
+From a laptop through the public URL, round trips were p50 about 80 ms. One run in three had a one-second network
+stall, while the server's own queue stayed under 11 ms. A VAD event arrives one round trip later than with local
+silero, so turn starts and ends move by that much. The gateway proxy `silero-vad` reaches it through the
 `h20-tunnel-silero-vad` tunnel (ai-foundry-poc) and adds the server's own key. A restart of the job deploys
 STT-API `main`.
 
