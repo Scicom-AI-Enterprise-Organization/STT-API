@@ -40,9 +40,30 @@ one process pinned to one core, harness cost subtracted (`benchmark.py`):
 Both arms found the same 64 speech starts. Round trip to a server on the same host:
 p50 2 ms, p99 3 to 8 ms.
 
-The CPU moves; it does not vanish. At that load the server spent about 0.6 % of a
-core per stream, half of it torch launch overhead on batches of 8.8 windows. The
-saving is on the agent box. Measure the server at your load (`GET /stats`).
+The server's share falls as it fills, because a batch costs about the same at 50
+windows as at 5. One server process on GPU 0, two cores, clients of 100 streams each
+at 16 kHz:
+
+| streams | server CPU per stream | mean batch | round trip p99 | windows failed over |
+|---:|---:|---:|---:|---:|
+| 100 | 0.12 % | 48 | 11 ms | 0 |
+| 300 | 0.11 % | 55 | 13 ms | 0 |
+| 600 | 0.087 % | 80 | 19 ms | 0 |
+| 1000 | 0.092 % | 297 | 2.1 s | 87,117 |
+| 1000, `--workers 2` | about 0.12 % | 73 | 21 ms | 0 |
+
+So agent plus server is about 0.25 % of a core per stream against 0.84 % for local
+silero. Most of the saving is real, not moved. With a few streams the batches are
+small and the server costs more per stream (0.6 % at 50 streams, half of it torch
+launch overhead); check `GET /stats` at your load.
+
+One process saturates near 1,000 streams: its event loop is one core (92 % busy),
+windows queue for seconds and the clients fail over to local silero. Every window
+was still scored. Run `--workers` at about one per 500 streams.
+
+The VAD was never a large share of an agent's CPU: GTCRN noise cancellation costs
+about 3 % of a core per stream (`PULSE_VAD_BENCH.md`). Look there first for a CPU
+problem.
 
 ## Parity
 
