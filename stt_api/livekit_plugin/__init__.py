@@ -18,6 +18,8 @@ Then one import line, whichever plugins the agent uses:
 - ``VoiceIsolator`` — keeps the caller, removes other voices and noise; CPU in the
   agent (``LocalIsolator``) or the GPU release on a server (``RemoteIsolator``)
   (``voice_isolator``)
+- ``RemoteSileroVAD``: silero VAD scored on a GPU server that batches every
+  call's windows (``remote_silero``)
 - ``DummySTT`` / ``DummyLLM`` / ``DummyTTS`` — free load testing (``dummy``)
 
 Each name is resolved on first access rather than at import time. Reaching for
@@ -45,6 +47,7 @@ __all__ = [
     "PulseVAD",
     "PulseVADModel",
     "RemoteIsolator",
+    "RemoteSileroVAD",
     "ScicomEoT",
     "SemanticVAD",
     "SmartTurnV3",
@@ -69,6 +72,7 @@ _EXPORTS = {
     "VoiceIsolator": ("voice_isolator", "VoiceIsolator"),
     "LocalIsolator": ("voice_isolator", "LocalIsolator"),
     "RemoteIsolator": ("voice_isolator", "RemoteIsolator"),
+    "RemoteSileroVAD": ("remote_silero", "RemoteSileroVAD"),
     "DummySTT": ("dummy", "STT"),
     "DummyLLM": ("dummy", "LLM"),
     "DummyTTS": ("dummy", "TTS"),
@@ -86,6 +90,7 @@ if TYPE_CHECKING:  # import-free completion for editors and type checkers
     from .dummy import TTS as DummyTTS
     from .noise_cancellation import GTCRN, MODEL_SAMPLE_RATE
     from .pulse_vad import PulseVAD, PulseVADModel
+    from .remote_silero import RemoteSileroVAD
     from .semantic_vad import ScicomEoT, SemanticVAD, SmartTurnV3
     from .turn_detector import MultilingualModel
     from .voice_isolator import LocalIsolator, RemoteIsolator, VoiceIsolator

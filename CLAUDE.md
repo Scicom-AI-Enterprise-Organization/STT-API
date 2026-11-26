@@ -21,6 +21,7 @@ Module-scoped notes live beside their code — see
 | `stt_api/livekit_plugin/noise_cancellation/` | GTCRN filter + `benchmark/` harness |
 | `stt_api/livekit_plugin/voice_isolator/` | voice isolation filter: `LocalIsolator` (CPU, ONNX) / `RemoteIsolator` (GPU server) |
 | `stt_api/livekit_plugin/clearline/` | `ClearlineVAD` (silero drop-in) and `ClearlineNC` (GTCRN drop-in), weights from a pinned HF revision |
+| `stt_api/livekit_plugin/remote_silero/` | `RemoteSileroVAD` (silero drop-in) scored on a GPU server that batches every call's windows; pin the server's `silero-vad` to the agents' LiveKit |
 | `stt_api/livekit_plugin/dummy/` | no-op STT/LLM/TTS, useful for agent tests |
 
 ## Repo-wide traps
