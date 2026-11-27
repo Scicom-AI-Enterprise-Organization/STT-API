@@ -343,10 +343,16 @@ def test_a_server_that_never_answers_counts_as_gone():
         s.close()
 
 
-def _stalling_app(stall_every: float, stall_for: float, hold: float, base: float = 0.0):
+def _stalling_app(
+    stall_every: float,
+    stall_for: float,
+    hold: float,
+    base: float = 0.0,
+    hello_after: float = 0.0,
+):
     """Upstream silero per connection, whose replies are held `hold` s while a stall
     is on (`stall_for` s of every `stall_every`), else `base` s, in order, as a
-    congested path does."""
+    congested path does. `hello_after`: seconds a connection takes to open."""
     from livekit.plugins.silero import onnx_model
 
     session = onnx_model.new_inference_session(True)
@@ -355,6 +361,7 @@ def _stalling_app(stall_every: float, stall_for: float, hold: float, base: float
         async def ws(request):
             w = web.WebSocketResponse()
             await w.prepare(request)
+            await asyncio.sleep(hello_after)
             await w.send_str(
                 json.dumps({"model": "stalling", "sample_rate": 16000, "window": 512})
             )
@@ -544,5 +551,259 @@ def test_a_keyed_server_refuses_a_call_without_the_key():
         rows = events(vad, padded(RATE), RATE)
         assert vad.windows_remote > 0 and vad.windows_local == 0
         assert any(k == "start_of_speech" for k, _ in turns(rows))
+    finally:
+        s.close()
+
+
+# ----------------------------------------------------------------------------- twins
+
+
+async def _drive_many(
+    vad,
+    x: np.ndarray,
+    rate: int,
+    spans: list[tuple[int | None, int | None]],
+    same_frames: bool = True,
+    frame_ms: int = 20,
+    pace: float = 0.002,
+    last_first: bool = False,
+) -> list[list[tuple]]:
+    """Every event of several streams of one VAD fed `x` together: stream i gets the
+    frames numbered spans[i][0] up to (not including) spans[i][1], None for the first
+    and the last. `same_frames`: the same frame objects, as an AgentSession pushes
+    its own VAD stream and its StreamAdapter's; else a copy each. `last_first`: each
+    frame goes to the streams in reverse, so a later stream's task runs before an
+    earlier one's."""
+    n = rate * frame_ms // 1000
+    pcm = np.clip(np.rint(x * 32767.0), -32768, 32767).astype(np.int16)
+    total = len(pcm) // n
+    spans = [(a or 0, total if b is None else b) for a, b in spans]
+    streams: list = [None] * len(spans)
+    rows: list[list[tuple]] = [[] for _ in spans]
+    tasks: list = [None] * len(spans)
+
+    async def drain(i):
+        async for ev in streams[i]:
+            rows[i].append(_row(ev))
+
+    for k in range(total):
+        frame = rtc.AudioFrame(pcm[k * n : (k + 1) * n].tobytes(), rate, 1, n)
+        order = list(enumerate(spans))
+        for i, (a, b) in reversed(order) if last_first else order:
+            if k == a:
+                streams[i] = vad.stream()
+                tasks[i] = asyncio.create_task(drain(i))
+            if a <= k < b:
+                streams[i].push_frame(
+                    frame
+                    if same_frames
+                    else rtc.AudioFrame(bytes(frame.data), rate, 1, n)
+                )
+            if k == b - 1:
+                streams[i].end_input()
+        await asyncio.sleep(pace)
+    await asyncio.gather(*tasks)
+    for st in streams:
+        await st.aclose()
+    return rows
+
+
+def _calls(server) -> int:
+    """Calls the server has had, the handshake of `load()` not counted."""
+    return server.app[srv.BATCHER].stats["calls_total"] - 1
+
+
+def test_twin_streams_share_one_connection(server):
+    # An AgentSession with a non-streaming STT pushes its own VAD stream and its
+    # StreamAdapter's the same frame objects: one connection, every window sent once,
+    # and each stream still gets upstream's events.
+    x = padded(RATE)
+    vad = RemoteSileroVAD.load(server.url)
+    a, b = asyncio.run(_drive_many(vad, x, RATE, [(None, None), (None, None)]))
+    ref = events(silero.VAD.load(), x, RATE)
+    assert a == ref and b == ref
+    windows = len(x) // 320 * 320 // 512
+    assert _calls(server) == 1, "the twins opened a connection each"
+    assert server.stats()["windows"] == windows, "a window was scored twice"
+    assert vad.windows_remote == windows and vad.windows_local == 0
+    assert not vad._links, "the connection outlived its streams"
+
+
+def test_a_twin_that_comes_later_joins_and_leaving_does_not_end_the_call(server):
+    # A StreamAdapter's stream is made again mid-call (an STT that reconnects): it
+    # joins the connection already hearing its frames, gets the windows its own
+    # frames complete, and its end leaves the other stream running.
+    x = np.concatenate([padded(RATE), padded(RATE)])
+    total = len(x) // 320
+    first, last = total // 3, 2 * total // 3
+    vad = RemoteSileroVAD.load(server.url)
+    a, b = asyncio.run(_drive_many(vad, x, RATE, [(None, None), (first, last)]))
+    ref = events(silero.VAD.load(), x, RATE)
+    assert a == ref, "the older stream is not what it is alone"
+    owed = last * 320 // 512 - first * 320 // 512  # windows its frames complete
+    assert sum(r[0] == "inference_done" for r in b) == owed
+    p_a = [r[5] for r in a if r[0] == "inference_done"]
+    p_b = [r[5] for r in b if r[0] == "inference_done"]
+    k = first * 320 // 512
+    # the same scores from the server; each stream smooths them with its own filter,
+    # which has forgotten the difference a few windows in
+    assert p_b[20:] == pytest.approx(p_a[k + 20 : k + owed], abs=1e-3)
+    assert _calls(server) == 1
+    assert server.stats()["windows"] == total * 320 // 512
+
+
+def test_a_later_twin_whose_task_runs_first_still_joins(server):
+    # The younger stream gets each frame before the older one has taken it, so it
+    # starts on a connection of its own. It finds the older link one frame behind,
+    # waits for its own windows to come back, and moves: the younger moves, never
+    # the older, whose events stay what they are alone.
+    x = np.concatenate([padded(RATE), padded(RATE)])
+    total = len(x) // 320
+    first = total // 3
+    vad = RemoteSileroVAD.load(server.url)
+    a, b = asyncio.run(
+        _drive_many(vad, x, RATE, [(None, None), (first, None)], last_first=True)
+    )
+    assert a == events(silero.VAD.load(), x, RATE)
+    owed = total * 320 // 512 - first * 320 // 512
+    assert abs(sum(r[0] == "inference_done" for r in b) - owed) <= 2
+    # the second utterance, on the younger stream's own clock, where the older has it
+    for (kind, t), (kind_a, t_a) in zip(turns(b)[-2:], turns(a)[-2:]):
+        assert kind == kind_a and abs(t + first * 0.02 - t_a) <= 0.064, (t, t_a)
+    # its own connection lasted a few frames: nearly every window was sent once
+    assert _calls(server) == 2
+    assert server.stats()["windows"] <= total * 320 // 512 + 3
+    assert not vad._links and not vad._taken
+
+
+def test_streams_fed_other_frames_keep_their_own_connections(server):
+    # Two calls in one process: equal audio, but not the same frames. Sharing here
+    # would give one caller the other's model state.
+    x = padded(RATE)
+    vad = RemoteSileroVAD.load(server.url)
+    a, b = asyncio.run(
+        _drive_many(vad, x, RATE, [(None, None), (None, None)], same_frames=False)
+    )
+    ref = events(silero.VAD.load(), x, RATE)
+    assert a == ref and b == ref
+    assert _calls(server) == 2
+    assert server.stats()["windows"] == 2 * (len(x) // 320 * 320 // 512)
+
+
+def test_twins_survive_an_outage_together():
+    s = Server()
+    try:
+        x = np.concatenate([padded(RATE), padded(RATE), padded(RATE)])
+        vad = RemoteSileroVAD.load(s.url)
+        total = len(x) // 320
+
+        async def go():
+            run = asyncio.create_task(
+                _drive_many(vad, x, RATE, [(None, None), (None, None)], pace=0.004)
+            )
+            await asyncio.sleep(0.004 * total / 4)
+            await asyncio.to_thread(s.stop)
+            await asyncio.sleep(0.004 * total / 4)
+            await asyncio.to_thread(s.start)
+            return await run
+
+        a, b = asyncio.run(go())
+        windows = total * 320 // 512
+        assert a == b, "the twins heard different things"
+        assert sum(r[0] == "inference_done" for r in a) == windows, "a window lost"
+        assert vad.windows_local > 0 and vad.windows_remote > windows // 3
+        assert vad.windows_local + vad.windows_remote == windows, "counted twice"
+        assert len([1 for k, _ in turns(a) if k == "start_of_speech"]) == 3
+    finally:
+        s.close()
+
+
+# ----------------------------------------------------------------------------- what it is doing
+
+
+def test_stats_say_who_scored_the_windows(server, caplog):
+    import logging
+
+    x = padded(RATE)
+    vad = RemoteSileroVAD.load(server.url, log_every=0.05)
+    with caplog.at_level(
+        logging.INFO, logger="stt_api.livekit_plugin.remote_silero.client"
+    ):
+        events(vad, x, RATE, pace=0.002)
+    st = vad.stats()
+    windows = len(x) // 320 * 320 // 512
+    assert st["windows"] == st["windows_remote"] == windows
+    assert st["local_share"] == 0 and st["late_share"] == 0
+    assert 0 < st["round_trip_ms_p50"] <= st["round_trip_ms_p99"] < 200
+    assert st["connects"] == 1 and st["outages"] == 0 and st["connections"] == 0
+    lines = [r.getMessage() for r in caplog.records if "scored here" in r.getMessage()]
+    assert lines and "round trip p50" in lines[0]
+
+
+def test_a_handshake_that_takes_long_does_not_hold_up_the_audio():
+    # The first windows queue behind the handshake; the ones it keeps waiting past
+    # max_lag are scored here, and the server takes over when it has answered.
+    s = Server(
+        app_factory=_stalling_app(
+            stall_every=1e9, stall_for=0.0, hold=0.0, hello_after=0.5
+        )
+    )
+    try:
+        x = padded(RATE)
+        vad = RemoteSileroVAD.load(s.url, check_server=False, max_lag=0.2)
+        rows, delays = _in_real_time(vad, x)
+        ref = turns(events(silero.VAD.load(), x, RATE))
+        assert sum(r[0] == "inference_done" for r in rows) == len(x) // 320 * 320 // 512
+        assert max(delays) < 0.2 + 0.05, f"a window waited {max(delays):.3f} s"
+        assert vad.windows_late > 5 and vad.windows_remote > vad.windows_late
+        assert vad.outages == 0, "a slow handshake was taken for an outage"
+        assert [k for k, _ in turns(rows)] == [k for k, _ in ref]
+    finally:
+        s.close()
+
+
+def test_the_key_can_come_from_the_environment(monkeypatch):
+    s = Server(
+        app_factory=lambda: srv.make_app(srv.OnnxBackend(None, "cpu"), api_key="k3y")
+    )
+    try:
+        monkeypatch.setenv("SILERO_VAD_API_KEY", "k3y")
+        vad = RemoteSileroVAD.load(s.url)
+        events(vad, padded(RATE), RATE)
+        assert vad.windows_remote > 0 and vad.windows_local == 0
+        # a header given wins over the environment
+        with pytest.raises(ConnectionError):
+            RemoteSileroVAD.load(
+                s.url, headers={"authorization": "Bearer nope"}, connect_timeout=2.0
+            )
+    finally:
+        s.close()
+
+
+# ----------------------------------------------------------------------------- delay
+
+
+def test_compensate_delay_takes_the_round_trip_off_the_end_of_a_turn():
+    # Every reply 0.11 s late: three whole windows. A turn's end then comes three
+    # windows of silence sooner in the stream, so on the wall clock it is where local
+    # silero puts it (0.11 - 0.096 s after) instead of a round trip later. Starts are
+    # not moved, and without the option nothing is.
+    s = Server(
+        app_factory=_stalling_app(stall_every=1e9, stall_for=0.0, hold=0.0, base=0.11)
+    )
+    try:
+        x = padded(RATE)
+        ref = turns(events(silero.VAD.load(), x, RATE))
+        plain, _ = _in_real_time(RemoteSileroVAD.load(s.url, max_lag=0.4), x)
+        assert turns(plain) == ref
+        vad = RemoteSileroVAD.load(s.url, max_lag=0.4, compensate_delay=True)
+        got = turns(_in_real_time(vad, x)[0])
+        assert vad.windows_local == 0
+        assert [k for k, _ in got] == [k for k, _ in ref]
+        for (kind, t), (_, t_ref) in zip(got, ref):
+            if kind == "start_of_speech":
+                assert t == t_ref
+            else:
+                assert t_ref - t == pytest.approx(3 * 0.032, abs=1e-6), (t, t_ref)
     finally:
         s.close()

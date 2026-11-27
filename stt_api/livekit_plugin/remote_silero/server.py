@@ -35,6 +35,10 @@ Backends:
 
 `GET /health` answers `{"ok": true}`; `GET /stats` the counters since start.
 
+One process's limit is its event loop, a core busy with sockets, not the GPU. It runs
+on uvloop when that is installed (`pip install uvloop`; `--loop asyncio` to compare),
+and `--workers N` runs N processes on the port.
+
 Auth: with `SILERO_VAD_API_KEY` set, the WebSocket and `/stats` need
 `Authorization: Bearer <key>` (`RemoteSileroVAD.load(url, headers=...)`); `/health`
 stays open for probes.
@@ -459,9 +463,42 @@ def build_backend(kind: str, device: str, path: str | None):
     raise ValueError(f"unknown backend {kind!r}: torch or onnx")
 
 
+def new_event_loop(kind: str = "auto") -> tuple[asyncio.AbstractEventLoop, str]:
+    """The server's loop. One process's limit is its event loop (a core, busy with
+    sockets), not the GPU, so uvloop is used when it is installed (`auto`)."""
+    if kind != "asyncio":
+        try:
+            import uvloop
+
+            return uvloop.new_event_loop(), "uvloop"
+        except ImportError:
+            if kind == "uvloop":
+                raise
+    return asyncio.new_event_loop(), "asyncio"
+
+
+def raise_file_limit() -> int:
+    """Every call is a socket, and the usual soft limit is 1,024 open files: a process
+    left at it refuses the calls past about a thousand, and a client that cannot
+    connect scores on its own CPU with no error on either side. Takes the hard
+    limit; returns what the process ended with (-1 where there is no such limit)."""
+    try:
+        import resource
+
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        want = 65536 if hard == resource.RLIM_INFINITY else hard
+        if soft != resource.RLIM_INFINITY and soft < want:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (want, hard))
+        return resource.getrlimit(resource.RLIMIT_NOFILE)[0]
+    except (ImportError, ValueError, OSError):
+        return -1
+
+
 def _serve(args, reuse_port: bool) -> None:
     from aiohttp import web
 
+    files = raise_file_limit()
+    loop, loop_name = new_event_loop(args.loop)
     backend = build_backend(args.backend, args.device, args.model)
     app = make_app(
         backend,
@@ -470,13 +507,21 @@ def _serve(args, reuse_port: bool) -> None:
         api_key=os.environ.get("SILERO_VAD_API_KEY") or None,
     )
     logger.info(
-        "serving %s on %s:%d (pid %d)", backend.name, args.host, args.port, os.getpid()
+        "serving %s on %s:%d (pid %d, %s, up to %d open files)",
+        backend.name,
+        args.host,
+        args.port,
+        os.getpid(),
+        loop_name,
+        files,
     )
     web.run_app(
         app,
+        loop=loop,
         host=args.host,
         port=args.port,
         reuse_port=reuse_port or None,
+        backlog=1024,  # a restart brings every open call back at once
         print=None,
         access_log=None,  # a line per call is noise at a thousand calls
     )
@@ -499,6 +544,12 @@ def main(argv: list[str] | None = None) -> None:
         type=float,
         default=0.0,
         help="how long the first window of a batch waits for others (0: none)",
+    )
+    ap.add_argument(
+        "--loop",
+        choices=("auto", "uvloop", "asyncio"),
+        default="auto",
+        help="the event loop: uvloop when it is installed (auto), or one of the two",
     )
     ap.add_argument(
         "--workers",
