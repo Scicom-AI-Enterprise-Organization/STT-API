@@ -234,6 +234,13 @@ class RemoteIsolator:
     `--voicebot` default). The server must run `--enroll-loud`; a server older than
     the mode ignores the request.
 
+    `vad=True` asks the server to score the audio it sends with Silero VAD as well
+    (the URL's `?vad=1`; the server must run `--vad`): p(speech) of every 512-sample
+    window of the isolated audio comes back on the same connection, and
+    `IsolatorVAD` uses it as the session's VAD without a model run or a second
+    upload. A server that does not know the request ignores it, and `IsolatorVAD`
+    then scores the audio on this CPU.
+
     `url` defaults to `VOICE_ISOLATOR_URL`. An unreachable server raises at
     `open()`. A connection lost mid-call logs one warning and passes the caller's
     audio through untouched for the rest of the call, so the agent keeps hearing
@@ -251,6 +258,7 @@ class RemoteIsolator:
         wait_ms: float = 30.0,
         max_lag_ms: float = 40.0,
         voicebot: bool | None = None,
+        vad: bool = False,
     ) -> None:
         url = url or os.environ.get("VOICE_ISOLATOR_URL")
         self.wait_ms, self.max_lag_ms = wait_ms, max_lag_ms
@@ -264,7 +272,10 @@ class RemoteIsolator:
                 "heard: it does not go with enrollment="
             )
         self.voicebot = voicebot
+        self.vad = vad
         self.url = url if voicebot is None else _with_query(url, voicebot=int(voicebot))
+        if vad:
+            self.url = _with_query(self.url, vad=1)
         self.headers = headers or {}
         self.connect_timeout = connect_timeout
         self.enrollment = (
@@ -278,6 +289,8 @@ class RemoteIsolator:
 
 
 class _RemoteStream:
+    VAD_RING = 256  # windows of p(speech) kept (8 s)
+
     def __init__(self, url, headers, timeout, enrollment) -> None:
         self.url = url
         self.delay_s = 0.010  # the server's model: the same 20 ms window every 10 ms
@@ -289,6 +302,13 @@ class _RemoteStream:
         )  # audio came back, or the connection went
         self._down = False
         self._closed = False
+        # the server's VAD of the audio it sends (`RemoteIsolator(vad=True)`): what it
+        # said it would send, p(speech) of the last VAD_RING windows, how many it has
+        # sent, and who to tell when more come or the connection goes
+        self.vad_ready: dict | None = None
+        self.vad_count = 0
+        self._vad_p = np.zeros(self.VAD_RING, np.float32)
+        self._vad_listeners: list = []
         fut = asyncio.run_coroutine_threadsafe(
             self._connect(headers, enrollment), self._loop
         )
@@ -336,12 +356,54 @@ class _RemoteStream:
                     with self._ready:
                         self._buf.extend(msg.data)
                         self._ready.notify_all()
+                elif msg.type == aiohttp.WSMsgType.TEXT:
+                    self._on_text(msg.data)
                 elif msg.type in (aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSED):
                     break
         except Exception as exc:  # noqa: BLE001
             self._fail(exc)
             return
         self._fail(ConnectionError("the server closed the connection"))
+
+    def _on_text(self, data: str) -> None:
+        """The server's VAD: `{"vad_ready": {...}}` once, then `{"vad": [p, ...],
+        "at": i}` for windows i, i+1, ... of the audio it has sent."""
+        d = json.loads(data)
+        if "vad_ready" in d:
+            self.vad_ready = d["vad_ready"]
+        elif "vad" in d:
+            at = int(d["at"])
+            for j, p in enumerate(d["vad"]):
+                self._vad_p[(at + j) % self.VAD_RING] = p
+            self.vad_count = at + len(d["vad"])  # after the values
+            self._tell()
+
+    def _tell(self) -> None:
+        for cb in tuple(self._vad_listeners):
+            try:
+                cb()
+            except Exception:  # noqa: BLE001 - a listener's trouble is not the call's
+                logger.exception("voice isolator: a VAD listener failed")
+
+    @property
+    def down(self) -> bool:
+        return self._down
+
+    def vad_p(self, i: int) -> float | None:
+        """p(speech) of window i (samples [512 i, 512 i + 512) of the isolated audio
+        as it was received); None when it has not come yet, or is VAD_RING old."""
+        if not self.vad_count - self.VAD_RING <= i < self.vad_count:
+            return None
+        return float(self._vad_p[i % self.VAD_RING])
+
+    def vad_listen(self, cb) -> None:
+        """`cb()` on the I/O thread whenever more windows have come, and once when the
+        connection is lost."""
+        self._vad_listeners.append(cb)
+
+    def vad_unlisten(self, cb) -> None:
+        if cb in self._vad_listeners:
+            self._vad_listeners.remove(cb)
 
     def _fail(self, exc: BaseException) -> None:
         if not self._down and not self._closed:
@@ -354,6 +416,7 @@ class _RemoteStream:
         self._down = True
         with self._ready:
             self._ready.notify_all()
+        self._tell()
 
     def push(self, pcm: np.ndarray) -> np.ndarray:
         if self._down:

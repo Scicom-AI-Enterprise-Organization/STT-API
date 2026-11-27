@@ -19,7 +19,7 @@ Module-scoped notes live beside their code — see
 | `stt_api/livekit_plugin/pulse_vad/` | **frame** VAD (is anyone speaking) — silero drop-in + `benchmark/` |
 | `stt_api/livekit_plugin/whisper_stt/` | Whisper STT client that stops silence interrupting the agent |
 | `stt_api/livekit_plugin/noise_cancellation/` | GTCRN filter + `benchmark/` harness |
-| `stt_api/livekit_plugin/voice_isolator/` | voice isolation filter: `LocalIsolator` (CPU, ONNX) / `RemoteIsolator` (GPU server) |
+| `stt_api/livekit_plugin/voice_isolator/` | voice isolation filter: `LocalIsolator` (CPU, ONNX) / `RemoteIsolator` (GPU server); `IsolatorVAD`, the session's VAD scored by that server |
 | `stt_api/livekit_plugin/clearline/` | `ClearlineVAD` (silero drop-in) and `ClearlineNC` (GTCRN drop-in), weights from a pinned HF revision |
 | `stt_api/livekit_plugin/remote_silero/` | `RemoteSileroVAD` (silero drop-in) scored on a GPU server that batches every call's windows; pin the server's `silero-vad` to the agents' LiveKit |
 | `stt_api/livekit_plugin/dummy/` | no-op STT/LLM/TTS, useful for agent tests |
@@ -154,6 +154,25 @@ speaker stops, so no text detector can beat that. That is the reason
   mechanics (frame contract, frame-size invariance, isolation between calls, the
   enrollment switching on at 3.0 s), not quality.
 
+- **`IsolatorVAD` scores the server's window, not the agent's** (`vad.py`). The
+  server (`--vad`) scores the audio it sends in windows from its first sample; each
+  agent window takes the last server window that ends inside it
+  (`int(end // 512) - 1`): up to 32 ms earlier. Turns move by 27 ms on average and
+  96 ms at most against silero on the same frames. It is not value for value and no
+  test should ask for that.
+- **The mark rides on `frame.userdata`.** Anything between the filter and the VAD
+  that makes new frame objects drops it, and every window is then scored by local
+  silero with no error: `stats()["local_share"]` is the only sign.
+- **It scores what the server sent, also for audio that reached the agent
+  unfiltered.** One lone 24 kHz call (66 of 140 s unfiltered) gave 14 turn events
+  against 10 on the delivered frames.
+- **It saves the agent nothing over `RemoteSileroVAD`** (0.39 against 0.40 % of a
+  core per call). It saves the second connection, upload and server.
+- **The server's silero must run outside TF32** (9.2e-3 off LiveKit's ONNX session
+  in TF32, 2.4e-4 in float32) **and once a tick, not once a step** (5.2 ms of a 40 ms
+  tick at 32 calls against 1.6 ms). Both live in Voice-Isolator's `vi/silero.py` and
+  `vi/server_mp.py`.
+
 ### `clearline/`
 
 - **The weights are not vendored**: 1.4 MB (VAD) and 1.6 / 5.3 MB (NC's two modes) are
@@ -198,6 +217,39 @@ speaker stops, so no text detector can beat that. That is the reason
 - `tests/test_clearline.py` passes on livekit-agents 1.2.18, 1.3.11 and 1.8.9. Off the
   extra, 1.2.x/1.3.x import `httpx` without declaring it: a bare
   `pip install livekit-agents==1.3.11` fails at `from livekit import agents`, not here.
+
+### `remote_silero/`
+
+- **Streams share by frame identity, not by audio.** Streams of one VAD pushed the
+  same `rtc.AudioFrame` objects ride one connection (`_Link`); a copy of a frame is
+  another call. Only the younger stream moves. A test that wraps frames again per
+  stream measures two connections and proves nothing about a session.
+- **`_n_live` counts from `stream()`, not from the stream task's first step.** The
+  per-frame bookkeeping is off while a VAD has one live stream. Counted in the task,
+  a twin made in the same breath found the first frame unrecorded, opened its own
+  connection for one frame and scored one window twice. Three tests caught it.
+- **Sharing halves the traffic, not the agent's CPU.** Two streams of a call cost
+  0.26 % of a core against 0.31 % before (16 kHz). The rest is each stream's own
+  filter, state machine, speech buffer and events. Do not promise half.
+- **At these sizes the call count is the cost function, here too.** The first
+  shared client cost 8 to 20 % more CPU than the one it replaced: a per-frame
+  `_find`, a dict write and a deque append. The bookkeeping now runs only while
+  another stream is alive, and looks for a twin on a stream's first 8 frames and
+  every 8th after.
+- **A server process at the soft limit of 1,024 open files fails silently at about
+  a thousand calls.** The refused clients score on their own CPU and neither side
+  logs an error. It was read as an event loop limit for a day. `server.py` takes
+  the hard limit at start; `stats()["local_share"]` on the agent is what shows it.
+- **`compensate_delay` moves ends only, in whole windows, never earlier than local
+  silero.** It shortens the pause that ends a turn by the round trip. It does
+  nothing on a LAN (round trip under one window).
+- **The route is the delay.** 1 ms on the node's LAN, 48 to 64 ms at the median
+  through the public gateway from a laptop. Measure a route with `benchmark.py
+  --arm remote` and `turn_delay.py` before pointing agents at it.
+- Pin the server's `silero-vad` to the agents' LiveKit (6.2.1 for 1.8.x, 6.1 for
+  1.2.x / 1.3.x): the two disagree by up to 0.79 in p(speech) on one window.
+
+Numbers: [`stt_api/livekit_plugin/remote_silero/README.md`](stt_api/livekit_plugin/remote_silero/README.md).
 
 ### `pulse_vad/`
 

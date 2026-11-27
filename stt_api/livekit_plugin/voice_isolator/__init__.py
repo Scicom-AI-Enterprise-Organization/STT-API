@@ -15,6 +15,9 @@ the noise, before the VAD, the turn detector and the STT hear the call.
         noise_cancellation=lambda params: VoiceIsolator(backend=backend),
     )
 
+`RemoteIsolator(url, vad=True)` with `IsolatorVAD.load()` as the session's VAD: the
+server scores the audio it sends, and the agent runs no VAD model (vad.py).
+
 See README.md for which backend to pick and what it does to the agent's VAD.
 """
 
@@ -23,6 +26,7 @@ from .onnx_stream import OnnxStream, isolate
 
 __all__ = [
     "Backend",
+    "IsolatorVAD",
     "LocalIsolator",
     "OnnxStream",
     "RemoteIsolator",
@@ -34,8 +38,12 @@ __all__ = [
 
 def __getattr__(name: str):
     # Deferred so the backends import without livekit-agents present.
-    if name in ("VoiceIsolator", "MODEL_SAMPLE_RATE"):
+    if name in ("VoiceIsolator", "MODEL_SAMPLE_RATE", "VAD_KEY"):
         from . import isolator
 
         return getattr(isolator, name)
+    if name == "IsolatorVAD":
+        from . import vad
+
+        return vad.IsolatorVAD
     raise AttributeError(name)

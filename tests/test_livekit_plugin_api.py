@@ -46,6 +46,8 @@ class TestExportedNames:
             "VoiceIsolator",
             "LocalIsolator",
             "RemoteIsolator",
+            "IsolatorVAD",
+            "RemoteSileroVAD",
             "ClearlineVAD",
             "ClearlineNC",
             "DummySTT",
@@ -184,8 +186,17 @@ class TestPluginsStayIndependentOfTheServer:
     def test_no_plugin_module_imports_the_server_side(self):
         import pathlib
 
-        root = pathlib.Path(__file__).resolve().parent.parent / "stt_api" / "livekit_plugin"
-        server_modules = ("stt_api.main", "stt_api.diarization", "stt_api.vad", "stt_api.nemo")
+        root = (
+            pathlib.Path(__file__).resolve().parent.parent
+            / "stt_api"
+            / "livekit_plugin"
+        )
+        server_modules = (
+            "stt_api.main",
+            "stt_api.diarization",
+            "stt_api.vad",
+            "stt_api.nemo",
+        )
         for path in root.rglob("*.py"):
             source = path.read_text()
             for module in server_modules:

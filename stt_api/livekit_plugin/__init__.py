@@ -17,7 +17,8 @@ Then one import line, whichever plugins the agent uses:
   filter, both trained here for one CPU core (``clearline``)
 - ``VoiceIsolator`` — keeps the caller, removes other voices and noise; CPU in the
   agent (``LocalIsolator``) or the GPU release on a server (``RemoteIsolator``)
-  (``voice_isolator``)
+  (``voice_isolator``); ``IsolatorVAD``, the session's VAD scored by that server
+  on the audio it returns
 - ``RemoteSileroVAD``: silero VAD scored on a GPU server that batches every
   call's windows (``remote_silero``)
 - ``DummySTT`` / ``DummyLLM`` / ``DummyTTS`` — free load testing (``dummy``)
@@ -42,6 +43,7 @@ __all__ = [
     "DummyLLM",
     "DummySTT",
     "DummyTTS",
+    "IsolatorVAD",
     "LocalIsolator",
     "MultilingualModel",
     "PulseVAD",
@@ -72,6 +74,7 @@ _EXPORTS = {
     "VoiceIsolator": ("voice_isolator", "VoiceIsolator"),
     "LocalIsolator": ("voice_isolator", "LocalIsolator"),
     "RemoteIsolator": ("voice_isolator", "RemoteIsolator"),
+    "IsolatorVAD": ("voice_isolator", "IsolatorVAD"),
     "RemoteSileroVAD": ("remote_silero", "RemoteSileroVAD"),
     "DummySTT": ("dummy", "STT"),
     "DummyLLM": ("dummy", "LLM"),
@@ -93,7 +96,12 @@ if TYPE_CHECKING:  # import-free completion for editors and type checkers
     from .remote_silero import RemoteSileroVAD
     from .semantic_vad import ScicomEoT, SemanticVAD, SmartTurnV3
     from .turn_detector import MultilingualModel
-    from .voice_isolator import LocalIsolator, RemoteIsolator, VoiceIsolator
+    from .voice_isolator import (
+        IsolatorVAD,
+        LocalIsolator,
+        RemoteIsolator,
+        VoiceIsolator,
+    )
     from .whisper_stt import DropBlankSTT, WhisperSTT
 
 

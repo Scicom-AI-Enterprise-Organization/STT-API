@@ -264,6 +264,96 @@ most of it in the first seconds of a call, before the enrollment exists. These a
 GPU release's numbers; the CPU model's come with its weights. Method and data:
 Voice-Isolator's preprint, section "In a voice agent" (`scripts/vad_eval.py`).
 
+## The VAD from the same connection
+
+A call on `RemoteIsolator` already has its audio on a GPU server. Asked to, that
+server also scores the audio it sends back with Silero VAD and sends p(speech) with
+it. The agent then runs no VAD model and opens no second connection:
+
+```python
+from stt_api.livekit_plugin import IsolatorVAD, RemoteIsolator, VoiceIsolator
+
+def prewarm(proc):
+    proc.userdata["vad"] = IsolatorVAD.load()        # as silero.VAD.load()
+
+backend = RemoteIsolator("ws://gpu-host:8765", vad=True)
+session = AgentSession(vad=ctx.proc.userdata["vad"], ...)
+await session.start(..., room_options=room_io.RoomOptions(
+    audio_input=room_io.AudioInputOptions(
+        sample_rate=16000,
+        noise_cancellation=lambda params: VoiceIsolator(backend=backend),
+    ),
+))
+```
+
+The server runs with `--vad` (Voice-Isolator, `python -m vi.server_mp ... --vad`). It
+cuts the audio it sends into 512-sample windows and scores them in one or two batched
+runs a tick, with the weights `livekit-plugins-silero` 1.8.x ships, in full float32. Against
+LiveKit's own ONNX session its p(speech) is within 2.4e-4 on every window.
+`VoiceIsolator` marks each frame it returns with where the frame stands in the
+server's audio (`frame.userdata`), and `IsolatorVAD` reads the scores by the mark.
+Everything after the score is `RemoteSileroVAD`'s, so upstream silero's: the filter,
+the state machine, the speech buffer and the events, and one scoring for the two VAD
+streams of a session.
+
+**What is scored is the server's window, not the agent's.** The server's windows
+start at its first sample, the agent's at the first frame the VAD is pushed, and the
+plugin moves its output against the server's by a few milliseconds when a reply is
+late. So each of the agent's windows takes the score of the last server window that
+ends inside it: the same audio up to 32 ms earlier. One call of 140 s through the
+release model, against upstream silero on the same frames in the same process (box
+1023, 2026-11-27):
+
+| agent input | turn starts and ends | found by both | moved, mean / most | event after silero's, median |
+|---|---:|---:|---:|---:|
+| 16 kHz | 14 | 14 | 27 / 96 ms | 3 ms |
+| 24 kHz | 14 | 14 | 27 / 64 ms | 0 ms |
+
+**It scores what the server sent, also where the agent got something else.** Audio
+whose isolated version is late goes to the agent unfiltered (`max_lag_ms`), and the
+score for that stretch is still of the isolated audio. One lone 24 kHz call had 66 of
+its 140 s go out unfiltered, and the VAD found 14 turn events where silero on the
+delivered frames found 10. The VAD then cuts turns on the caller alone while
+the STT hears the unfiltered piece. Watch `VoiceIsolator.unfiltered_ms`.
+
+A window is scored on the agent's CPU, by LiveKit's silero warmed on the second
+before, when its frame carries no mark (the server does not run `--vad`, the
+connection is lost and the caller is passed through, the frames did not come from a
+`VoiceIsolator`, something between the filter and the VAD made new frame objects) or
+its score has not come `max_lag` (0.1 s) after the window was complete. So a session
+whose isolator cannot score is local silero, not a silent agent.
+`vad.stats()["local_share"]` says how often: 0.04 to 0.09 % in these runs, the first
+window or two of a call.
+
+What the VAD costs the agent, one call per process pinned to a core, 50 ms frames,
+the isolator's own cost taken off, two runs each
+(`benchmark/vad_cost.py`). Percent of a core:
+
+| | 16 kHz, one stream | 16 kHz, two | 24 kHz, one stream | 24 kHz, two |
+|---|---:|---:|---:|---:|
+| local silero | 1.48 % | 2.47 % | 1.70 % | 2.96 % |
+| `RemoteSileroVAD` | 0.40 % | 0.48 % | 0.66 % | 0.65 % |
+| `IsolatorVAD` | 0.39 % | 0.47 % | 0.56 % | 0.62 % |
+
+It costs the agent what `RemoteSileroVAD` costs. What it removes is the second
+connection, the second upload of the call's audio and the second server, and the
+wait: the score is there when the window is complete (median 2 microseconds after,
+99th percentile 4 ms, against a 1 ms round trip to a VAD server on the same host).
+A lone call's process costs more per stream than the fifty-call figures in
+`remote_silero/README.md`; compare within one table.
+
+What it costs the isolator's server, the release model with 32 calls on 40 ms chunks:
+a tick's busy time went from 12.4 to 14.0 ms at the median and from 13.7 to 17.8 ms
+at the 99th percentile, 4 % of the tick's period, and its processes' CPU by roughly
+0.2 % of a core per call (read from whole seconds of CPU time, so coarse). Scoring behind every step of a tick instead
+of once behind the last cost 5.2 ms a tick; do not move it back.
+
+Not deployed: the tm-h20 isolator job does not run `--vad`, and nothing has been
+tested through the gateway (the scores are WebSocket text messages beside the binary
+audio, and the request is `?vad=1` on the URL). It needs livekit-rtc frames with
+`userdata` (livekit-agents 1.8.x's have them); without, the plugin warns once and the VAD scores
+locally.
+
 ## Streaming benchmark
 
 `benchmark/` measures the filter inside a real LiveKit agent: its own LiveKit server, a
