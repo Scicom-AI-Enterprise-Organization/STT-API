@@ -104,7 +104,8 @@ class LocalIsolator:
 
     `gate`: the agent model's presence gate (see onnx_stream.py). "auto" (default)
     takes the model's own setting, none for a model without a presence head; "off"
-    runs the agent model without it; "THETA:HOLD:THETA_OFF:KEEP_DB" sets another.
+    runs the agent model without it;
+    "THETA:HOLD:THETA_OFF:KEEP_DB[:SUS_THETA:SUS_N]" sets another.
     """
 
     REPO = "Scicom-intl/voice-isolator-cpu"

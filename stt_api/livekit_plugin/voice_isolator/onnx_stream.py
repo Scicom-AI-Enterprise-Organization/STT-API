@@ -49,7 +49,10 @@ step's extra output `gate`, one logit per frame, and `config.json` "serve"
 "gate"): every 10 ms frame is open or closed. A closed gate opens at a frame whose
 probability is `theta` or over; an open one counts a frame at `theta_off` or over as
 the caller and stays open `hold` frames after the last one; a frame the model kept
-within `keep_db` of the line counts as the caller whatever the head says. Output hop
+within `keep_db` of the line counts as the caller whatever the head says; with
+`sus_theta` and `sus_n` a closed gate also opens at the `sus_n`-th frame in a row at
+`sus_theta` or over (a caller the head is only fairly sure of, for a while: on a
+noisy phone line it can sit under `theta` for a whole turn). Output hop
 t is multiplied by g[t-1] w^2[hop:] + g[t] w^2[:hop] (w^2 the periodic Hann, whose
 shifts by a hop sum to one), so a closed run leaves as exact digital silence, with
 no added delay. Voice-Isolator's `vi/model.py` (`gate_frames`, `_gate_out`) is the
@@ -57,7 +60,8 @@ same rule in PyTorch; `gate="auto"` takes the model's own setting. While the
 voicebot mode's decoy holds, the model is told to keep nobody, so a frame it kept
 is a weaker sign of the caller than after the first enrollment. A model says what
 it counts for there in "serve" "wait_keep": 1 as ever (the default), 0 nothing
-(only the head opens the gate), N only from the N-th kept frame in a row.
+(only the head opens the gate), N only from the N-th kept frame in a row; and
+"wait_sustain": 0 keeps a sustained run from opening the gate there.
 """
 
 from __future__ import annotations
@@ -86,8 +90,8 @@ _DECOY_EMB: dict[tuple[str, int], np.ndarray] = {}  # per model: the decoy's vec
 
 
 def parse_gate(spec) -> dict | None:
-    """'THETA[:HOLD[:THETA_OFF[:KEEP_DB]]]' -> the presence gate's settings; None,
-    "" or "off" -> no gate. HOLD is in 10 ms frames (default 10)."""
+    """'THETA[:HOLD[:THETA_OFF[:KEEP_DB[:SUS_THETA:SUS_N]]]]' -> the presence gate's
+    settings; None, "" or "off" -> no gate. HOLD is in 10 ms frames (default 10)."""
     if spec is None or str(spec) in ("", "off"):
         return None
     f = str(spec).split(":")
@@ -96,6 +100,8 @@ def parse_gate(spec) -> dict | None:
         hold=int(f[1]) if len(f) > 1 and f[1] else 10,
         theta_off=float(f[2]) if len(f) > 2 and f[2] else None,
         keep_db=float(f[3]) if len(f) > 3 and f[3] else None,
+        sus_theta=float(f[4]) if len(f) > 4 and f[4] else None,
+        sus_n=int(f[5]) if len(f) > 5 and f[5] else 1,
     )
 
 
@@ -229,9 +235,13 @@ class OnnxStream:
             g = self.gate
             self.g_th = np.float32(g["theta"])
             self.g_th_off = np.float32(g["theta_off"] or g["theta"])
+            # no sustained opening: a probability never reaches 2
+            self.g_sus = np.float32(g["sus_theta"] or 2.0)
             self.w2 = self.w * self.w
             # kept frames on the voicebot mode's decoy: as ever, never, or in runs
             self.wait_keep = int(serve.get("wait_keep", 1))
+            # a sustained run on the decoy: opens the gate (1, the default) or not
+            self.wait_sustain = int(serve.get("wait_sustain", 1))
         self.start = self.null
         if voicebot:  # the decoy's vector, once per model and process
             key = (str(model_dir), num_threads)
@@ -261,6 +271,7 @@ class OnnxStream:
         self.g_since = 1 << 30  # frames since the gate last heard the caller
         self.g_prev = np.float32(0.0)  # the last frame's gate: a call starts closed
         self.g_krun = 0  # frames in a row the model has kept
+        self.g_srun = 0  # frames in a row at the gate's sus_theta or over
         n_hist = int(self.loud_until * SAMPLE_RATE) + self.step_n
         self.hist = np.zeros(n_hist, np.float32) if self.live else None
         self.loud_st = None
@@ -422,6 +433,9 @@ class OnnxStream:
         need = 1 if not self.waiting else (self.wait_keep or (1 << 30))
         for t in range(C):
             heard = p[t] >= (self.g_th_off if is_open else self.g_th)
+            self.g_srun = self.g_srun + 1 if p[t] >= self.g_sus else 0
+            if self.g_srun >= g["sus_n"] and (self.wait_sustain or not self.waiting):
+                heard = True
             if keep is not None:
                 self.g_krun = self.g_krun + 1 if keep[t] else 0
                 if self.g_krun >= need:

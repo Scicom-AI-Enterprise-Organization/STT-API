@@ -364,7 +364,14 @@ class TestGate:
 
     def test_takes_the_models_own_setting(self):
         s = LocalIsolator(TINY_GATE).open()
-        assert s.gate == {"theta": 0.6, "hold": 3, "theta_off": None, "keep_db": None}
+        assert s.gate == {
+            "theta": 0.6,
+            "hold": 3,
+            "theta_off": None,
+            "keep_db": None,
+            "sus_theta": None,
+            "sus_n": 1,
+        }
 
     def test_off_and_other_settings(self):
         assert LocalIsolator(TINY_GATE, gate="off").open().gate is None
@@ -373,7 +380,11 @@ class TestGate:
             "hold": 100,
             "theta_off": 0.2,
             "keep_db": 1.0,
+            "sus_theta": None,
+            "sus_n": 1,
         }
+        g = LocalIsolator(TINY_GATE, gate="0.9:100:0.2:1:0.65:10").open().gate
+        assert (g["sus_theta"], g["sus_n"]) == (0.65, 10)
 
     def test_a_model_without_a_head_has_none(self, local):
         assert local.open().gate is None
@@ -430,6 +441,25 @@ class TestGate:
         )
         assert np.allclose(y, 1.0, atol=1e-6)
 
+    def test_a_caller_the_head_is_fairly_sure_of_for_a_while(self):
+        # sus_theta, sus_n: a closed gate also opens at the sus_n-th frame in a row
+        # at sus_theta or over, though no frame reaches theta.
+        from stt_api.livekit_plugin.voice_isolator.onnx_stream import OnnxStream
+
+        ones = np.ones(8 * 160, np.float32)
+        p = [0.7, 0.7, 0.1, 0.7, 0.7, 0.7, 0.3, 0.1]  # open: 0 0 0 0 0 1 1 0
+        s = OnnxStream(TINY_GATE, gate="0.9:0:0.2::0.6:3")
+        h = s._gate_out(ones.copy(), ones, logit(p)).reshape(8, 160).mean(1)
+        assert not h[:5].any() and h[7] == pytest.approx(0.5, abs=0.01)
+        assert h[5] == pytest.approx(0.5, abs=0.01) and h[6] == pytest.approx(1.0)
+        s = OnnxStream(TINY_GATE, gate="0.9:0:0.2")  # without it: never opens
+        assert not np.any(s._gate_out(ones.copy(), ones, logit(p)))
+        # the run carries over to the next step
+        s = OnnxStream(TINY_GATE, gate="0.9:0:0.2::0.6:3")
+        assert not np.any(s._gate_out(ones[:320].copy(), ones[:320], logit(p[:2])))
+        y = s._gate_out(ones[:160].copy(), ones[:160], logit([0.7]))
+        assert y.mean() == pytest.approx(0.5, abs=0.01)
+
     def test_a_kept_frame_counts_as_the_caller(self):
         # keep_db: a frame the model kept within that many dB of the line is open
         # whatever the head says; one it turned down 20 dB is not.
@@ -479,6 +509,36 @@ class TestGate:
         assert s.enrolled_at is not None and not s.waiting
         kept = s._gate_out(line[:640].copy(), line[:640], low[:4]).reshape(4, 160)
         assert np.allclose(kept.mean(1)[1:], 0.1, atol=1e-6)
+
+    def test_a_sustained_run_while_the_decoy_holds(self, tmp_path):
+        # "serve" "wait_sustain": 0 keeps a run at sus_theta from opening the gate
+        # until the first enrollment; the default lets it.
+        import shutil
+
+        from stt_api.livekit_plugin.voice_isolator.onnx_stream import OnnxStream
+
+        d = tmp_path / "ws0"
+        shutil.copytree(TINY_GATE, d)
+        cfg = json.loads((d / "config.json").read_text())
+        cfg["serve"] = dict(cfg.get("serve") or {}, wait_sustain=0)
+        (d / "config.json").write_text(json.dumps(cfg))
+
+        ones = np.ones(6 * 160, np.float32)
+        fair = logit([0.7] * 6)
+        g = dict(gate="0.9:0:0.2::0.6:3", voicebot=True)
+        s = OnnxStream(TINY_GATE, **g)  # no word from the model: it opens
+        assert s.waiting and s.wait_sustain == 1
+        h = s._gate_out(ones.copy(), ones, fair).reshape(6, 160).mean(1)
+        assert not h[:2].any() and h[3] == pytest.approx(1.0)
+        s = OnnxStream(str(d), **g)  # not while the call waits on the decoy
+        assert not np.any(s._gate_out(ones.copy(), ones, fair))
+        x = np.concatenate([steady(4.0, 0.05, seed=25), steady(3.0, 0.2, seed=26)])
+        for i in range(0, len(x), 800):
+            s.push(x[i : i + 800])
+        assert s.enrolled_at is not None and not s.waiting
+        s.g_since, s.g_srun, s.g_prev = 1 << 30, 0, np.float32(0.0)
+        h = s._gate_out(ones.copy(), ones, fair).reshape(6, 160).mean(1)
+        assert not h[:2].any() and h[3] == pytest.approx(1.0)
 
 
 @pytest.fixture
